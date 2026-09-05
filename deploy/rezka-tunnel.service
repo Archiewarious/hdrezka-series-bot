@@ -1,0 +1,46 @@
+# SOCKS5-туннель на сервер с незабаненным IP — без него сайт недоступен.
+#
+# Перед установкой подставьте свои значения (в угловых скобках):
+#   <USER>          — пользователь на хосте, от которого живёт ssh-ключ
+#   <COMPOSE_NET>   — сеть compose, например 172.28.0.0/16 (см. docker-compose.yml)
+#   <COMPOSE_GW>    — её шлюз, например 172.28.0.1 — его контейнеры видят как HDREZKA_PROXY
+#   <HOST_IP>       — адрес хоста во внутренней сети (для проверок с самого хоста)
+#   <SSH_PORT>, <SSH_KEY>, <REMOTE_USER>@<REMOTE_HOST> — доступ к серверу-выходу
+#
+# Установка:
+#   sudo cp deploy/rezka-tunnel.service /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now rezka-tunnel
+[Unit]
+Description=SSH SOCKS tunnel (HDREZKA egress)
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+User=<USER>
+
+# Разрешаем контейнерам compose-сети достучаться до туннеля.
+# Префикс "+" — выполнить от root, несмотря на User=.
+# Проверка через -C делает правило идемпотентным при рестарте.
+ExecStartPre=+/bin/sh -c '/usr/sbin/iptables -C INPUT -s <COMPOSE_NET> -d <COMPOSE_GW> -p tcp --dport 1080 -j ACCEPT 2>/dev/null || /usr/sbin/iptables -I INPUT 7 -s <COMPOSE_NET> -d <COMPOSE_GW> -p tcp --dport 1080 -j ACCEPT'
+
+# Слушаем только на внутренних адресах. На 0.0.0.0 вешать нельзя: получится открытый прокси.
+ExecStart=/usr/bin/ssh -N \
+    -D <HOST_IP>:1080 \
+    -D <COMPOSE_GW>:1080 \
+    -p <SSH_PORT> \
+    -i <SSH_KEY> \
+    -o ServerAliveInterval=30 \
+    -o ServerAliveCountMax=3 \
+    -o ExitOnForwardFailure=yes \
+    -o StrictHostKeyChecking=accept-new \
+    -o BatchMode=yes \
+    <REMOTE_USER>@<REMOTE_HOST>
+
+# Правило живёт ровно столько, сколько туннель — ничего за собой не оставляем.
+ExecStopPost=+/bin/sh -c '/usr/sbin/iptables -D INPUT -s <COMPOSE_NET> -d <COMPOSE_GW> -p tcp --dport 1080 -j ACCEPT 2>/dev/null || true'
+
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

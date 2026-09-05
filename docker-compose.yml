@@ -1,0 +1,74 @@
+# Логи контейнеров: без лимита json-file растёт бесконечно и за месяцы забивает диск.
+x-logging: &logging
+  driver: json-file
+  options: {max-size: "20m", max-file: "5"}
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_DB: rezka
+      POSTGRES_USER: rezka
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?задайте POSTGRES_PASSWORD в .env}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U rezka"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+    logging: *logging
+    # Наружу порт не публикуем — только внутренняя сеть compose.
+
+  migrate:
+    build: .
+    env_file: .env
+    command: alembic upgrade head
+    depends_on:
+      postgres: {condition: service_healthy}
+    restart: "no"
+    logging: *logging
+
+  bot:
+    build: .
+    env_file: .env
+    command: python -m app.bot.main
+    stop_grace_period: 30s   # дать закончить запросы в обработке при перезапуске
+    depends_on:
+      migrate: {condition: service_completed_successfully}
+    extra_hosts: ["host.docker.internal:host-gateway"]   # доступ к SSH-туннелю на хосте
+    restart: unless-stopped
+    logging: *logging
+
+  poller:
+    build: .
+    env_file: .env
+    command: python -m app.poller
+    stop_grace_period: 60s   # цикл поллера должен завершиться и закоммититься
+    depends_on:
+      migrate: {condition: service_completed_successfully}
+    extra_hosts: ["host.docker.internal:host-gateway"]
+    restart: unless-stopped
+    logging: *logging
+
+  sender:
+    build: .
+    env_file: .env
+    command: python -m app.sender
+    depends_on:
+      migrate: {condition: service_completed_successfully}
+    restart: unless-stopped
+    logging: *logging
+
+volumes:
+  pgdata:
+
+networks:
+  default:
+    ipam:
+      config:
+        # Подсеть зафиксирована: на шлюз 172.28.0.1 привязан SSH-туннель
+        # (см. deploy/rezka-tunnel.service). Адрес приватный, снаружи недоступен.
+        - subnet: 172.28.0.0/16
+          gateway: 172.28.0.1
