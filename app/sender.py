@@ -35,6 +35,7 @@ from app import posters
 from app import service as svc
 from app.config import cfg
 from app.db import init_db, session
+from app.i18n import t
 
 log = logging.getLogger("sender")
 
@@ -130,7 +131,7 @@ async def _sub_for(s, user_id: int, page_id: int, franchise_id: int | None) -> t
     return (row[0], row[1]) if row else (None, None)
 
 
-async def _render(s, user_id: int, kind: str, ref_id: int) -> Rendered | None:
+async def _render(s, user_id: int, kind: str, ref_id: int, lang: str = "ru") -> Rendered | None:
     if kind == "episode" or kind.startswith("voice:"):
         row = (await s.execute(EPISODE_SQL, {"id": ref_id})).first()
         if not row:
@@ -139,13 +140,13 @@ async def _render(s, user_id: int, kind: str, ref_id: int) -> Rendered | None:
         title = title[:TITLE_MAX_LEN]
         esc_title = html.escape(title)
         sxe = f"{season}×{episode}"
-        body = f"{season} сезон, {episode} серия"
+        body = t(lang, "n_episode_body", s=season, e=episode)
         voice = None
         if kind.startswith("voice:"):
             tid = int(kind.split(":")[1])
             name = await s.scalar(VOICE_NAME_SQL, {"id": ref_id, "tid": tid})
             voice = html.escape(name or f"#{tid}")
-            body += f" · вышла в озвучке <b>{voice}</b>"
+            body += t(lang, "n_voice_suffix", v=voice)
         else:
             # Озвучка «любая»: ведём в ту, где серия появилась первой, иначе — в озвучку по умолчанию.
             tid = await s.scalar(FIRST_VOICE_SQL, {"id": ref_id})
@@ -156,7 +157,7 @@ async def _render(s, user_id: int, kind: str, ref_id: int) -> Rendered | None:
             kind=kind, page_id=page_id, hdrezka_id=hid, title=title,
             text=f"🎬 <b>{esc_title}</b>\n{body}",
             line=f"• <b>{esc_title}</b> — {sxe}" + (f" ({voice})" if voice else ""),
-            watch_label=f"▶ Смотреть {sxe}", watch_url=watch_url(url, tid, season, episode),
+            watch_label=t(lang, "btn_watch", sxe=sxe), watch_url=watch_url(url, tid, season, episode),
             poster_url=poster_url, poster_file_id=file_id, sub_id=sub_id, sub_scope=scope,
         )
     if kind == "new_part":
@@ -166,39 +167,39 @@ async def _render(s, user_id: int, kind: str, ref_id: int) -> Rendered | None:
         page_id, hid, title, url, poster_url, file_id, ctype, year, finished, franchise_id, fname = row
         title = title[:TITLE_MAX_LEN]
         esc_title, esc_fname = html.escape(title), html.escape(fname or "")
-        what = {"film": "фильм", "series": "сериал"}.get(ctype or "")
+        what = t(lang, "kind_film") if ctype == "film" else (t(lang, "kind_series") if ctype == "series" else None)
         tail = " · ".join(x for x in (what, year) if x)
         sub_id, scope = await _sub_for(s, user_id, page_id, franchise_id)
         return Rendered(
             kind=kind, page_id=page_id, hdrezka_id=hid, title=title,
-            text=f"🆕 Новая часть франшизы «{esc_fname}»\n<b>{esc_title}</b>" + (f" · {tail}" if tail else ""),
-            line=f"• 🆕 «{esc_fname}»: <b>{esc_title}</b>" + (f" · {tail}" if tail else ""),
-            watch_label="▶ Открыть", watch_url=url,
+            text=t(lang, "n_new_part", f=esc_fname, t=esc_title) + (f" · {tail}" if tail else ""),
+            line=t(lang, "n_new_part_line", f=esc_fname, t=esc_title) + (f" · {tail}" if tail else ""),
+            watch_label=t(lang, "btn_open"), watch_url=url,
             poster_url=poster_url, poster_file_id=file_id, sub_id=sub_id, sub_scope=scope,
             can_follow=ctype != "film" and not finished,
         )
     return None
 
 
-def _unfollow_button(r: Rendered) -> InlineKeyboardButton:
-    label = "🔕 Не следить за франшизой" if r.sub_scope == "franchise" else "🔕 Не следить"
+def _unfollow_button(r: Rendered, lang: str = "ru") -> InlineKeyboardButton:
+    label = t(lang, "btn_unfollow_fr" if r.sub_scope == "franchise" else "btn_unfollow")
     return InlineKeyboardButton(text=label, callback_data=f"unsubq:{r.sub_id}")
 
 
-def _single_keyboard(r: Rendered) -> InlineKeyboardMarkup:
+def _single_keyboard(r: Rendered, lang: str = "ru") -> InlineKeyboardMarkup:
     rows = [[InlineKeyboardButton(text=r.watch_label, url=r.watch_url)]]
     if r.kind == "new_part":
         if r.can_follow:
-            rows.append([InlineKeyboardButton(text="➕ Следить за этой частью", callback_data=f"sub:{r.hdrezka_id}")])
+            rows.append([InlineKeyboardButton(text=t(lang, "btn_follow_part"), callback_data=f"sub:{r.hdrezka_id}")])
     elif r.sub_id:
-        rows.append([InlineKeyboardButton(text="🎙 Другие озвучки", callback_data=f"voices:{r.sub_id}")])
+        rows.append([InlineKeyboardButton(text=t(lang, "btn_other_voices"), callback_data=f"voices:{r.sub_id}")])
     if r.sub_id:
-        rows.append([_unfollow_button(r)])
+        rows.append([_unfollow_button(r, lang)])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-def _digest(items: list[Rendered]) -> tuple[str, InlineKeyboardMarkup]:
-    head = "🆕 Вышли новые серии" if any(r.kind != "new_part" for r in items) else "🆕 Новые части франшиз"
+def _digest(items: list[Rendered], lang: str = "ru") -> tuple[str, InlineKeyboardMarkup]:
+    head = t(lang, "digest_episodes" if any(r.kind != "new_part" for r in items) else "digest_parts")
     body = head + "\n\n" + "\n".join(r.line for r in items)
     if len(body) > TG_MAX_LEN:
         body = body[:TG_MAX_LEN - 1] + "…"
@@ -215,15 +216,15 @@ async def _send_photo(bot: Bot, s, user_id: int, r: Rendered, kb: InlineKeyboard
     return msg is not None
 
 
-async def _deliver(bot: Bot, s, user_id: int, items: list[Rendered], photos: bool) -> None:
+async def _deliver(bot: Bot, s, user_id: int, items: list[Rendered], photos: bool, lang: str) -> None:
     if len(items) == 1:
         r = items[0]
-        kb = _single_keyboard(r)
+        kb = _single_keyboard(r, lang)
         if photos and await _send_photo(bot, s, user_id, r, kb):
             return
         await bot.send_message(user_id, r.text, reply_markup=kb, disable_web_page_preview=True)
         return
-    body, kb = _digest(items)
+    body, kb = _digest(items, lang)
     await bot.send_message(user_id, body, reply_markup=kb, disable_web_page_preview=True)
 
 
@@ -240,17 +241,18 @@ async def send_batch(bot: Bot, limiter: RateLimiter) -> int:
 
         sent_total = 0
         for user_id, items in by_user.items():
-            rendered = [await _render(s, user_id, k, r) for _, k, r in items]
+            prefs = (await s.execute(text("SELECT photos, lang FROM users WHERE id = :u"), {"u": user_id})).first()
+            photos, lang = (prefs[0], prefs[1] or "ru") if prefs else (True, "ru")
+            rendered = [await _render(s, user_id, k, r, lang) for _, k, r in items]
             rendered = [r for r in rendered if r]
             ids = [nid for nid, _, _ in items]
             if not rendered:
                 await _mark(s, ids, "failed", "nothing to render")
                 continue
 
-            photos = await s.scalar(text("SELECT photos FROM users WHERE id = :u"), {"u": user_id})
             await limiter.acquire()
             try:
-                await _deliver(bot, s, user_id, rendered, photos is not False)
+                await _deliver(bot, s, user_id, rendered, photos is not False, lang)
                 await _mark(s, ids, "sent")
                 sent_total += len(ids)
             except TelegramRetryAfter as exc:

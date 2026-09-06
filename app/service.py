@@ -18,6 +18,7 @@ from app.models import (
     Episode, EpisodeVoice, Franchise, Meta, Notification, Page, Schedule,
     Subscription, User, Voice, VoiceCheck,
 )
+from app.i18n import detect
 from app.rezka.client import RezkaClient
 from app.rezka.parser import FeedItem, ScheduleRow, TitlePage, franchise_name, parse_title_page
 
@@ -34,13 +35,28 @@ def now() -> datetime:
 
 # ----------------------------------------------------------------------------- users
 
-async def upsert_user(s: AsyncSession, user_id: int, username: str | None) -> None:
-    await s.execute(
+async def upsert_user(s: AsyncSession, user_id: int, username: str | None,
+                      language_code: str | None = None) -> str:
+    """Возвращает язык интерфейса. Язык из Telegram берём только при первом появлении человека:
+    дальше это его настройка (⚙️ → 🌐), и клиент Telegram её не перебивает."""
+    return await s.scalar(
         pg_insert(User)
-        .values(id=user_id, username=username, is_active=True)
+        .values(id=user_id, username=username, is_active=True, lang=detect(language_code))
         .on_conflict_do_update(index_elements=[User.id],
                                set_={"username": username, "is_active": True, "blocked_at": None})
+        .returning(User.lang)
     )
+
+
+async def reschedule_pending(s: AsyncSession, user_id: int) -> int:
+    """Настройки доставки (тихие часы, дайджест, пояс) применяются и к уже стоящим в очереди
+    уведомлениям — иначе выключенные тихие часы подействовали бы только на следующие."""
+    r = await s.execute(text("""
+        UPDATE notifications n
+           SET next_attempt_at = notify_at(u.tz_offset, u.quiet_from, u.quiet_to, u.digest_hour)
+          FROM users u
+         WHERE u.id = n.user_id AND n.user_id = :u AND n.status = 'pending'"""), {"u": user_id})
+    return r.rowcount or 0
 
 
 # ----------------------------------------------------------------------------- pages

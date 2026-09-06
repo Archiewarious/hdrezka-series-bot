@@ -36,3 +36,10 @@ def test_digest():
     assert all(len(r[0].text) <= BUTTON_MAX_LEN for r in kb.inline_keyboard)
     body, _ = _digest([_r("new_part", "А", ""), _r("new_part", "Б", "")])
     assert body.startswith("🆕 Новые части франшиз")
+
+
+def test_keyboard_and_digest_in_english():
+    kb = _single_keyboard(_r("new_part", "Butterfly", "", scope="franchise"), lang="en")
+    assert [b.text for row in kb.inline_keyboard for b in row] == ["▶ Открыть", "➕ Follow this part", "🔕 Unfollow the franchise"]
+    body, _ = _digest([_r("episode", "Slime", "4×22")], lang="uk")
+    assert body.startswith("🆕 Вийшли нові серії")

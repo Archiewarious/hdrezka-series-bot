@@ -1,0 +1,13 @@
+# Разовый запуск бэкапа (deploy/backup.sh). Запускает таймер rezka-backup.timer.
+# Установка: sudo cp deploy/rezka-backup.{service,timer} /etc/systemd/system/ && \
+#            sudo systemctl daemon-reload && sudo systemctl enable --now rezka-backup.timer
+# Лог: journalctl -u rezka-backup
+[Unit]
+Description=HDREZKA bot: pg_dump backup to local dir and egress server
+After=docker.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=alex
+ExecStart=/home/alex/HDREZKA/deploy/backup.sh

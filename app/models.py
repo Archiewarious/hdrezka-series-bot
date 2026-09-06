@@ -33,6 +33,7 @@ class User(Base):
     quiet_to: Mapped[int | None] = mapped_column(SmallInteger, default=8, server_default=text("8"))  # NULL/NULL = выкл
     digest_hour: Mapped[int | None] = mapped_column(SmallInteger)                                    # NULL = сразу
     default_voice_filter: Mapped[list[int] | None] = mapped_column(ARRAY(Integer))                   # для новых подписок
+    lang: Mapped[str] = mapped_column(String(2), default="ru", server_default=text("'ru'"))          # ru | uk | en
 
 
 class Franchise(Base):

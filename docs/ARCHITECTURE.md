@@ -291,7 +291,9 @@ making-of «Дом, который построили Драконы». В пе�
 - 429 → спим `retry_after`, строка обратно в `pending` с `next_attempt_at`. 403 «blocked by user» → `users.is_active = false`, все его pending → `failed`. Прочие ошибки → до 5 попыток с ростом интервала.
 - Очистка: `DELETE FROM notifications WHERE status IN ('sent','failed') AND sent_at < now() - interval '7 days'` раз в сутки.
 - **Настройки пользователя (06.09.2026).** Тихие часы и дайджест не проверяются в sender'е: SQL-функция
-  `notify_at(tz, quiet_from, quiet_to, digest_hour)` вычисляет `next_attempt_at` при постановке в очередь
+  `notify_at(tz, quiet_from, quiet_to, digest_hour)` вычисляет `next_attempt_at` при постановке в очередь;
+  при смене настроек `reschedule_pending()` пересчитывает и уже стоящие в очереди (06.09.2026).
+  `users.lang` (ru / uk / en) — язык текстов бота и уведомлений (`app/i18n.py`); новому — из Telegram
   (три `INSERT … SELECT` в `service.enqueue_*`). Sender читает только `users.photos` (фото или текст).
 - **Формат (05.09.2026).** Одно событие пользователю → `sendPhoto` с постером, подписью и кнопками «▶ Смотреть S×E»
   (`url#t:{translator}-s:{s}-e:{e}`, F18), «🎙 Другие озвучки», «🔕 Не следить» (с подтверждением). Два и больше →

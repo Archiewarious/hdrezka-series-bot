@@ -23,6 +23,8 @@
   конкретные — тогда бот проверит их через тот же ajax, что использует плеер сайта.
 - **Только Postgres**: хранение, очередь рассылки (`FOR UPDATE SKIP LOCKED`),
   singleton-лок поллера (advisory lock). Redis и брокеры не нужны.
+- **Три языка** интерфейса и уведомлений: русский, украинский, английский (`app/i18n.py`).
+  Новому человеку — язык его Telegram, дальше — ⚙️ Настройки → 🌐 Язык.
 
 ## Доступ к сайту
 
@@ -68,8 +70,13 @@ docker compose run --rm --no-deps bot python -m pytest
 ```bash
 docker compose logs -f poller                       # что происходит
 docker compose run --rm --no-deps poller python -m app.check_access   # доступ после смены IP/зеркала
-docker compose exec -T postgres pg_dump -U rezka rezka | gzip > backup-$(date +%F).sql.gz
+sudo systemctl start rezka-backup.service        # бэкап вручную (deploy/backup.sh)
+deploy/restore-check.sh                             # проверить свежий дамп восстановлением в отдельную базу
 ```
+
+Бэкапы: `deploy/rezka-backup.timer` раз в сутки (03:30 UTC) делает `pg_dump -Fc` в `/var/backups/rezka`
+(7 последних) и копирует на сервер-выход по SSH (`~/rezka-backups`, 30 последних). Адрес сервера и ключ —
+`deploy/backup.env` (образец `backup.env.example`, в git не попадает). Восстановление: `pg_restore -U rezka -d rezka --no-owner < файл.dump`.
 
 Схема БД — Alembic (`migrations/`). Изменили `app/models.py` →
 `docker compose run --rm -v $PWD/migrations:/srv/migrations migrate alembic revision --autogenerate -m "…"`,
@@ -89,6 +96,7 @@ app/poller.py         лента → события; франшизы; очер�
 app/sender.py         очередь → Telegram (фото/дайджест, кнопки); watchdog; очистка
 app/posters.py        постеры: скачивание с CDN, загрузка в Telegram, кэш file_id
 app/bot/main.py       поиск, подписки, озвучки, Новое, Настройки, поделиться
+app/i18n.py           тексты бота и уведомлений: ru / uk / en
 app/bot/search.py     группировка локальной выдачи по франшизам
 tests/                pytest на сохранённом HTML сайта
 docs/ARCHITECTURE.md  решения и факты; docs/PRODUCT_AND_SCALE.md — продукт и масштаб
