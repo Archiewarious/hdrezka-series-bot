@@ -152,7 +152,8 @@ async def sync_page(s: AsyncSession, client: RezkaClient, hdrezka_id: int, url: 
                                    set_={"title": row.title, "air_date": row.air_date, "aired": row.aired})
         )
 
-    if tp.content_type == "series" and schedule_finished(tp.schedule):
+    if tp.content_type == "series" and (schedule_finished(tp.schedule)
+                                        or finished_by_silence(page, bool(tp.schedule))):
         page.is_finished = True
 
     franchise, was_known, new_parts = await _apply_franchise(s, page, tp)
@@ -172,6 +173,37 @@ def schedule_finished(rows: list[ScheduleRow]) -> bool:
         return False
     last = max((r.air_date for r in rows if r.air_date), default=None)
     return last is not None and (date.today() - last).days > FINISHED_AFTER_DAYS
+
+
+QUIET_DAYS = 30
+
+
+def _known_since(page: Page) -> datetime | None:
+    """created_at без похода в БД: у страницы, созданной в этой же сессии, server_default ещё не
+    загружен, а ленивая загрузка в async-сессии — ошибка. Не загружено = знаем только что."""
+    return page.__dict__.get("created_at")
+
+
+def finished_by_silence(page: Page, has_schedule: bool, at: datetime | None = None) -> bool:
+    """Сериал без расписания на сайте (части франшиз, старые тайтлы): дат нет, «Завершен» в карточке
+    сайт ставит не всем — такие страницы считались идущими и перечитывались каждую неделю.
+    Завершён, если год старше текущего и серий в ленте не было QUIET_DAYS: часть двухлетней давности
+    и старше — сразу при чтении, прошлогодняя — когда страница известна боту QUIET_DAYS без серий
+    (перерыв между курами короче). Текущий год — никогда: решают расписание и лента. Есть расписание —
+    решает только оно (schedule_finished). Ошибка в сторону «завершён» безопасна: новая серия в ленте
+    снимает флаг (upsert_page_from_feed)."""
+    if has_schedule:
+        return False
+    at = at or now()
+    y = _year(page)
+    if y is None or y >= at.year:
+        return False
+    if page.last_event_at is not None and (at - page.last_event_at).days < QUIET_DAYS:
+        return False
+    if y <= at.year - 2:
+        return True
+    known = _known_since(page)
+    return known is not None and (at - known).days >= QUIET_DAYS
 
 
 async def _apply_franchise(s: AsyncSession, page: Page, tp: TitlePage):

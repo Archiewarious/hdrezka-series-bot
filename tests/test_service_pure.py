@@ -1,7 +1,8 @@
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 
 from app.rezka.parser import ScheduleRow, parse_title_page
-from app.service import FINISHED_AFTER_DAYS, schedule_finished
+from app.models import Page
+from app.service import FINISHED_AFTER_DAYS, QUIET_DAYS, finished_by_silence, schedule_finished
 
 
 def _row(days_ago: int, aired: bool = True) -> ScheduleRow:
@@ -32,3 +33,38 @@ def test_year_from_meta():
     assert year_from_meta("2026, Япония, Фэнтези") == "2026"
     assert year_from_meta("2024 - 2025, США, Драмы") == "2024"
     assert year_from_meta(None) is None and year_from_meta("Япония") is None
+
+
+NOW = datetime(2026, 9, 6, 12, tzinfo=timezone.utc)
+
+
+def _page(year, known_days=None, event_days=None, ctype="series"):
+    p = Page(hdrezka_id=1, title="t", url="u", year=year, content_type=ctype)
+    if known_days is not None:
+        p.created_at = NOW - timedelta(days=known_days)
+    if event_days is not None:
+        p.last_event_at = NOW - timedelta(days=event_days)
+    return p
+
+
+def test_silence_two_years_old_part_is_finished_at_once():
+    assert finished_by_silence(_page("2024"), False, NOW)                     # только что узнали — всё равно
+    assert finished_by_silence(_page("2018", known_days=0), False, NOW)
+    assert finished_by_silence(_page("2022-2023", known_days=0), False, NOW)  # год из «2022-2023»
+
+
+def test_silence_last_year_needs_quiet_period():
+    assert not finished_by_silence(_page("2025"), False, NOW)                          # created_at не загружен
+    assert not finished_by_silence(_page("2025", known_days=QUIET_DAYS - 1), False, NOW)
+    assert finished_by_silence(_page("2025", known_days=QUIET_DAYS), False, NOW)
+
+
+def test_silence_never_for_current_year_or_unknown_year():
+    assert not finished_by_silence(_page("2026", known_days=400), False, NOW)
+    assert not finished_by_silence(_page(None, known_days=400), False, NOW)
+
+
+def test_silence_recent_feed_episode_or_schedule_wins():
+    assert not finished_by_silence(_page("2020", known_days=400, event_days=QUIET_DAYS - 1), False, NOW)
+    assert finished_by_silence(_page("2020", known_days=400, event_days=QUIET_DAYS), False, NOW)
+    assert not finished_by_silence(_page("2020", known_days=400), True, NOW)   # расписание есть — решает оно
