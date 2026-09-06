@@ -12,22 +12,22 @@ import html
 import logging
 import re
 import time
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 from urllib.parse import urlencode
 
-from aiogram import Bot, Dispatcher, F
+from aiogram import BaseMiddleware, Bot, Dispatcher, F
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ChatType, ParseMode
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command, CommandObject, CommandStart
 from aiogram.types import (BotCommand, CallbackQuery, ErrorEvent, InlineKeyboardButton,
-                           InlineKeyboardMarkup, KeyboardButton, Message, ReplyKeyboardMarkup)
+                           InlineKeyboardMarkup, KeyboardButton, Message, ReplyKeyboardMarkup, Update)
 from sqlalchemy import func, select, text
 
 from app import posters
 from app import service as svc
 from app.bot import guard
-from app.bot.search import group_hits
+from app.bot.search import MAX_WAITING, group_hits
 from app.config import cfg
 from app.db import init_db, session
 from app.models import Franchise, Page, Schedule, Subscription, User, Voice
@@ -69,6 +69,7 @@ HELP = (
     "• или ссылку на страницу тайтла\n\n"
     "Подписаться можно на <b>один сезон</b> или на <b>всю франшизу</b> — тогда "
     "сообщу и о новых сезонах, фильмах и спин-оффах.\n\n"
+    "Сезон уже вышел целиком, а франшизы нет? На его карточке есть «🔔 Сообщить о продолжении».\n\n"
     "Кнопки внизу — главное меню: поиск, подписки, что нового за неделю, календарь, настройки, помощь."
 )
 BUSY = "Сайт сейчас отвечает медленно или недоступен — попробуйте через пару минут."
@@ -81,6 +82,28 @@ _search_cache: dict[str, tuple[list[FeedItem], float]] = {}
 # Только личные чаты. Группы, каналы, другие боты — молча игнорируем.
 dp.message.filter(F.chat.type == ChatType.PRIVATE, F.from_user.is_bot == False)  # noqa: E712
 dp.callback_query.filter(F.message.chat.type == ChatType.PRIVATE)
+
+MAX_UPDATE_AGE = timedelta(minutes=15)
+
+
+class SkipStaleUpdates(BaseMiddleware):
+    """Бэклог за время перезапуска обрабатываем (ссылка, присланная во время деплоя, не должна
+    пропасть), но не отвечаем на сообщения, которым больше 15 минут: ответ на вчерашний запрос
+    только путает. У callback даты нажатия нет — они идут всегда; просроченные Telegram отклоняет сам."""
+
+    async def __call__(self, handler, event: Update, data):
+        msg = event.message
+        if msg is not None and msg.date is not None:
+            sent = msg.date if msg.date.tzinfo else msg.date.replace(tzinfo=timezone.utc)
+            age = datetime.now(timezone.utc) - sent
+            if age > MAX_UPDATE_AGE:
+                log.info("Пропускаю сообщение от %s: возраст %s", msg.from_user.id if msg.from_user else "?",
+                         str(age).split(".")[0])
+                return None
+        return await handler(event, data)
+
+
+dp.update.outer_middleware(SkipStaleUpdates())
 
 
 def _kb(rows: list[list[tuple[str, str]]]) -> InlineKeyboardMarkup:
@@ -291,10 +314,12 @@ async def _handle_search(msg: Message, query: str) -> None:
         rows.append([(f"🎞 {name[:22]} · {tail}", f"subf:{fid}:{g.origin[fid]}")])
     rows += [[(f"➕ {p.title[:34]} · {SECTION_LABEL.get(p.section or '', '')} · {p.last_season}×{p.last_episode}",
                f"sub:{p.hdrezka_id}")] for p in g.standalone]
+    # Завершённые без франшизы — карточкой: там кнопка «🔔 Сообщить о продолжении».
+    rows += [[(f"🔔 {p.title[:34]} · завершён", f"pcard:{p.id}")] for p in g.waiting]
     rows.append([("🔍 Искать на сайте", f"site:{_site_token(query)}")])
     text_ = f"Нашёл ({len(rows) - 1}). Выберите:"
     if g.hidden:
-        text_ += f"\n<i>Скрыто {g.hidden}: завершённые сезоны и фильмы.</i>"
+        text_ += f"\n<i>Скрыто {g.hidden}: фильмы и тайтлы без вышедших серий.</i>"
     await msg.answer(text_, reply_markup=_kb(rows), disable_web_page_preview=True)
 
 
@@ -335,10 +360,13 @@ async def _site_search(note: Message, query: str, local_hidden: int = 0) -> None
     # База учится на пользователях: следующий такой поиск ответит без сайта.
     finished_known: set[int] = set()
     franchises: list = []
+    page_ids: dict[int, int] = {}          # hdrezka_id → pages.id для страниц без франшизы
     async with session() as s:
         known = [i.hdrezka_id for i in items]
         for i in items:
-            await svc.upsert_page_from_feed(s, i)
+            pg = await svc.upsert_page_from_feed(s, i)
+            if pg.franchise_id is None:
+                page_ids[i.hdrezka_id] = pg.id
         if known:
             # База знает больше карточки: сезон, завершённый по расписанию (сайт его так не пометил),
             # в «Сейчас выходит» не попадает — иначе предложим подписку на то, где серий не будет.
@@ -354,14 +382,20 @@ async def _site_search(note: Message, query: str, local_hidden: int = 0) -> None
                and i.hdrezka_id not in finished_known][:MAX_RESULTS]
     # Франшиза известна — отдельной строкой: «следить за всем новым» одним нажатием.
     fr_rows = [[(f"🎞 Франшиза «{name[:28]}»", f"subf:{fid}:{pid}")] for fid, name, pid in franchises]
+    # Завершённые без франшизы — карточкой: там «🔔 Сообщить о продолжении».
+    waiting = [i for i in items if (i.is_finished or i.hdrezka_id in finished_known) and not i.looks_like_film
+               and i.section in cfg.feed_sections and i.hdrezka_id in page_ids][:MAX_WAITING]
+    fr_rows += [[(f"🔔 {i.title[:34]} · завершён", f"pcard:{page_ids[i.hdrezka_id]}")] for i in waiting]
     if not ongoing:
         hidden = local_hidden + sum(1 for i in items if i.is_finished or i.looks_like_film
-                                    or i.hdrezka_id in finished_known)
+                                    or i.hdrezka_id in finished_known) - len(waiting)
         text_ = ("Сейчас ничего выходящего по этому запросу нет."
-                 + (f" Скрыто {hidden}: завершённые сезоны и фильмы — на них подписаться нельзя." if hidden else ""))
-        if fr_rows:
+                 + (f" Скрыто {hidden}: фильмы и завершённые части франшиз." if hidden > 0 else ""))
+        if franchises:
             text_ += "\n\nЕсть франшиза: подпишитесь на неё — сообщу о новых сезонах, фильмах, спин-оффах."
-        else:
+        if waiting:
+            text_ += "\n\nСезон вышел целиком? Откройте карточку — там «🔔 Сообщить о продолжении»."
+        if not franchises and not waiting:
             text_ += ("\n\nЕсли у тайтла есть франшиза — пришлите ссылку на любую его страницу, "
                       "предложу подписку на всю франшизу.")
         await note.edit_text(text_, reply_markup=_kb(fr_rows) if fr_rows else None)
@@ -448,7 +482,12 @@ async def _render_page_card(user_id: int, page_id: int, just_created: bool = Fal
     kind = SECTION_LABEL.get(page.section or "", "")
     if page.content_type == "film":
         kind = "фильм"
-    head = "✅ Подписал:" if (sub and just_created) else ("В подписках:" if sub else "Найдено:")
+    # Подписка на завершённую страницу = «жду продолжения» (docs/ARCHITECTURE.md §7, решение 3).
+    waiting = sub is not None and page.is_finished and page.content_type != "film"
+    if waiting:
+        head = "🔔 Сообщу о продолжении:" if just_created else "🔔 Жду продолжения:"
+    else:
+        head = "✅ Подписал:" if (sub and just_created) else ("В подписках:" if sub else "Найдено:")
     lines = [f"{head} <b>{page.title}</b>" + (f" · {kind}" if kind else "")]
     if page.content_type != "film" and page.last_season:
         if page.is_finished:
@@ -458,7 +497,10 @@ async def _render_page_card(user_id: int, page_id: int, just_created: bool = Fal
     if nxt:
         lines.append(f"Следующая серия: {_ru_date(nxt)}")
     rows = []
-    if sub:
+    if waiting:
+        lines.append("Сообщу, когда появится продолжение: новый сезон, фильм или спин-офф.")
+        rows.append([("❌ Больше не ждать", f"unsub:{sub.id}")])
+    elif sub:
         lines.append(f"Озвучка: {_voice_label(sub, voices)}")
         rows.append([("🎙 Выбрать озвучку", f"voices:{sub.id}")])
         rows.append([("❌ Отписаться", f"unsub:{sub.id}")])
@@ -466,8 +508,11 @@ async def _render_page_card(user_id: int, page_id: int, just_created: bool = Fal
         lines.append(f"Уже входит в вашу подписку на франшизу «{fr.name}».")
     elif page.content_type == "film":
         lines.append("Это фильм — на него подписаться нельзя, новых серий не будет.")
+    elif page.is_finished and fr is None:
+        lines.append("Сезон вышел целиком. Могу сообщить, когда появится продолжение.")
+        rows.append([("🔔 Сообщить о продолжении", f"wait:{page.hdrezka_id}")])
     elif page.is_finished:
-        lines.append("Сезон вышел целиком — подписаться на него нельзя.")
+        lines.append("Сезон вышел целиком — подписаться на него нельзя. О продолжении сообщит подписка на франшизу.")
     else:
         rows.append([("➕ Подписаться на этот сезон", f"sub:{page.hdrezka_id}")])
     if fr and parts > 1 and not fr_sub:
@@ -505,8 +550,9 @@ async def _too_many_subs(user_id: int) -> bool:
     return n >= guard.MAX_SUBSCRIPTIONS
 
 
-@dp.callback_query(F.data.startswith("sub:"))
+@dp.callback_query(F.data.regexp(r"^(sub|wait):"))
 async def cb_subscribe(cb: CallbackQuery) -> None:
+    """sub: — подписка на выходящий сезон; wait: — на завершённый, со смыслом «жду продолжения»."""
     if not guard.cheap_actions.allow(cb.from_user.id):
         await cb.answer(TOO_FAST, show_alert=False)
         return
@@ -524,7 +570,8 @@ async def cb_subscribe(cb: CallbackQuery) -> None:
                 await cb.answer("Карточка устарела — повторите поиск.", show_alert=True)
                 return
             page = await svc.upsert_page_from_feed(s, card[0])
-        if page.content_type == "film" or page.is_finished:
+        waiting = cb.data.startswith("wait:")
+        if page.content_type == "film" or (page.is_finished and not waiting):
             await s.commit()
             await cb.answer("На это подписаться нельзя: фильм или завершённый сезон.", show_alert=True)
             return
@@ -535,7 +582,7 @@ async def cb_subscribe(cb: CallbackQuery) -> None:
 
     # В выдаче поиска кнопка становится «✓ …» — результат виден без тоста.
     if cb.message and cb.message.reply_markup and cb.message.reply_markup.inline_keyboard:
-        tapped = any(b.callback_data == cb.data and b.text.startswith("➕")
+        tapped = any(b.callback_data == cb.data and b.text.startswith(("➕", "🔔"))
                      for row in cb.message.reply_markup.inline_keyboard for b in row)
         if tapped:
             rows = [[InlineKeyboardButton(
@@ -900,7 +947,7 @@ async def _render_my(user_id: int):
                     Schedule.page_id == p.id, Schedule.aired.is_(False), Schedule.air_date >= date.today()))
                 st = f"{p.last_season}×{p.last_episode}" if p.last_episode else "—"
                 extra = f" · след. {_ru_date(nxt)}" if nxt else ""
-                fin = " · завершён" if p.is_finished else ""
+                fin = " · завершён, жду продолжения" if p.is_finished else ""
                 lines.append(f'📺 <a href="{p.url}">{p.title}</a> — {st}{extra}{fin}')
                 label = p.title
             voices = await _voices_for_sub(s, sub)
@@ -1127,8 +1174,12 @@ async def _edit_message(m: Message, text_: str, kb: InlineKeyboardMarkup) -> Non
 @dp.errors()
 async def on_error(event: ErrorEvent) -> None:
     """Любая необработанная ошибка — в лог; бот продолжает работать."""
-    log.exception("Ошибка обработчика: %s", event.exception)
     upd = event.update
+    if isinstance(event.exception, TelegramBadRequest) and "query is too old" in str(event.exception):
+        # Нажатие из бэклога (во время перезапуска): Telegram уже не принимает ответ на него.
+        log.info("Просроченный callback %s — пропускаю", upd.callback_query.data if upd.callback_query else "?")
+        return
+    log.exception("Ошибка обработчика: %s", event.exception)
     try:
         if upd.message:
             await upd.message.answer("Что-то пошло не так. Попробуйте ещё раз чуть позже.")
@@ -1156,8 +1207,9 @@ async def main() -> None:
     ])
     log.info("Бот запущен")
     try:
-        # Накопившийся за простой бэклог не разгребаем; принимаем только нужные типы апдейтов.
-        await bot.delete_webhook(drop_pending_updates=True)
+        # Бэклог за время перезапуска сохраняем (устаревшие сообщения отсеет SkipStaleUpdates);
+        # принимаем только нужные типы апдейтов.
+        await bot.delete_webhook(drop_pending_updates=False)
         await dp.start_polling(bot, allowed_updates=["message", "callback_query"])
     finally:
         await client.close()

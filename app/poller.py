@@ -44,6 +44,7 @@ class Poller:
     def __init__(self) -> None:
         self.client = RezkaClient()
         self._read_failures: dict[int, int] = {}
+        self._cycle_new_parts = 0               # уведомлений new_part за цикл — для строки лога
 
     # ------------------------------------------------------------------ helpers
 
@@ -61,9 +62,41 @@ class Poller:
                     except AccessBlocked as exc:
                         log.warning("Не прочитал новую часть %s: %s", part.hdrezka_id, exc)
                     n = await svc.enqueue_new_part(s, res.franchise.id, part)
+                    self._cycle_new_parts += n
                     log.info("НОВАЯ ЧАСТЬ франшизы «%s»: %s → %s подписчикам",
                              res.franchise.name, part.title, n)
+        if res.franchise:
+            await self._adopt_waiting(s, res.franchise)
         return res
+
+    async def _adopt_waiting(self, s, fr: Franchise) -> None:
+        """«Жду продолжения» (§7, решение 3): подписка на завершённую часть франшизы переводится
+        на франшизу, а о частях-продолжениях (не завершены, не старше ждавшейся) уходит new_part.
+        Идемпотентно: после перевода ждущих у франшизы не остаётся. Срабатывает и на быстром пути
+        (новый сезон пришёл в ленту с 1-й серией, его страница показала старую в блоке франшизы),
+        и на запасном (недельное перечитывание завершённой страницы с подписчиками)."""
+        waiting = await svc.waiting_subscriptions(s, fr.id)
+        if not waiting:
+            return
+        parts = (await s.execute(select(Page).where(Page.franchise_id == fr.id))).scalars().all()
+        by_id = {p.id: p for p in parts}
+        moved = queued = 0
+        for user_id, page_id in waiting:
+            waited = by_id.get(page_id)
+            if waited is None:
+                continue
+            for part in svc.continuation_parts(parts, waited):
+                if part.page_refreshed_at is None and part.url:      # тип и статус части — со страницы
+                    try:
+                        await svc.sync_page(s, self.client, part.hdrezka_id, part.url)
+                    except AccessBlocked as exc:
+                        log.warning("Не прочитал часть %s для ждущего продолжения: %s", part.hdrezka_id, exc)
+            await svc.subscribe_franchise(s, user_id, fr.id)          # удаляет и подписку на страницу
+            moved += 1
+            for part in svc.continuation_parts(parts, waited):
+                queued += await svc.enqueue_new_part(s, fr.id, part, user_id=user_id)
+        self._cycle_new_parts += queued
+        log.info("ПРОДОЛЖЕНИЕ: франшиза «%s» — переведено подписок %s, уведомлений %s", fr.name, moved, queued)
 
     async def _candidate_for_sync(self, s, item: FeedItem) -> bool:
         """Неизвестная страница стоит одного запроса, если это начало сериала
@@ -179,10 +212,14 @@ class Poller:
     # ------------------------------------------------------------------ 4: франшизы
 
     async def refresh_franchises(self, s) -> int:
+        # Франшизы с подписчиками, а также с «ждущими продолжения» на завершённых частях:
+        # франшизу мог завести бот по ссылке (без перевода ждущих) — сверка переведёт их за сутки.
         rows = (await s.execute(text("""
-            SELECT DISTINCT f.id FROM franchises f
-              JOIN subscriptions sub ON sub.franchise_id = f.id
-             WHERE f.refreshed_at IS NULL OR f.refreshed_at < now() - make_interval(hours => :h)
+            SELECT f.id FROM franchises f
+             WHERE (EXISTS (SELECT 1 FROM subscriptions sub WHERE sub.franchise_id = f.id)
+                    OR EXISTS (SELECT 1 FROM subscriptions sub JOIN pages p ON p.id = sub.page_id
+                                WHERE p.franchise_id = f.id AND p.is_finished))
+               AND (f.refreshed_at IS NULL OR f.refreshed_at < now() - make_interval(hours => :h))
              ORDER BY f.id LIMIT :lim"""), {"h": FRANCHISE_REFRESH_HOURS, "lim": PER_CYCLE_FRANCHISES})).all()
         done = 0
         for (fid,) in rows:
@@ -206,7 +243,8 @@ class Poller:
               LEFT JOIN subscriptions sp ON sp.page_id = p.id
               LEFT JOIN subscriptions sf ON sf.franchise_id = p.franchise_id
              WHERE (sp.id IS NOT NULL OR sf.id IS NOT NULL)
-               AND NOT p.is_finished AND p.url <> ''
+               AND (NOT p.is_finished OR sp.id IS NOT NULL)    -- завершённые с «жду продолжения» — раз в неделю
+               AND p.url <> ''
                AND coalesce(p.content_type, 'series') = 'series'
                AND (p.page_refreshed_at IS NULL OR p.page_refreshed_at < now() - make_interval(days => :d))
              ORDER BY p.id LIMIT :lim"""), {"d": PAGE_REFRESH_DAYS, "lim": PER_CYCLE_PAGES})).all()
@@ -247,6 +285,7 @@ class Poller:
     async def cycle(self) -> None:
         async with session() as s:
             new_eps = queued = 0
+            self._cycle_new_parts = 0
             for section in cfg.feed_sections:
                 e, q = await self.process_feed(s, section)
                 new_eps += e
@@ -257,7 +296,8 @@ class Poller:
             rd = await self.read_pending_pages(s)
             await svc.meta_set(s, "last_poll_ok", svc.now().isoformat())
             await s.commit()
-        if new_eps or fr or pg or rd:
+        queued += self._cycle_new_parts
+        if new_eps or queued or fr or pg or rd:
             log.info("Цикл: новых серий=%s, уведомлений=%s, франшиз сверено=%s, страниц обновлено=%s, прочитано новых=%s",
                      new_eps, queued, fr, pg, rd)
 

@@ -279,16 +279,53 @@ async def enqueue_voice(s: AsyncSession, page: Page, episode_id: int, translator
     return r.rowcount or 0
 
 
-async def enqueue_new_part(s: AsyncSession, franchise_id: int, part: Page) -> int:
+async def enqueue_new_part(s: AsyncSession, franchise_id: int, part: Page, user_id: int | None = None) -> int:
+    """Всем подписчикам франшизы; с user_id — только ему (ждавший продолжения переведён на франшизу,
+    остальные подписчики об этой части уже знают)."""
     r = await s.execute(text("""
         INSERT INTO notifications (user_id, kind, ref_id, next_attempt_at)
         SELECT DISTINCT sub.user_id, 'new_part', CAST(:part_id AS bigint),
                notify_at(u.tz_offset, u.quiet_from, u.quiet_to, u.digest_hour)
           FROM subscriptions sub JOIN users u ON u.id = sub.user_id AND u.is_active
-         WHERE sub.franchise_id = :franchise_id
+         WHERE sub.franchise_id = :franchise_id AND (CAST(:uid AS bigint) IS NULL OR sub.user_id = :uid)
         ON CONFLICT ON CONSTRAINT uq_notification DO NOTHING
-    """), {"part_id": part.id, "franchise_id": franchise_id})
+    """), {"part_id": part.id, "franchise_id": franchise_id, "uid": user_id})
     return r.rowcount or 0
+
+
+# ----------------------------------------------------------------------------- «жду продолжения»
+
+async def waiting_subscriptions(s: AsyncSession, franchise_id: int) -> list[tuple[int, int]]:
+    """Подписки на завершённые части франшизы = «жду продолжения» (§7, решение 3): (user_id, page_id)."""
+    rows = await s.execute(text("""
+        SELECT sub.user_id, sub.page_id FROM subscriptions sub
+          JOIN pages p ON p.id = sub.page_id
+         WHERE p.franchise_id = :f AND p.is_finished
+         ORDER BY sub.id"""), {"f": franchise_id})
+    return [(u, pid) for u, pid in rows]
+
+
+def _year(p: Page) -> int | None:
+    try:
+        return int((p.year or "")[:4])
+    except ValueError:
+        return None
+
+
+def continuation_parts(parts: list[Page], waited: Page) -> list[Page]:
+    """Части франшизы, о которых стоит сообщить ждавшему продолжения: не та, которую ждали,
+    не завершённые, не старше ждавшейся по году (старые части и старые фильмы — не продолжение).
+    Непрочитанные (content_type NULL) проходят: вызывающий дочитает их и отфильтрует ещё раз."""
+    wy = _year(waited)
+    out = []
+    for p in parts:
+        if p.id == waited.id or p.is_finished:
+            continue
+        py = _year(p)
+        if wy is not None and py is not None and py < wy:
+            continue
+        out.append(p)
+    return out
 
 
 async def mark_voice_seen(s: AsyncSession, episode_id: int, translator_id: int) -> bool:
