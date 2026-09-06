@@ -1,5 +1,12 @@
 # HDREZKA → Telegram
 
+**EN.** A Telegram bot that watches HDREZKA for new episodes and notifies subscribers — per season or per
+franchise (new seasons, films, spin-offs). Python 3.12 · aiogram 3 · PostgreSQL 17 (delivery queue on
+`FOR UPDATE SKIP LOCKED`, pg_trgm search, Alembic) · Docker Compose · three processes (bot / poller / sender) ·
+pytest on saved HTML pages. Site load does not depend on the number of users: the poller reads the site's
+update feed, not subscriptions. UI in Russian, Ukrainian and English. Docs are in Russian:
+[ARCHITECTURE.md](docs/ARCHITECTURE.md), [PRODUCT_AND_SCALE.md](docs/PRODUCT_AND_SCALE.md).
+
 Бот, который следит за выходом новых серий на HDREZKA и присылает уведомления.
 Подписаться можно на **один сезон** или на **всю франшизу** — тогда бот сообщит
 и о новых сезонах, фильмах и спин-оффах.
