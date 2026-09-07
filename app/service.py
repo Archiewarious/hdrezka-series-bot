@@ -36,16 +36,18 @@ def now() -> datetime:
 # ----------------------------------------------------------------------------- users
 
 async def upsert_user(s: AsyncSession, user_id: int, username: str | None,
-                      language_code: str | None = None) -> str:
-    """Возвращает язык интерфейса. Язык из Telegram берём только при первом появлении человека:
-    дальше это его настройка (⚙️ → 🌐), и клиент Telegram её не перебивает."""
-    return await s.scalar(
+                      language_code: str | None = None) -> tuple[str, bool]:
+    """Возвращает (язык интерфейса, впервые ли видим этого человека). Язык из Telegram берём только
+    при первом появлении: дальше это его настройка (⚙️ → 🌐), и клиент Telegram её не перебивает.
+    `xmax = 0` у строки, которую вставили, а не обновили, — так отличаем нового от вернувшегося."""
+    row = (await s.execute(
         pg_insert(User)
         .values(id=user_id, username=username, is_active=True, lang=detect(language_code))
         .on_conflict_do_update(index_elements=[User.id],
                                set_={"username": username, "is_active": True, "blocked_at": None})
-        .returning(User.lang)
-    )
+        .returning(User.lang, text("(xmax = 0) AS inserted"))
+    )).first()
+    return row[0], bool(row[1])
 
 
 async def reschedule_pending(s: AsyncSession, user_id: int) -> int:

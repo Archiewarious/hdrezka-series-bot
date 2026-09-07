@@ -30,10 +30,11 @@ def test_plural_forms():
     assert plural("en", 0, ("a", "b")) == "b"
 
 
-def test_detect_and_fallback():
-    assert detect("uk") == "uk" and detect("en-US") == "en" and detect("ru") == "ru"
-    assert detect(None) == "ru" and detect("de") == "ru"
-    assert t("xx", "btn_my") == t("ru", "btn_my"), "неизвестный язык — русский"
+def test_detect_matches_botfather_localizations():
+    """Русский и украинский — свои, всё остальное английский: так же настроены описания в BotFather."""
+    assert detect("uk") == "uk" and detect("en-US") == "en" and detect("ru-RU") == "ru"
+    assert detect(None) == "en" and detect("de") == "en" and detect("pl") == "en"
+    assert t("xx", "btn_my") == t("ru", "btn_my"), "нет перевода ключа — берём русский"
 
 
 def test_dates():

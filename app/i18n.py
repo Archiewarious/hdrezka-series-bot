@@ -9,12 +9,15 @@ from __future__ import annotations
 from datetime import date
 
 LANGS = {"ru": "Русский", "uk": "Українська", "en": "English"}
-DEFAULT = "ru"
+DEFAULT = "ru"          # на него опирается t(), если перевода нет
+DETECT_FALLBACK = "en"  # язык Telegram не из наших трёх → английский, как Default-локализация в BotFather
 
 
 def detect(language_code: str | None) -> str:
+    """Язык нового пользователя по языку его Telegram. Совпадает с локализациями бота в BotFather:
+    русский и украинский — свои, всё остальное — английский (07.09.2026). Дальше решает выбор в ⚙️."""
     code = (language_code or "").lower()[:2]
-    return code if code in ("uk", "en") else DEFAULT
+    return code if code in LANGS else DETECT_FALLBACK
 
 
 def plural(lang: str, n: int, forms: tuple) -> str:
@@ -101,6 +104,11 @@ STRINGS: dict[str, dict[str, str | tuple]] = {
                "Tap “🔔 Follow” and you're done: I'll tell you about every new episode, and when the season "
                "ends — about the sequel: a new season, film or spin-off.\n\n"
                "Type a title or send a link to a page. The buttons below are all the controls. 👇"),
+    },
+    "choose_lang": {
+        "ru": "🌐 <b>Выберите язык</b>\nПотом его можно поменять в ⚙️ Настройках.",
+        "uk": "🌐 <b>Виберіть мову</b>\nПотім її можна змінити в ⚙️ Налаштуваннях.",
+        "en": "🌐 <b>Choose your language</b>\nYou can change it later in ⚙️ Settings.",
     },
     "start_pick": {"ru": "🔥 Сейчас выходят — можно начать отсюда:",
                    "uk": "🔥 Зараз виходять — можна почати звідси:",

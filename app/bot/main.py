@@ -99,10 +99,15 @@ async def _lang(user_id: int) -> str:
 
 
 async def _touch_user(s, user) -> str:
-    """upsert + язык в кэш: новый человек получает язык своего Telegram."""
-    lang = await svc.upsert_user(s, user.id, user.username, user.language_code)
-    _langs[user.id] = lang
+    lang, _ = await _touch_user2(s, user)
     return lang
+
+
+async def _touch_user2(s, user) -> tuple[str, bool]:
+    """upsert + язык в кэш. Второй элемент — впервые ли человек нажал Start (для выбора языка)."""
+    lang, is_new = await svc.upsert_user(s, user.id, user.username, user.language_code)
+    _langs[user.id] = lang
+    return lang, is_new
 
 
 def menu(lang: str) -> ReplyKeyboardMarkup:
@@ -156,7 +161,7 @@ async def _site(coro):
 @dp.message(CommandStart())
 async def cmd_start(msg: Message, command: CommandObject) -> None:
     async with session() as s:
-        lang = await _touch_user(s, msg.from_user)
+        lang, is_new = await _touch_user2(s, msg.from_user)
         await s.commit()
     arg = (command.args or "").strip()
     # Deep-link «поделиться» (§7.10): p_<hdrezka_id> — карточка страницы, f_<key> — обзор франшизы.
@@ -177,8 +182,36 @@ async def cmd_start(msg: Message, command: CommandObject) -> None:
             text_, kb = await _render_franchise_overview(msg.from_user.id, target[1], None)
             await msg.answer(text_, reply_markup=kb, disable_web_page_preview=True)
         return
+    if is_new:
+        # Первый Start: язык — осознанный выбор, а не догадка по клиенту Telegram.
+        # Вопрос задаём на языке, который определили: он же стоит в описании бота (BotFather).
+        await msg.answer(t(lang, "choose_lang"),
+                         reply_markup=_kb([[(name, f"startlang:{code}")] for code, name in LANGS.items()]))
+        return
+    await _welcome(msg, lang)
+
+
+async def _welcome(msg: Message, lang: str) -> None:
     await msg.answer(t(lang, "start"), reply_markup=menu(lang))
     await _suggest_airing(msg, lang)
+
+
+@dp.callback_query(F.data.startswith("startlang:"))
+async def cb_start_lang(cb: CallbackQuery) -> None:
+    """Выбор языка на первом экране: подтверждаем в том же сообщении и здороваемся уже на нём."""
+    code = cb.data.split(":")[1]
+    if code not in LANGS:
+        await cb.answer()
+        return
+    async with session() as s:
+        await _touch_user(s, cb.from_user)
+        u = await s.get(User, cb.from_user.id)
+        u.lang = code
+        await s.commit()
+    _langs[cb.from_user.id] = code
+    await cb.answer()
+    await _edit(cb, t(code, "lang_switched"), _kb([]))
+    await _welcome(cb.message, code)
 
 
 START_SUGGESTIONS = 5
