@@ -1172,13 +1172,22 @@ async def _render_settings(user_id: int):
              + t(lang, "set_delivery", v=delivery) + "\n"
              + t(lang, "set_voice", v=voice) + "\n"
              + t(lang, "set_lang", v=LANGS.get(u.lang, u.lang)))
-    quiet_row = [(t(lang, "btn_quiet_off"), "set:quiet"), (t(lang, "btn_quiet_edit"), "set:quietcfg")] if quiet_on \
-        else [(t(lang, "btn_quiet_on", f=QUIET_DEFAULT[0], t=QUIET_DEFAULT[1]), "set:quiet")]
-    rows = [[(t(lang, "btn_photos_off" if u.photos else "btn_photos_on"), "set:photos")],
-            quiet_row,
-            [(t(lang, "btn_tz_minus"), "set:tz:-1"), (_tz_label(lang, u.tz_offset), "noop"), (t(lang, "btn_tz_plus"), "set:tz:1")],
-            [(t(lang, "btn_digest_now") if u.digest_hour is not None else t(lang, "btn_digest", h=DIGEST_DEFAULT_HOUR), "set:digest")],
-            [(t(lang, "btn_default_voice"), "set:voice"), (t(lang, "btn_lang"), "set:lang")]]
+    # Кнопка показывает вариант, а не действие: галочка — то, что выбрано сейчас (07.09.2026).
+    # Раньше было «Тихие часы: выключить», и понять из этого текущее состояние было невозможно.
+    def opt(chosen: bool, key: str, **kw) -> str:
+        return ("☑ " if chosen else "☐ ") + t(lang, key, **kw)
+
+    qf, qt = (u.quiet_from, u.quiet_to) if quiet_on else QUIET_DEFAULT
+    rows = [[(opt(u.photos, "opt_photos_on"), "set:photos:1"),
+             (opt(not u.photos, "opt_photos_off"), "set:photos:0")],
+            [(opt(quiet_on, "opt_quiet_on", f=qf, t=qt), "set:quiet:1"),
+             (opt(not quiet_on, "opt_quiet_off"), "set:quiet:0")],
+            [(opt(u.digest_hour is None, "opt_digest_now"), "set:digest:0"),
+             (opt(u.digest_hour is not None, "opt_digest", h=u.digest_hour or DIGEST_DEFAULT_HOUR), "set:digest:1")],
+            [(t(lang, "btn_tz_minus"), "set:tz:-1"), (_tz_label(lang, u.tz_offset), "noop"), (t(lang, "btn_tz_plus"), "set:tz:1")]]
+    if quiet_on:
+        rows.append([(t(lang, "btn_quiet_edit"), "set:quietcfg")])
+    rows.append([(t(lang, "btn_default_voice"), "set:voice"), (t(lang, "btn_lang"), "set:lang")])
     return text_, _kb(rows)
 
 
@@ -1225,14 +1234,23 @@ async def cb_settings(cb: CallbackQuery) -> None:
     async with session() as s:
         await _touch_user(s, cb.from_user)
         u = await s.get(User, cb.from_user.id)
+        # Значение приходит в callback: повторное нажатие выбранного варианта ничего не меняет,
+        # а не переключает обратно (кнопки — варианты, а не тумблеры). Пустое значение — кнопка
+        # из старого сообщения, отправленного до 07.09.2026: там кнопки были тумблерами.
+        val = parts[2] if len(parts) > 2 else ""
         if what == "photos":
-            u.photos = not u.photos
+            u.photos = (val == "1") if val else not u.photos
         elif what == "quiet":
-            u.quiet_from, u.quiet_to = (None, None) if u.quiet_from is not None else QUIET_DEFAULT
+            on = (val == "1") if val else u.quiet_from is None
+            if not on:
+                u.quiet_from = u.quiet_to = None
+            elif u.quiet_from is None or u.quiet_to is None:
+                u.quiet_from, u.quiet_to = QUIET_DEFAULT     # свои часы не затираем
         elif what == "tz":
-            u.tz_offset = max(-12, min(14, u.tz_offset + int(parts[2])))
+            u.tz_offset = max(-12, min(14, u.tz_offset + int(val or 0)))
         elif what == "digest":
-            u.digest_hour = None if u.digest_hour is not None else DIGEST_DEFAULT_HOUR
+            on = (val == "1") if val else u.digest_hour is None
+            u.digest_hour = (u.digest_hour or DIGEST_DEFAULT_HOUR) if on else None
         if what in ("quiet", "tz", "digest"):
             await s.flush()
             await svc.reschedule_pending(s, cb.from_user.id)   # уже стоящие в очереди — по новым правилам
