@@ -1,5 +1,7 @@
 # HDREZKA → Telegram
 
+[![tests](https://github.com/Archiewarious/hdrezka-series-bot/actions/workflows/tests.yml/badge.svg)](https://github.com/Archiewarious/hdrezka-series-bot/actions/workflows/tests.yml)
+
 **EN.** A Telegram bot that watches HDREZKA for new episodes and notifies subscribers — per season or per
 franchise (new seasons, films, spin-offs). Python 3.12 · aiogram 3 · PostgreSQL 17 (delivery queue on
 `FOR UPDATE SKIP LOCKED`, pg_trgm search, Alembic) · Docker Compose · three processes (bot / poller / sender) ·
