@@ -31,7 +31,7 @@ from app.bot import guard
 from app.bot.search import MAX_WAITING, group_hits
 from app.config import cfg
 from app.db import init_db, session
-from app.i18n import LANGS, fmt_date, t, when
+from app.i18n import DETECT_FALLBACK, LANGS, fmt_date, t, when
 from app.models import Franchise, Page, Schedule, Subscription, User, Voice
 from app.rezka.client import AccessBlocked, RezkaClient
 from app.rezka.parser import FeedItem, parse_feed
@@ -1374,15 +1374,16 @@ async def main() -> None:
     bot = Bot(cfg.bot_token, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     global BOT_USERNAME
     BOT_USERNAME = (await bot.get_me()).username or BOT_USERNAME
-    # Список команд — на языке клиента Telegram (без language_code — для всех остальных, по-русски).
-    for lang in LANGS:
+    # Список команд: без language_code — запасной для всех прочих языков, дальше три явных.
+    # Запасной английский — как Default-локализация в BotFather и как detect() (07.09.2026).
+    for lang, code in [(DETECT_FALLBACK, None)] + [(l, l) for l in LANGS]:
         await bot.set_my_commands([
             BotCommand(command="my", description=t(lang, "cmd_my")),
             BotCommand(command="new", description=t(lang, "cmd_new")),
             BotCommand(command="calendar", description=t(lang, "cmd_calendar")),
             BotCommand(command="settings", description=t(lang, "cmd_settings")),
             BotCommand(command="help", description=t(lang, "cmd_help")),
-        ], language_code=None if lang == "ru" else lang)
+        ], language_code=code)
     log.info("Бот запущен")
     try:
         # Бэклог за время перезапуска сохраняем (устаревшие сообщения отсеет SkipStaleUpdates);
