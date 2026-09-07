@@ -271,6 +271,43 @@ async def cmd_settings(msg: Message) -> None:
     await msg.answer(text_, reply_markup=kb)
 
 
+CALENDAR_SQL = text("""
+    SELECT DISTINCT p.title, sc.season, sc.episode, sc.air_date
+      FROM subscriptions sub
+      JOIN pages p ON (p.id = sub.page_id OR (sub.franchise_id IS NOT NULL AND p.franchise_id = sub.franchise_id))
+      JOIN schedule sc ON sc.page_id = p.id
+     WHERE sub.user_id = :uid AND NOT sc.aired AND sc.air_date IS NOT NULL
+       AND sc.air_date >= current_date AND sc.air_date < current_date + :days
+       AND coalesce(p.content_type, 'series') = 'series'
+     ORDER BY sc.air_date, p.title, sc.season, sc.episode
+     LIMIT 60
+""")
+
+
+@dp.message(Command("calendar"))
+@dp.message(F.text.in_(MENU["btn_cal"]))
+async def cmd_calendar(msg: Message) -> None:
+    if not guard.cheap_actions.allow(msg.from_user.id):
+        return
+    lang = await _lang(msg.from_user.id)
+    async with session() as s:
+        rows = (await s.execute(CALENDAR_SQL, {"uid": msg.from_user.id, "days": CAL_DAYS})).all()
+        has_subs = await s.scalar(select(func.count()).select_from(Subscription).where(Subscription.user_id == msg.from_user.id))
+    if not has_subs:
+        await msg.answer(t(lang, "cal_no_subs"), reply_markup=menu(lang))
+        return
+    if not rows:
+        await msg.answer(t(lang, "cal_empty", n=CAL_DAYS) + t(lang, "cal_note"), reply_markup=menu(lang))
+        return
+    lines, cur = [t(lang, "cal_head", n=CAL_DAYS)], None
+    for title, season, episode, d in rows:
+        if d != cur:
+            cur = d
+            lines.append(f"\n<b>{when(lang, d)}</b>")
+        lines.append(f"  • {title[:36]} — {season}×{episode}")
+    await msg.answer("\n".join(lines) + t(lang, "cal_note"), reply_markup=menu(lang))
+
+
 @dp.message(Command("stats"))
 async def cmd_stats(msg: Message) -> None:
     if msg.from_user.id not in cfg.admin_ids:
@@ -881,43 +918,6 @@ async def cb_franchise_card(cb: CallbackQuery) -> None:
     text_, kb = await _render_franchise_card(cb.from_user.id, int(cb.data.split(":")[1]), created=False)
     await cb.answer()
     await _edit(cb, text_, kb)
-
-
-CALENDAR_SQL = text("""
-    SELECT DISTINCT p.title, sc.season, sc.episode, sc.air_date
-      FROM subscriptions sub
-      JOIN pages p ON (p.id = sub.page_id OR (sub.franchise_id IS NOT NULL AND p.franchise_id = sub.franchise_id))
-      JOIN schedule sc ON sc.page_id = p.id
-     WHERE sub.user_id = :uid AND NOT sc.aired AND sc.air_date IS NOT NULL
-       AND sc.air_date >= current_date AND sc.air_date < current_date + :days
-       AND coalesce(p.content_type, 'series') = 'series'
-     ORDER BY sc.air_date, p.title, sc.season, sc.episode
-     LIMIT 60
-""")
-
-
-@dp.message(Command("calendar"))
-@dp.message(F.text.in_(MENU["btn_cal"]))
-async def cmd_calendar(msg: Message) -> None:
-    if not guard.cheap_actions.allow(msg.from_user.id):
-        return
-    lang = await _lang(msg.from_user.id)
-    async with session() as s:
-        rows = (await s.execute(CALENDAR_SQL, {"uid": msg.from_user.id, "days": CAL_DAYS})).all()
-        has_subs = await s.scalar(select(func.count()).select_from(Subscription).where(Subscription.user_id == msg.from_user.id))
-    if not has_subs:
-        await msg.answer(t(lang, "cal_no_subs"), reply_markup=menu(lang))
-        return
-    if not rows:
-        await msg.answer(t(lang, "cal_empty", n=CAL_DAYS) + t(lang, "cal_note"), reply_markup=menu(lang))
-        return
-    lines, cur = [t(lang, "cal_head", n=CAL_DAYS)], None
-    for title, season, episode, d in rows:
-        if d != cur:
-            cur = d
-            lines.append(f"\n<b>{when(lang, d)}</b>")
-        lines.append(f"  • {title[:36]} — {season}×{episode}")
-    await msg.answer("\n".join(lines) + t(lang, "cal_note"), reply_markup=menu(lang))
 
 
 # ----------------------------------------------------------------------------- озвучки
