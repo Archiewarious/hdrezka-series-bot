@@ -934,6 +934,18 @@ async def _voices_for_sub(s, sub: Subscription) -> list[Voice]:
     return sorted(uniq.values(), key=lambda v: v.name.lower())
 
 
+async def _airing_voice_ids(s, sub: Subscription) -> set[int]:
+    """Озвучки, которые есть у выходящих сейчас частей. Только по ним и придут уведомления:
+    у подписки на франшизу список озвучек собирается со всех частей, и у старых сезонов бывают
+    студии, которые новый не озвучивают (живой случай 07.09.2026: AniLibria у ТВ-1 и ТВ-2,
+    но не у выходящего ТВ-3 — человек выбрал её и не получил бы ничего)."""
+    q = (select(Voice.translator_id).join(Page, Page.id == Voice.page_id)
+         .where(Page.is_finished.is_(False), Page.last_episode.isnot(None),
+                func.coalesce(Page.content_type, "series") != "film"))
+    q = q.where(Page.id == sub.page_id) if sub.page_id else q.where(Page.franchise_id == sub.franchise_id)
+    return set((await s.execute(q)).scalars())
+
+
 async def _own_sub(user_id: int, sub_id: int) -> Subscription | None:
     async with session() as s:
         sub = await s.get(Subscription, sub_id)
@@ -947,12 +959,19 @@ async def _render_voices(user_id: int, sub_id: int):
         return t(lang, "sub_not_found"), _kb([])
     async with session() as s:
         voices = await _voices_for_sub(s, sub)
+        airing = await _airing_voice_ids(s, sub)
     chosen = set(sub.voice_filter or [])
+    # Сначала те, что есть у выходящих частей: остальные бесполезны и помечены.
+    voices.sort(key=lambda v: (v.translator_id not in airing, v.name.lower()))
     rows = [[(("☑ " if not chosen else "☐ ") + t(lang, "voice_any_btn"), f"vany:{sub_id}")]]
-    rows += [[(f"{'☑' if v.translator_id in chosen else '☐'} {v.name[:36]}", f"vt:{sub_id}:{v.translator_id}")]
-             for v in voices[:40]]
+    for v in voices[:40]:
+        mark = "☑" if v.translator_id in chosen else "☐"
+        tail = "" if v.translator_id in airing else f" · {t(lang, 'voice_old_part')}"
+        rows.append([(f"{mark} {v.name[:30]}{tail}", f"vt:{sub_id}:{v.translator_id}")])
     rows.append([(t(lang, "btn_done"), f"card:{sub_id}")])
     hint = t(lang, "voices_hint") if voices else t(lang, "voices_unknown")
+    if chosen and airing and not (chosen & airing):
+        hint += t(lang, "voices_warn")
     return hint, _kb(rows)
 
 
