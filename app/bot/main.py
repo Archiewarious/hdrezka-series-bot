@@ -1172,18 +1172,19 @@ async def _render_settings(user_id: int):
              + t(lang, "set_delivery", v=delivery) + "\n"
              + t(lang, "set_voice", v=voice) + "\n"
              + t(lang, "set_lang", v=LANGS.get(u.lang, u.lang)))
-    # Кнопка показывает вариант, а не действие: галочка — то, что выбрано сейчас (07.09.2026).
-    # Раньше было «Тихие часы: выключить», и понять из этого текущее состояние было невозможно.
-    def opt(chosen: bool, key: str, **kw) -> str:
-        return ("☑ " if chosen else "☐ ") + t(lang, key, **kw)
+    # Кнопка показывает вариант, а не действие, галочка — на выбранном (07.09.2026).
+    # Первая кнопка в строке — подпись, к чему относится пара: без неё «Вкл / Выкл» висело
+    # в воздухе. Конкретные часы и время дайджеста живут в тексте выше, в кнопках их нет.
+    def opt(chosen: bool, key: str) -> str:
+        return ("☑ " if chosen else "☐ ") + t(lang, key)
 
-    qf, qt = (u.quiet_from, u.quiet_to) if quiet_on else QUIET_DEFAULT
-    rows = [[(opt(u.photos, "opt_photos_on"), "set:photos:1"),
-             (opt(not u.photos, "opt_photos_off"), "set:photos:0")],
-            [(opt(quiet_on, "opt_quiet_on", f=qf, t=qt), "set:quiet:1"),
-             (opt(not quiet_on, "opt_quiet_off"), "set:quiet:0")],
-            [(opt(u.digest_hour is None, "opt_digest_now"), "set:digest:0"),
-             (opt(u.digest_hour is not None, "opt_digest", h=u.digest_hour or DIGEST_DEFAULT_HOUR), "set:digest:1")],
+    rows = [[(t(lang, "lbl_photos"), "noop"),
+             (opt(u.photos, "opt_on"), "set:photos:1"), (opt(not u.photos, "opt_off"), "set:photos:0")],
+            [(t(lang, "lbl_quiet"), "noop"),
+             (opt(quiet_on, "opt_on"), "set:quiet:1"), (opt(not quiet_on, "opt_off"), "set:quiet:0")],
+            [(t(lang, "lbl_delivery"), "noop"),
+             (opt(u.digest_hour is None, "opt_now"), "set:digest:0"),
+             (opt(u.digest_hour is not None, "opt_digest_short"), "set:digest:1")],
             [(t(lang, "btn_tz_minus"), "set:tz:-1"), (_tz_label(lang, u.tz_offset), "noop"), (t(lang, "btn_tz_plus"), "set:tz:1")]]
     if quiet_on:
         rows.append([(t(lang, "btn_quiet_edit"), "set:quietcfg")])
