@@ -961,12 +961,14 @@ async def _render_voices(user_id: int, sub_id: int):
         voices = await _voices_for_sub(s, sub)
         airing = await _airing_voice_ids(s, sub)
     chosen = set(sub.voice_filter or [])
-    # Сначала те, что есть у выходящих частей: остальные бесполезны и помечены.
-    voices.sort(key=lambda v: (v.translator_id not in airing, v.name.lower()))
+    # Сначала те, что есть у выходящих частей; остальные помечены «пока нет» — выбрать их можно,
+    # поллер месяц перепроверяет, не появилась ли серия в этой озвучке. Если не выходит ничего
+    # (подписка «жду продолжения»), пометка не значит ничего и не ставится.
+    voices.sort(key=lambda v: (v.translator_id not in airing, v.name.lower()) if airing else (False, v.name.lower()))
     rows = [[(("☑ " if not chosen else "☐ ") + t(lang, "voice_any_btn"), f"vany:{sub_id}")]]
     for v in voices[:40]:
         mark = "☑" if v.translator_id in chosen else "☐"
-        tail = "" if v.translator_id in airing else f" · {t(lang, 'voice_old_part')}"
+        tail = "" if not airing or v.translator_id in airing else f" · {t(lang, 'voice_old_part')}"
         rows.append([(f"{mark} {v.name[:30]}{tail}", f"vt:{sub_id}:{v.translator_id}")])
     rows.append([(t(lang, "btn_done"), f"card:{sub_id}")])
     hint = t(lang, "voices_hint") if voices else t(lang, "voices_unknown")

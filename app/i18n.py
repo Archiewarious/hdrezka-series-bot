@@ -331,11 +331,14 @@ STRINGS: dict[str, dict[str, str | tuple]] = {
     "sub_not_found": {"ru": "Подписка не найдена.", "uk": "Підписку не знайдено.", "en": "Subscription not found."},
     "voice_any_btn": {"ru": "Любая озвучка", "uk": "Будь-яка озвучка", "en": "Any dub"},
     "btn_done": {"ru": "« Готово", "uk": "« Готово", "en": "« Done"},
-    "voice_old_part": {"ru": "нет в новых", "uk": "немає в нових", "en": "not in new"},
+    "voice_old_part": {"ru": "пока нет", "uk": "поки немає", "en": "not yet"},
     "voices_warn": {
-        "ru": "\n\n⚠️ Выбранных озвучек нет у выходящих частей — уведомлений не будет. Отметьте другую или «Любая».",
-        "uk": "\n\n⚠️ Вибраних озвучок немає у частинах, що виходять — сповіщень не буде. Позначте іншу або «Будь-яка».",
-        "en": "\n\n⚠️ The dubs you picked are absent from the airing parts — you'll get no notifications. Pick another one or “Any”.",
+        "ru": ("\n\n⚠️ Выбранных озвучек у выходящих серий пока нет. Месяц буду проверять, не возьмётся ли "
+               "студия за сериал, но если не возьмётся — уведомлений не будет. Надёжнее отметить ту, что выходит, или «Любая»."),
+        "uk": ("\n\n⚠️ Вибраних озвучок у серій, що виходять, поки немає. Місяць перевірятиму, чи візьметься "
+               "студія за серіал, але якщо ні — сповіщень не буде. Надійніше позначити ту, що виходить, або «Будь-яка»."),
+        "en": ("\n\n⚠️ The dubs you picked are not on the airing episodes yet. I'll keep checking for a month in case "
+               "the studio takes the show on, but if it doesn't, you'll get nothing. Safer to pick one that airs, or “Any”."),
     },
     "voices_hint": {
         "ru": "Отмечайте нужные озвучки — уведомлю, когда серия появится именно в них.\n«Любая» — сообщаю при первом появлении серии.",
