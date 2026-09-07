@@ -81,6 +81,7 @@ STRINGS: dict[str, dict[str, str | tuple]] = {
     "btn_cal": {"ru": "📅 Календарь", "uk": "📅 Календар", "en": "📅 Calendar"},
     "btn_settings": {"ru": "⚙️ Настройки", "uk": "⚙️ Налаштування", "en": "⚙️ Settings"},
     "btn_help": {"ru": "❓ Помощь", "uk": "❓ Допомога", "en": "❓ Help"},
+    "cmd_start": {"ru": "Начать заново", "uk": "Почати заново", "en": "Start over"},
     "cmd_my": {"ru": "Мои подписки", "uk": "Мої підписки", "en": "My subscriptions"},
     "cmd_new": {"ru": "Что вышло за неделю", "uk": "Що вийшло за тиждень", "en": "Released this week"},
     "cmd_calendar": {"ru": "Календарь выхода серий", "uk": "Календар виходу серій", "en": "Episode calendar"},

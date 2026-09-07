@@ -1378,6 +1378,9 @@ async def main() -> None:
     # Запасной английский — как Default-локализация в BotFather и как detect() (07.09.2026).
     for lang, code in [(DETECT_FALLBACK, None)] + [(l, l) for l in LANGS]:
         await bot.set_my_commands([
+            # /start в списке: если человек очистил чат, нижнее меню исчезает вместе с сообщениями,
+            # и вернуть его больше нечем (07.09.2026).
+            BotCommand(command="start", description=t(lang, "cmd_start")),
             BotCommand(command="my", description=t(lang, "cmd_my")),
             BotCommand(command="new", description=t(lang, "cmd_new")),
             BotCommand(command="calendar", description=t(lang, "cmd_calendar")),
