@@ -277,7 +277,8 @@ CALENDAR_SQL = text("""
       JOIN pages p ON (p.id = sub.page_id OR (sub.franchise_id IS NOT NULL AND p.franchise_id = sub.franchise_id))
       JOIN schedule sc ON sc.page_id = p.id
      WHERE sub.user_id = :uid AND NOT sc.aired AND sc.air_date IS NOT NULL
-       AND sc.air_date >= current_date AND sc.air_date < current_date + :days
+       -- CAST обязателен: asyncpg шлёт параметр без типа, а «date + unknown» неоднозначен
+       AND sc.air_date >= current_date AND sc.air_date < current_date + CAST(:days AS int)
        AND coalesce(p.content_type, 'series') = 'series'
      ORDER BY sc.air_date, p.title, sc.season, sc.episode
      LIMIT 60
