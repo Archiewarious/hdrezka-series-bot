@@ -479,12 +479,13 @@ async def _render_page_card(user_id: int, page_id: int, just_created: bool = Fal
     kind = _section_label(lang, page.section)
     if page.content_type == "film":
         kind = t(lang, "kind_film")
-    # Подписка на завершённую страницу = «жду продолжения» (docs/ARCHITECTURE.md §7, решение 3).
-    waiting = sub is not None and page.is_finished and page.content_type != "film"
-    if waiting:
+    state = svc.card_state(page, sub is not None, bool(fr_sub), fr is not None)
+    if state == "waiting":
         head = t(lang, "head_wait_created" if just_created else "head_waiting")
+    elif state == "subscribed":
+        head = t(lang, "head_subscribed_new" if just_created else "head_in_subs")
     else:
-        head = t(lang, "head_subscribed_new" if (sub and just_created) else ("head_in_subs" if sub else "head_found"))
+        head = t(lang, "head_in_subs" if state == "franchise_sub" else "head_found")
     lines = [f"{head} <b>{page.title}</b>" + (f" · {kind}" if kind else "")]
     if page.content_type != "film" and page.last_season:
         if page.is_finished:
@@ -494,26 +495,35 @@ async def _render_page_card(user_id: int, page_id: int, just_created: bool = Fal
     if nxt:
         lines.append(t(lang, "next_episode", d=fmt_date(lang, nxt)))
     rows = []
-    if waiting:
+    if state == "waiting":
         lines.append(t(lang, "wait_desc"))
         rows.append([(t(lang, "btn_stop_waiting"), f"unsub:{sub.id}")])
-    elif sub:
+    elif state == "subscribed":
         lines.append(t(lang, "voice_line", v=_voice_label(lang, sub, voices)))
         rows.append([(t(lang, "btn_choose_voice"), f"voices:{sub.id}")])
         rows.append([(t(lang, "btn_unsubscribe"), f"unsub:{sub.id}")])
-    elif fr_sub:
+    elif state == "franchise_sub":
+        # Раньше здесь не было ни одной кнопки: человек не понимал, подписан он или нет (07.09.2026).
         lines.append(t(lang, "in_franchise_sub", name=fr.name))
-    elif page.content_type == "film":
+        rows.append([(t(lang, "btn_open_franchise", name=fr.name[:24]), f"fcard:{fr.id}")])
+        rows.append([(t(lang, "btn_unfollow_fr"), f"unsubq:{fr_sub}")])
+    elif state == "film":
         lines.append(t(lang, "film_no_sub"))
-    elif page.is_finished and fr is None:
+    elif state == "finished_alone":
         lines.append(t(lang, "finished_offer_wait"))
         rows.append([(t(lang, "btn_wait"), f"wait:{page.hdrezka_id}")])
-    elif page.is_finished:
+    elif state == "finished_franchise":
         lines.append(t(lang, "finished_in_franchise"))
     else:
-        rows.append([(t(lang, "btn_sub_season"), f"sub:{page.hdrezka_id}")])
-    if fr and parts > 1 and not fr_sub:
-        rows.append([(t(lang, "btn_whole_franchise", name=fr.name[:24], n=parts), f"subf:{fr.id}:{page.id}")])
+        # «Нажал и забыл»: франшиза известна — подписываем на неё целиком, иначе на страницу
+        # (она сама станет «жду продолжения», когда сезон закончится).
+        lines.append(t(lang, "follow_desc_franchise" if fr else "follow_desc"))
+        rows.append([(t(lang, "btn_follow"), f"subf_all:{fr.id}" if fr else f"sub:{page.hdrezka_id}")])
+    if fr and parts > 1 and state != "franchise_sub":
+        # Кнопка «Следить» уже покрывает всю франшизу — здесь только выбор отдельных частей.
+        label = (t(lang, "btn_fr_parts_n", n=parts) if state == "follow"
+                 else t(lang, "btn_whole_franchise", name=fr.name[:24], n=parts))
+        rows.append([(label, f"subf:{fr.id}:{page.id}")])
     if page.content_type != "film":
         rows.append([(t(lang, "btn_schedule"), f"sched:p:{page.id}"), (t(lang, "btn_open_site"), page.url)])
     else:
@@ -1005,7 +1015,7 @@ async def cb_unsubscribe_ask(cb: CallbackQuery) -> None:
         await cb.answer(t(lang, "too_fast"))
         return
     sub_id = int(cb.data.split(":")[1])
-    await _swap_last_row(cb, [InlineKeyboardButton(text=t(lang, "btn_unsub_yes"), callback_data=f"unsub:{sub_id}"),
+    await _swap_row(cb, [InlineKeyboardButton(text=t(lang, "btn_unsub_yes"), callback_data=f"unsub:{sub_id}"),
                               InlineKeyboardButton(text=t(lang, "btn_keep"), callback_data=f"keep:{sub_id}")])
     await cb.answer()
 
@@ -1019,13 +1029,16 @@ async def cb_keep(cb: CallbackQuery) -> None:
     sub_id = int(cb.data.split(":")[1])
     sub = await _own_sub(cb.from_user.id, sub_id)
     label = t(lang, "btn_unfollow_fr" if sub and sub.scope == "franchise" else "btn_unfollow")
-    await _swap_last_row(cb, [InlineKeyboardButton(text=label, callback_data=f"unsubq:{sub_id}")])
+    await _swap_row(cb, [InlineKeyboardButton(text=label, callback_data=f"unsubq:{sub_id}")])
     await cb.answer()
 
 
-async def _swap_last_row(cb: CallbackQuery, row: list[InlineKeyboardButton]) -> None:
+async def _swap_row(cb: CallbackQuery, row: list[InlineKeyboardButton]) -> None:
+    """Подтверждение подменяет ряд нажатой кнопки. В уведомлении он последний, а в карточке сериала
+    ниже ещё расписание и «Поделиться» — по индексу, иначе подтверждение съело бы чужие кнопки."""
     kb = cb.message.reply_markup.inline_keyboard if cb.message and cb.message.reply_markup else []
-    rows = list(kb[:-1]) + [row]
+    idx = next((i for i, r in enumerate(kb) if any(b.callback_data == cb.data for b in r)), len(kb) - 1)
+    rows = [row if i == idx else list(r) for i, r in enumerate(kb)] or [row]
     try:
         await cb.message.edit_reply_markup(reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
     except TelegramBadRequest as exc:

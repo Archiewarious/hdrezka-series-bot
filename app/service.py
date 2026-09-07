@@ -222,6 +222,29 @@ def finished_by_silence(page: Page, has_schedule: bool, at: datetime | None = No
     return known is not None and (at - known).days >= QUIET_DAYS
 
 
+def card_state(page: Page, page_sub: bool, franchise_sub: bool, franchise: bool) -> str:
+    """Что показывает карточка сериала. Порядок важен: своя подписка сильнее подписки на франшизу.
+
+    waiting            — подписка на завершённую страницу = «жду продолжения» (§7, решение 3)
+    subscribed         — подписка на эту страницу
+    franchise_sub      — страница входит в подписку на франшизу (кнопки ведут в карточку франшизы)
+    film               — фильм: следить не за чем
+    finished_alone     — завершён, франшизы нет → «🔔 Сообщить о продолжении»
+    finished_franchise — завершён, но франшиза есть → следить надо за ней
+    follow             — идёт: одна кнопка «🔔 Следить» (франшиза целиком, если она известна)
+    """
+    film = page.content_type == "film"
+    if page_sub:
+        return "waiting" if (page.is_finished and not film) else "subscribed"
+    if franchise_sub:
+        return "franchise_sub"
+    if film:
+        return "film"
+    if page.is_finished:
+        return "finished_franchise" if franchise else "finished_alone"
+    return "follow"
+
+
 async def _apply_franchise(s: AsyncSession, page: Page, tp: TitlePage):
     if not tp.franchise:
         return None, False, []
@@ -328,14 +351,18 @@ async def enqueue_voice(s: AsyncSession, page: Page, episode_id: int, translator
 
 
 async def enqueue_new_part(s: AsyncSession, franchise_id: int, part: Page, user_id: int | None = None) -> int:
-    """Всем подписчикам франшизы; с user_id — только ему (ждавший продолжения переведён на франшизу,
-    остальные подписчики об этой части уже знают)."""
+    """Подписчикам франшизы и подписчикам любой её части: «нажал и забыл» — новый сезон, фильм или
+    спин-офф приходит и тому, кто следит за одним сезоном (06.09.2026).
+    С user_id — только ему (ждавший продолжения переведён на франшизу, остальные уже знают)."""
     r = await s.execute(text("""
         INSERT INTO notifications (user_id, kind, ref_id, next_attempt_at)
         SELECT DISTINCT sub.user_id, 'new_part', CAST(:part_id AS bigint),
                notify_at(u.tz_offset, u.quiet_from, u.quiet_to, u.digest_hour)
           FROM subscriptions sub JOIN users u ON u.id = sub.user_id AND u.is_active
-         WHERE sub.franchise_id = :franchise_id AND (CAST(:uid AS bigint) IS NULL OR sub.user_id = :uid)
+          LEFT JOIN pages p ON p.id = sub.page_id
+         WHERE (sub.franchise_id = :franchise_id OR p.franchise_id = :franchise_id)
+           AND sub.page_id IS DISTINCT FROM :part_id          -- о своей же странице не пишем
+           AND (CAST(:uid AS bigint) IS NULL OR sub.user_id = :uid)
         ON CONFLICT ON CONSTRAINT uq_notification DO NOTHING
     """), {"part_id": part.id, "franchise_id": franchise_id, "uid": user_id})
     return r.rowcount or 0

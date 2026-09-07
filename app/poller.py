@@ -53,8 +53,10 @@ class Poller:
         """Читает страницу и, если франшиза уже была известна, уведомляет о новых частях."""
         res = await svc.sync_page(s, self.client, hdrezka_id, url)
         if res.franchise and res.franchise_was_known and res.new_parts:
-            has_subs = await s.scalar(text(
-                "SELECT 1 FROM subscriptions WHERE franchise_id = :f LIMIT 1"), {"f": res.franchise.id})
+            # Подписчик франшизы или любой её части: часть стоит прочитать ради текста уведомления.
+            has_subs = await s.scalar(text("""
+                SELECT 1 FROM subscriptions sub LEFT JOIN pages p ON p.id = sub.page_id
+                 WHERE sub.franchise_id = :f OR p.franchise_id = :f LIMIT 1"""), {"f": res.franchise.id})
             for part in res.new_parts:
                 if has_subs and part.url:
                     # Читаем новую часть, чтобы знать тип (фильм/сериал) для текста уведомления.
