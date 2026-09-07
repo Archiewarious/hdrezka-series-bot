@@ -89,19 +89,22 @@ STRINGS: dict[str, dict[str, str | tuple]] = {
         "en": "\n\n<i>To add more, type a title. Your list is under “📋 My subscriptions”.</i>",
     },
     "start": {
-        "ru": ("Привет! Я сообщу, когда выйдет новая серия.\n\n"
-               "Напишите название — например, «слизь» — и выберите, за чем следить. Можно за одним сезоном, "
-               "а можно за всей франшизой: тогда расскажу и о новых сезонах, фильмах, спин-оффах.\n\n"
-               "Кнопки внизу — всё управление. 👇"),
-        "uk": ("Привіт! Я повідомлю, коли вийде нова серія.\n\n"
-               "Напишіть назву — наприклад, «слиз» — і виберіть, за чим стежити. Можна за одним сезоном, "
-               "а можна за всією франшизою: тоді розповім і про нові сезони, фільми, спін-офи.\n\n"
-               "Кнопки внизу — все керування. 👇"),
-        "en": ("Hi! I'll let you know when a new episode is out.\n\n"
-               "Type a title — for example “slime” — and choose what to follow. You can follow a single season "
-               "or the whole franchise: then I'll also tell you about new seasons, films and spin-offs.\n\n"
-               "The buttons below are all the controls. 👇"),
+        "ru": ("Привет! Я слежу за HDREZKA и пишу, когда выходит новая серия.\n\n"
+               "Нажмите «🔔 Следить» — и больше ничего делать не нужно: расскажу о каждой новой серии, "
+               "а когда сезон закончится — о продолжении: новом сезоне, фильме или спин-оффе.\n\n"
+               "Напишите название или пришлите ссылку на страницу. Кнопки внизу — всё управление. 👇"),
+        "uk": ("Привіт! Я стежу за HDREZKA і пишу, коли виходить нова серія.\n\n"
+               "Натисніть «🔔 Стежити» — і більше нічого робити не потрібно: розповім про кожну нову серію, "
+               "а коли сезон завершиться — про продовження: новий сезон, фільм або спін-оф.\n\n"
+               "Напишіть назву або надішліть посилання на сторінку. Кнопки внизу — усе керування. 👇"),
+        "en": ("Hi! I watch HDREZKA and message you when a new episode is out.\n\n"
+               "Tap “🔔 Follow” and you're done: I'll tell you about every new episode, and when the season "
+               "ends — about the sequel: a new season, film or spin-off.\n\n"
+               "Type a title or send a link to a page. The buttons below are all the controls. 👇"),
     },
+    "start_pick": {"ru": "🔥 Сейчас выходят — можно начать отсюда:",
+                   "uk": "🔥 Зараз виходять — можна почати звідси:",
+                   "en": "🔥 Airing now — you can start here:"},
     "help": {
         "ru": ("Слежу за выходом новых серий на HDREZKA и присылаю уведомления.\n\n"
                "<b>Как подписаться</b>\n"

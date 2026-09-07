@@ -178,6 +178,21 @@ async def cmd_start(msg: Message, command: CommandObject) -> None:
             await msg.answer(text_, reply_markup=kb, disable_web_page_preview=True)
         return
     await msg.answer(t(lang, "start"), reply_markup=menu(lang))
+    await _suggest_airing(msg, lang)
+
+
+START_SUGGESTIONS = 5
+
+
+async def _suggest_airing(msg: Message, lang: str) -> None:
+    """Первый экран (07.09.2026): подписаться можно сразу, не придумывая название. Отдельным
+    сообщением — нижнее меню и inline-кнопки в одном сообщении не уживаются."""
+    async with session() as s:
+        rows = await svc.airing_now(s, START_SUGGESTIONS)
+    if not rows:
+        return
+    await msg.answer(t(lang, "start_pick"), reply_markup=_kb(
+        [[(f"📺 {title[:30]} · {season}×{episode}", f"pcard:{pid}")] for pid, title, season, episode in rows]))
 
 
 @dp.message(Command("help"))

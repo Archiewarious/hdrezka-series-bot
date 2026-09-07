@@ -456,6 +456,27 @@ async def franchise_stats(s: AsyncSession, ids: list[int]) -> dict[int, tuple[st
     return {fid: (name, parts, ongoing) for fid, name, parts, ongoing in rows}
 
 
+AIRING_SQL = text("""
+    SELECT id, title, last_season, last_episode FROM (
+        SELECT DISTINCT ON (coalesce(p.franchise_id, -p.id))
+               p.id, p.title, p.last_season, p.last_episode,
+               (p.last_event_at IS NOT NULL) AS seen,          -- серию видели сами: такой тайтл живой наверняка
+               coalesce(p.last_event_at, p.created_at) AS fresh
+          FROM pages p
+         WHERE NOT p.is_finished AND coalesce(p.content_type, 'series') = 'series'
+           AND p.last_episode IS NOT NULL AND p.url <> '' AND p.section IS NOT NULL
+           AND (p.year IS NULL OR p.year >= :since_year)
+         ORDER BY coalesce(p.franchise_id, -p.id), seen DESC, fresh DESC) t
+     ORDER BY seen DESC, fresh DESC LIMIT :lim""")
+
+
+async def airing_now(s: AsyncSession, limit: int) -> list[tuple[int, str, int, int]]:
+    """Что предложить на первом экране: выходящие сериалы, по одному на франшизу, свежие сверху.
+    Популярности сайт не отдаёт, поэтому «сейчас выходят» — честная формулировка, не «популярное»."""
+    rows = await s.execute(AIRING_SQL, {"lim": limit, "since_year": str(now().year - 1)})
+    return [tuple(r) for r in rows]
+
+
 # ----------------------------------------------------------------------------- subscriptions
 
 async def _default_voices(s: AsyncSession, user_id: int) -> list[int] | None:
