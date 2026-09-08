@@ -331,6 +331,9 @@ STRINGS: dict[str, dict[str, str | tuple]] = {
     "sub_not_found": {"ru": "Подписка не найдена.", "uk": "Підписку не знайдено.", "en": "Subscription not found."},
     "voice_any_btn": {"ru": "Любая озвучка", "uk": "Будь-яка озвучка", "en": "Any dub"},
     "btn_done": {"ru": "« Готово", "uk": "« Готово", "en": "« Done"},
+    "voice_missing_now": {"ru": " ⚠️ пока не выходит в этой озвучке",
+                          "uk": " ⚠️ поки не виходить у цій озвучці",
+                          "en": " ⚠️ not airing in this dub yet"},
     "voice_old_part": {"ru": "пока нет", "uk": "поки немає", "en": "not yet"},
     "voices_warn": {
         "ru": ("\n\n⚠️ Выбранных озвучек у выходящих серий пока нет. Месяц буду проверять, не возьмётся ли "

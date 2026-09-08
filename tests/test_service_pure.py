@@ -68,3 +68,12 @@ def test_silence_recent_feed_episode_or_schedule_wins():
     assert not finished_by_silence(_page("2020", known_days=400, event_days=QUIET_DAYS - 1), False, NOW)
     assert finished_by_silence(_page("2020", known_days=400, event_days=QUIET_DAYS), False, NOW)
     assert not finished_by_silence(_page("2020", known_days=400), True, NOW)   # расписание есть — решает оно
+
+
+def test_pick_voices_keeps_only_available():
+    """Озвучка по умолчанию не должна попадать в подписку, если у тайтла её нет: иначе тишина."""
+    from app.service import pick_voices
+    assert pick_voices([19, 56], {56, 224}) == [56]
+    assert pick_voices([19], {56, 224}) is None, "совпадений нет — значит «любая», а не пустой фильтр"
+    assert pick_voices(None, {56}) is None and pick_voices([], {56}) is None
+    assert pick_voices([56, 19], {19, 56}) == [19, 56]

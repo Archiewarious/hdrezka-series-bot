@@ -481,13 +481,30 @@ async def airing_now(s: AsyncSession, limit: int) -> list[tuple[int, str, int, i
 
 # ----------------------------------------------------------------------------- subscriptions
 
-async def _default_voices(s: AsyncSession, user_id: int) -> list[int] | None:
-    return await s.scalar(text("SELECT default_voice_filter FROM users WHERE id = :u"), {"u": user_id})
+def pick_voices(wanted: list[int] | None, have: set[int]) -> list[int] | None:
+    """Озвучка по умолчанию, суженная до тех, что реально есть у тайтла. Пусто — значит «любая»:
+    подписка с фильтром, которого у страницы нет, молчала бы навсегда (08.09.2026)."""
+    both = sorted(set(wanted or []) & have)
+    return both or None
+
+
+async def _default_voices(s: AsyncSession, user_id: int, page_id: int | None = None,
+                          franchise_id: int | None = None) -> list[int] | None:
+    wanted = await s.scalar(text("SELECT default_voice_filter FROM users WHERE id = :u"), {"u": user_id})
+    if not wanted:
+        return None
+    have = set((await s.execute(text("""
+        SELECT DISTINCT v.translator_id FROM voices v JOIN pages p ON p.id = v.page_id
+         WHERE p.id = :page_id
+            OR (p.franchise_id = :franchise_id AND NOT p.is_finished AND p.last_episode IS NOT NULL
+                AND coalesce(p.content_type, 'series') <> 'film')"""),
+        {"page_id": page_id or -1, "franchise_id": franchise_id or -1})).scalars())
+    return pick_voices(wanted, have)
 
 
 async def subscribe_page(s: AsyncSession, user_id: int, page_id: int) -> bool:
     stmt = (pg_insert(Subscription).values(user_id=user_id, scope="page", page_id=page_id,
-                                           voice_filter=await _default_voices(s, user_id))
+                                           voice_filter=await _default_voices(s, user_id, page_id=page_id))
             .on_conflict_do_nothing(index_elements=["user_id", "page_id"],
                                     index_where=text("page_id IS NOT NULL"))
             .returning(Subscription.id))
@@ -497,7 +514,7 @@ async def subscribe_page(s: AsyncSession, user_id: int, page_id: int) -> bool:
 async def subscribe_franchise(s: AsyncSession, user_id: int, franchise_id: int) -> bool:
     """Подписка на франшизу поглощает подписки на её страницы — в /my одна строка."""
     stmt = (pg_insert(Subscription).values(user_id=user_id, scope="franchise", franchise_id=franchise_id,
-                                           voice_filter=await _default_voices(s, user_id))
+                                           voice_filter=await _default_voices(s, user_id, franchise_id=franchise_id))
             .on_conflict_do_nothing(index_elements=["user_id", "franchise_id"],
                                     index_where=text("franchise_id IS NOT NULL"))
             .returning(Subscription.id))

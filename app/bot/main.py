@@ -562,6 +562,10 @@ async def _render_page_card(user_id: int, page_id: int, just_created: bool = Fal
         fr_sub = fr and await s.scalar(select(Subscription.id).where(
             Subscription.user_id == user_id, Subscription.franchise_id == fr.id))
 
+    # Выбранной озвучки нет у выходящих частей — уведомлений не будет, и это надо сказать вслух,
+    # а не оставлять человека гадать, почему тихо (08.09.2026).
+    warn = await _voice_warning(lang, sub)
+
     kind = _section_label(lang, page.section)
     if page.content_type == "film":
         kind = t(lang, "kind_film")
@@ -585,7 +589,7 @@ async def _render_page_card(user_id: int, page_id: int, just_created: bool = Fal
         lines.append(t(lang, "wait_desc"))
         rows.append([(t(lang, "btn_stop_waiting"), f"unsub:{sub.id}")])
     elif state == "subscribed":
-        lines.append(t(lang, "voice_line", v=_voice_label(lang, sub, voices)))
+        lines.append(t(lang, "voice_line", v=_voice_label(lang, sub, voices)) + warn)
         rows.append([(t(lang, "btn_choose_voice"), f"voices:{sub.id}")])
         rows.append([(t(lang, "btn_unsubscribe"), f"unsub:{sub.id}")])
     elif state == "franchise_sub":
@@ -843,9 +847,10 @@ async def _render_franchise_card(user_id: int, fid: int, created: bool = True):
         lines += [f"  • {p.title[:44]} — {p.last_season}×{p.last_episode}" for p in ongoing[:5]]
     lines.append(t(lang, "fc_desc"))
     uniq = list({v.translator_id: v for v in voices}.values())
+    warn = await _voice_warning(lang, sub)
     rows = []
     if sub:
-        lines.append(t(lang, "voice_line", v=_voice_label(lang, sub, uniq)))
+        lines.append(t(lang, "voice_line", v=_voice_label(lang, sub, uniq)) + warn)
         rows.append([(t(lang, "btn_choose_voice"), f"voices:{sub.id}")])
         rows.append([(t(lang, "btn_unsubscribe"), f"unsub:{sub.id}")])
     else:
@@ -944,6 +949,15 @@ async def _airing_voice_ids(s, sub: Subscription) -> set[int]:
                 func.coalesce(Page.content_type, "series") != "film"))
     q = q.where(Page.id == sub.page_id) if sub.page_id else q.where(Page.franchise_id == sub.franchise_id)
     return set((await s.execute(q)).scalars())
+
+
+async def _voice_warning(lang: str, sub: Subscription | None) -> str:
+    """Приписка к строке «Озвучка: …», когда выбранной озвучки у выходящих частей нет."""
+    if sub is None or not sub.voice_filter:
+        return ""
+    async with session() as s:
+        airing = await _airing_voice_ids(s, sub)
+    return t(lang, "voice_missing_now") if airing and not (set(sub.voice_filter) & airing) else ""
 
 
 async def _own_sub(user_id: int, sub_id: int) -> Subscription | None:
