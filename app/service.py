@@ -20,7 +20,8 @@ from app.models import (
 )
 from app.i18n import detect
 from app.rezka.client import RezkaClient
-from app.rezka.parser import FeedItem, ScheduleRow, TitlePage, franchise_name, parse_title_page
+from app.rezka.parser import (FeedItem, ScheduleRow, TitlePage, UpdateItem, franchise_name, norm_voice,
+                              parse_title_page)
 
 log = logging.getLogger(__name__)
 
@@ -311,6 +312,60 @@ async def record_episode(s: AsyncSession, page: Page, season: int, episode: int)
     stmt = (pg_insert(Episode).values(page_id=page.id, season=season, episode=episode)
             .on_conflict_do_nothing(constraint="uq_episode").returning(Episode.id))
     return (await s.execute(stmt)).scalar_one_or_none()
+
+
+def classify_update(season: int, episode: int, has_row: bool, known: tuple[int, int] | None) -> str:
+    """Что значит для нас событие блока обновлений (F13).
+    voice   — серия уже записана: вышла ещё в одной озвучке;
+    new     — новее всего, что знаем о тайтле: настоящая новая серия;
+    catchup — старая серия, которой у нас нет (дозвучка задним числом или выход до запуска бота):
+              записываем молча, иначе подписчики получат «вышла 3×3» через неделю после 3×11.
+    known — старшая записанная серия страницы, а без записей — сезон и серия со страницы или карточки."""
+    if has_row:
+        return "voice"
+    if known is None or (season, episode) > known:
+        return "new"
+    return "catchup"
+
+
+async def known_episode(s: AsyncSession, page: Page) -> tuple[int, int] | None:
+    """Старшая серия, от которой считаем «новое». Записи бота важнее полей страницы: страницу могли
+    перечитать уже после выхода серии, и тогда её last_episode не отличил бы новую серию от старой."""
+    row = (await s.execute(text(
+        "SELECT season, episode FROM episodes WHERE page_id = :p ORDER BY season DESC, episode DESC LIMIT 1"),
+        {"p": page.id})).first()
+    if row:
+        return int(row[0]), int(row[1])
+    if page.last_season is not None and page.last_episode is not None:
+        return page.last_season, page.last_episode
+    return None
+
+
+async def find_episode(s: AsyncSession, page_id: int, season: int, episode: int) -> int | None:
+    return await s.scalar(select(Episode.id).where(
+        Episode.page_id == page_id, Episode.season == season, Episode.episode == episode))
+
+
+async def upsert_page_from_update(s: AsyncSession, item: UpdateItem, url: str) -> Page:
+    """Тайтл из блока обновлений, которого нет в каталоге: минимальная строка, остальное
+    (тип, франшиза, озвучки, постер) дочитает очередь чтения — page_refreshed_at пуст."""
+    page = await page_by_hid(s, item.hdrezka_id)
+    if page is None:
+        page = Page(hdrezka_id=item.hdrezka_id, title=item.title, url=url, section=item.section)
+        s.add(page)
+        await s.flush()
+    return page
+
+
+async def voice_index(s: AsyncSession, page_id: int) -> dict[str, int]:
+    """Нормализованное имя озвучки → translator_id по списку со страницы тайтла."""
+    rows = await s.execute(text("SELECT translator_id, name FROM voices WHERE page_id = :p"), {"p": page_id})
+    return {norm_voice(name): tid for tid, name in rows}
+
+
+async def drop_voice_check(s: AsyncSession, episode_id: int, translator_id: int) -> None:
+    await s.execute(delete(VoiceCheck).where(VoiceCheck.episode_id == episode_id,
+                                             VoiceCheck.translator_id == translator_id))
 
 
 _SUB_MATCH = "(sub.page_id = :page_id OR sub.franchise_id = :franchise_id)"

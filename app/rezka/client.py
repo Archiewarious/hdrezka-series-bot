@@ -182,6 +182,10 @@ class RezkaClient:
         suffix = "" if page == 1 else f"page/{page}/"
         return await self.get(f"/{section}/{suffix}?filter=last")
 
+    async def home(self) -> str:
+        """Главная: блок «Обновления» — неделя вышедших серий по дням, с озвучкой (F13)."""
+        return await self.get("/")
+
     async def title_page(self, url: str) -> str:
         """Страница тайтла: озвучки, серии, франшиза, расписание."""
         return await self.get(url)

@@ -266,3 +266,55 @@ def franchise_name(titles: list[tuple[str, str | None]]) -> str:
         return prefix
     earliest = min(titles, key=lambda t: (t[1] or "9999"))[0]
     return re.split(r"\s*[\[:(/]", earliest)[0].strip() or earliest
+
+
+# ----------------------------------------------------------------------------- блок «Обновления»
+
+@dataclass(frozen=True)
+class UpdateItem:
+    """Событие из блока «Обновления» на главной: серия вышла в конкретной озвучке (F13)."""
+    day: date | None            # из заголовка группы: «Сегодня (10 сентября 2026)» → 2026-09-10
+    hdrezka_id: int
+    title: str
+    url: str                    # путь, как в href: /animation/fantasy/90694-krestyanin-999-urovnya-2026.html
+    section: str | None         # первый сегмент пути: series / animation / cartoons
+    season: int
+    episode: int
+    voice: str | None           # «Дубляж», «Субтитры», «FanVoxUA (Украинский)»; у части событий озвучки нет
+
+
+def parse_updates(html: str) -> list[UpdateItem]:
+    """Неделя событий по дням, свежие сверху. В отличие от лент разделов (F8) упорядочен по времени
+    выхода и знает озвучку; одна серия встречается по разу на каждую озвучку."""
+    tree = HTMLParser(html)
+    out: list[UpdateItem] = []
+    for block in tree.css(".b-seriesupdate__block"):
+        head = block.css_first(".b-seriesupdate__block_date")
+        day = parse_ru_date(head.text(separator=" ") if head else "")
+        for li in block.css(".b-seriesupdate__block_list_item"):
+            a = li.css_first(".b-seriesupdate__block_list_link")
+            href = (a.attributes.get("href") or "") if a else ""
+            m = _ID_IN_URL_RX.search(href)
+            season_node, cell = li.css_first(".season"), li.css_first(".cell-2")
+            sm = re.search(r"(\d+)", season_node.text() if season_node else "")
+            em = re.search(r"(\d+)\s*сери", cell.text() if cell else "", re.I)
+            if not (a and m and sm and em):
+                continue
+            voice_node = cell.css_first("i")
+            voice = voice_node.text(strip=True).strip("() ") if voice_node else ""
+            section = href.strip("/").split("/", 1)[0] or None
+            out.append(UpdateItem(day, int(m.group(1)), a.text(strip=True), href, section,
+                                  int(sm.group(1)), int(em.group(1)), voice or None))
+    return out
+
+
+_VOICE_SYNONYMS = {"субтитры": "оригинал"}
+
+
+def norm_voice(name: str | None) -> str:
+    """Имя озвучки для сопоставления блока обновлений со списком на странице тайтла:
+    «FanVoxUA (Украинский)» ↔ «FanVoxUA», «Субтитры» ↔ «Оригинал (+субтитры)»."""
+    key = re.sub(r"\(.*?\)", " ", (name or "").lower())
+    key = re.sub(r"[^0-9a-zа-яё]+", "", key)
+    return _VOICE_SYNONYMS.get(key, key)
+

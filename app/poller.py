@@ -1,8 +1,8 @@
 """Поллер: единственный процесс, который ходит на сайт по расписанию.
 
 Потоки (docs/ARCHITECTURE.md, §4.1):
-  1. лента: 3 раздела × стр. 1 (глубже — только пока не найден курсор);
-  2. новые страницы из ленты → чтение → франшиза → уведомления «новая часть»;
+  1. блок «Обновления» на главной: неделя вышедших серий с озвучкой → новые серии и озвучки (F13);
+  2. ленты 3 разделов раз в 15 минут — только каталог: новые тайтлы → чтение → франшиза;
   3. отложенные проверки озвучек (ajax);
   4. суточная сверка состава франшиз с подписчиками;
   5. недельное обновление страниц с подписчиками (озвучки, расписание).
@@ -13,20 +13,22 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from datetime import timedelta
 
 from sqlalchemy import select, text
 
 from app import service as svc
 from app.config import cfg
 from app.db import engine, init_db, session
-from app.models import Episode, Franchise, Page, VoiceCheck
+from app.models import Episode, EpisodeVoice, Franchise, Page, VoiceCheck
 from app.rezka.client import AccessBlocked, RezkaClient
-from app.rezka.parser import FeedItem, parse_episodes_html, parse_feed
+from app.rezka.parser import FeedItem, norm_voice, parse_episodes_html, parse_feed, parse_updates
 
 log = logging.getLogger("poller")
 
 ADVISORY_LOCK_KEY = 0x52455A4B          # "REZK" — ровно один поллер на базу
-FEED_MAX_PAGES = 5
+FEED_EVERY = 5                          # ленты разделов — раз в 5 циклов (15 мин): только каталог
+PER_CYCLE_UPDATE_READS = 5              # новые тайтлы из блока обновлений, читаемые сразу (начало сезона)
 FRANCHISE_REFRESH_HOURS = 24
 PAGE_REFRESH_DAYS = 7
 PER_CYCLE_FRANCHISES = 2                # чтобы обход не растягивался: остальное — в следующий цикл
@@ -37,15 +39,12 @@ READ_GIVE_UP_AFTER = 3                  # страница не читается
 PER_CYCLE_VOICE_CHECKS = 5
 
 
-def _key(item: FeedItem) -> str:
-    return f"{item.hdrezka_id}:{item.season}:{item.episode}"
-
-
 class Poller:
     def __init__(self) -> None:
         self.client = RezkaClient()
         self._read_failures: dict[int, int] = {}
         self._cycle_new_parts = 0               # уведомлений new_part за цикл — для строки лога
+        self._cycle_no = 0
 
     # ------------------------------------------------------------------ helpers
 
@@ -114,76 +113,123 @@ class Poller:
         low = item.title.lower()
         return any(low.startswith(n[0].lower()) for n in names)
 
-    # ------------------------------------------------------------------ 1+2: лента
+    # ------------------------------------------------------------------ 1: блок обновлений
 
-    async def process_feed(self, s, section: str) -> tuple[int, int]:
-        cursor_key = f"feed_cursor:{section}"
-        cursor = await svc.meta_get(s, cursor_key)
+    def _abs(self, url: str) -> str:
+        return url if url.startswith("http") else f"{self.client.base_url}{url}"
 
-        collected: list[FeedItem] = []
-        found_cursor = cursor is None
-        for page_no in range(1, FEED_MAX_PAGES + 1):
-            items = parse_feed(await self.client.feed(section, page_no))
-            if not items:
-                log.error("[%s стр.%s] 0 карточек — вёрстка изменилась?", section, page_no)
-                break
-            for it in items:
-                if cursor is not None and _key(it) == cursor:
-                    found_cursor = True
-                    break
-                collected.append(it)
-            if found_cursor or cursor is None:
-                break
-        if not found_cursor:
-            log.warning("[%s] курсор %s не найден на %s страницах — обработал всё", section, cursor, FEED_MAX_PAGES)
+    async def process_updates(self, s) -> tuple[int, int]:
+        """Источник событий — блок «Обновления» на главной (F13, 10.09.2026). Ленты разделов для этого
+        не годятся: они не упорядочены по времени выхода серии. Живой случай: «Крестьянин 999 уровня»
+        1×12 лежал на 3-й странице ленты аниме, а сверху пять дней висел фильм 1981 года, и курсор
+        каждый цикл решал, что нового нет. Блок хранит неделю по дням и знает озвучку, поэтому курсор
+        не нужен: каждое событие сверяется с базой, простой до недели ничего не теряет.
+        Первый проход записывает всё старше суток без уведомлений, чтобы не прислать неделю разом."""
+        items = parse_updates(await self.client.home())
+        if not items:
+            log.error("Блок обновлений на главной: 0 событий — вёрстка изменилась?")
+            return 0, 0
+        baseline = await svc.meta_get(s, "updates_baseline") is None
+        fresh_from = svc.now().date() - timedelta(days=1)          # «Сегодня» и «Вчера»
+        voices: dict[int, dict[str, int]] = {}                      # page_id → имя озвучки → translator_id
+        new_eps = queued = reads = 0
+        for item in reversed(items):                                # от старых к новым
+            if item.section not in cfg.feed_sections:
+                continue
+            silent = baseline and (item.day is None or item.day < fresh_from)
+            try:
+                # Точка сохранения на событие: одна кривая страница не должна откатывать весь проход
+                # и вставать поперёк потока уведомлений каждые три минуты.
+                async with s.begin_nested():
+                    e, q, r = await self._apply_update(s, item, silent, voices, reads < PER_CYCLE_UPDATE_READS)
+            except AccessBlocked:
+                raise
+            except Exception:
+                log.exception("Событие блока обновлений пропущено: %s s%se%s", item.hdrezka_id, item.season, item.episode)
+                voices.clear()
+                continue
+            new_eps, queued, reads = new_eps + e, queued + q, reads + r
 
-        new_eps = queued = 0
-        for item in reversed(collected):                       # от старых к новым
+        if baseline:
+            await svc.meta_set(s, "updates_baseline", svc.now().isoformat())
+            log.info("Блок обновлений: первый проход, событий %s — всё старше суток записано без уведомлений", len(items))
+        return new_eps, queued
+
+    async def _apply_update(self, s, item, silent: bool, voices: dict[int, dict[str, int]],
+                            may_read: bool) -> tuple[int, int, int]:
+        """Одно событие блока: страница, запись серии, уведомления → (новых серий, уведомлений, прочитано)."""
+        new_eps = queued = reads = 0
+        page = await svc.page_by_hid(s, item.hdrezka_id)
+        if page is None:
+            page = await svc.upsert_page_from_update(s, item, self._abs(item.url))
+            # Начало сезона читаем сразу: франшиза, «жду продолжения». Остальное дочитает очередь.
+            if item.episode <= 2 and not silent and may_read:
+                reads = 1
+                try:
+                    await self.sync(s, page.hdrezka_id, page.url)
+                except AccessBlocked as exc:
+                    log.warning("Не прочитал новую страницу %s: %s", page.hdrezka_id, exc)
+
+        eid = await svc.find_episode(s, page.id, item.season, item.episode)
+        kind = svc.classify_update(item.season, item.episode, eid is not None, await svc.known_episode(s, page))
+        if eid is None:
+            eid = await svc.record_episode(s, page, item.season, item.episode)
+            if eid is None:
+                return new_eps, queued, reads
+        if kind == "new":
+            if (item.season, item.episode) > (page.last_season or 0, page.last_episode or 0):
+                page.last_season, page.last_episode, page.is_finished = item.season, item.episode, False
+            if not silent:
+                new_eps = 1
+                page.last_event_at = svc.now()
+                n = await svc.enqueue_episode(s, page, eid)
+                queued += n
+                log.info("НОВАЯ СЕРИЯ: %s s%se%s (%s) → %s уведомлений",
+                         page.title, item.season, item.episode, item.voice or "без озвучки", n)
+
+        # Озвучка события — сразу в episode_voices, подписчикам с этим фильтром — уведомление.
+        if page.id not in voices:
+            voices[page.id] = await svc.voice_index(s, page.id)
+        tid = voices[page.id].get(norm_voice(item.voice))
+        if tid is not None and await svc.mark_voice_seen(s, eid, tid):
+            await svc.drop_voice_check(s, eid, tid)
+            if not silent and kind != "catchup":
+                n = await svc.enqueue_voice(s, page, eid, tid)
+                queued += n
+                if n:
+                    log.info("ОЗВУЧКА: %s s%se%s в «%s» → %s уведомлений", page.title, item.season, item.episode, item.voice, n)
+        if kind == "new" and not silent:
+            await self._schedule_voices(s, page, eid)
+        return new_eps, queued, reads
+
+    async def _schedule_voices(self, s, page: Page, episode_id: int) -> None:
+        """Подписчикам с фильтром: озвучки, которых блок ещё не принёс, проверим позже через плеер
+        (process_voice_checks). Обычно блок сам приносит их за минуты, и проверка снимается."""
+        wanted = await svc.wanted_translators(s, page)
+        if not wanted:
+            return
+        seen = set((await s.execute(select(EpisodeVoice.translator_id)
+                                    .where(EpisodeVoice.episode_id == episode_id))).scalars())
+        for tid in wanted - seen:
+            await svc.schedule_voice_check(s, episode_id, tid, 0)
+
+    # ------------------------------------------------------------------ 2: ленты разделов — каталог
+
+    async def process_feed(self, s, section: str) -> None:
+        """Только пополнение каталога: карточки стр. 1 → pages, новые тайтлы дочитает очередь.
+        События о сериях отсюда больше не берутся: см. process_updates и F13."""
+        items = parse_feed(await self.client.feed(section, 1))
+        if not items:
+            log.error("[%s] 0 карточек в ленте — вёрстка изменилась?", section)
+            return
+        for item in items:
             known = await svc.page_by_hid(s, item.hdrezka_id) is not None
-            # Каталог-first: каждая карточка ленты попадает в pages. Страницу читаем сразу только
-            # если это важно для уведомлений (начало сезона, похоже на франшизу с подписчиками),
-            # остальное дочитает очередь (read_pending_pages) по несколько страниц за цикл.
-            page = await svc.upsert_page_from_feed(s, item)
+            await svc.upsert_page_from_feed(s, item)
             if not known and await self._candidate_for_sync(s, item):
                 try:
                     await self.sync(s, item.hdrezka_id, item.url)
                 except AccessBlocked as exc:
                     log.warning("Не прочитал новую страницу %s: %s", item.hdrezka_id, exc)
-
-            if not item.has_episode:
-                continue
-            episode_id = await svc.record_episode(s, page, item.season, item.episode)
-            if episode_id is None:
-                continue
-            new_eps += 1
-            page.last_event_at = svc.now()
-            n = await svc.enqueue_episode(s, page, episode_id)
-            queued += n
-            queued += await self._handle_voices(s, page, episode_id)
-            log.info("НОВАЯ СЕРИЯ: %s s%se%s → %s уведомлений", item.title, item.season, item.episode, n)
-
-        if collected:
-            await svc.meta_set(s, cursor_key, _key(collected[0]))
-        return new_eps, queued
-
-    async def _handle_voices(self, s, page: Page, episode_id: int) -> int:
-        """Подписчикам с фильтром озвучек: проверяем сразу, иначе — отложенная проверка."""
-        wanted = await svc.wanted_translators(s, page)
-        queued = 0
-        ep = await s.get(Episode, episode_id)
-        for tid in wanted:
-            try:
-                have = parse_episodes_html(await self.client.episodes_html(page.hdrezka_id, tid))
-            except AccessBlocked as exc:
-                log.warning("ajax озвучки %s для %s: %s", tid, page.hdrezka_id, exc)
-                await svc.schedule_voice_check(s, episode_id, tid, 0)
-                continue
-            if (ep.season, ep.episode) in have:
-                await svc.mark_voice_seen(s, episode_id, tid)
-                queued += await svc.enqueue_voice(s, page, episode_id, tid)
-            else:
-                await svc.schedule_voice_check(s, episode_id, tid, 0)
-        return queued
 
     # ------------------------------------------------------------------ 3: отложенные озвучки
 
@@ -289,10 +335,15 @@ class Poller:
         async with session() as s:
             new_eps = queued = 0
             self._cycle_new_parts = 0
-            for section in cfg.feed_sections:
-                e, q = await self.process_feed(s, section)
-                new_eps += e
-                queued += q
+            self._cycle_no += 1
+            new_eps, queued = await self.process_updates(s)
+            # События и уведомления фиксируем сразу: ниже ленты и чтение страниц ходят на сайт минуты
+            # и могут упасть, а откат не должен забирать с собой вышедшие серии (первый проход 10.09.2026
+            # держал уведомления в открытой транзакции, пока дочитывались полторы сотни новых страниц).
+            await s.commit()
+            if self._cycle_no % FEED_EVERY == 1:          # первый цикл после старта, дальше раз в 15 мин
+                for section in cfg.feed_sections:
+                    await self.process_feed(s, section)
             queued += await self.process_voice_checks(s)
             fr = await self.refresh_franchises(s)
             pg = await self.refresh_pages(s)
