@@ -16,17 +16,14 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models import (
     Episode, EpisodeVoice, Franchise, Meta, Notification, Page, Schedule,
-    Subscription, User, Voice, VoiceCheck,
+    Subscription, User, Voice,
 )
 from app.i18n import detect
 from app.rezka.client import RezkaClient
-from app.rezka.parser import (FeedItem, ScheduleRow, TitlePage, UpdateItem, franchise_name, norm_voice,
-                              parse_title_page)
+from app.rezka.parser import FeedItem, ScheduleRow, TitlePage, UpdateItem, franchise_name, parse_title_page
 
 log = logging.getLogger(__name__)
 
-# Интервалы отложенных проверок озвучек: 1ч, 3ч, 12ч, затем раз в сутки — до месяца.
-VOICE_CHECK_DELAYS = [1, 3, 12] + [24] * 27
 UTC = timezone.utc
 
 
@@ -307,38 +304,64 @@ async def franchise_anchor(s: AsyncSession, franchise_id: int) -> Page | None:
 
 # ----------------------------------------------------------------------------- episodes & fan-out
 
+SEED_SEEN_AT = datetime(1970, 1, 1, tzinfo=timezone.utc)   # «серия была известна до бота»: не новая, не в 🆕 Новом
+SEED_BEFORE = datetime(2000, 1, 1, tzinfo=timezone.utc)
+
+
 async def record_episode(s: AsyncSession, page: Page, season: int, episode: int) -> int | None:
-    """Возвращает id серии, только если она новая. UNIQUE делает операцию идемпотентной."""
+    """Записывает серию и возвращает id, если записи не было. Запись-затравку (seed_known_episodes),
+    появившуюся в этом же событии, забирает себе: чтение страницы могло перевести ждавшего продолжения
+    на франшизу и засеять ту самую серию, о которой сообщает блок."""
     stmt = (pg_insert(Episode).values(page_id=page.id, season=season, episode=episode)
-            .on_conflict_do_nothing(constraint="uq_episode").returning(Episode.id))
+            .on_conflict_do_update(constraint="uq_episode", set_={"first_seen_at": func.now()},
+                                   where=Episode.first_seen_at < SEED_BEFORE)
+            .returning(Episode.id))
     return (await s.execute(stmt)).scalar_one_or_none()
 
 
-def classify_update(season: int, episode: int, has_row: bool, known: tuple[int, int] | None) -> str:
-    """Что значит для нас событие блока обновлений (F13).
-    voice   — серия уже записана: вышла ещё в одной озвучке;
-    new     — новее всего, что знаем о тайтле: настоящая новая серия;
-    catchup — старая серия, которой у нас нет (дозвучка задним числом или выход до запуска бота):
-              записываем молча, иначе подписчики получат «вышла 3×3» через неделю после 3×11.
-    known — старшая записанная серия страницы, а без записей — сезон и серия со страницы или карточки."""
+def classify_update(has_row: bool, page_max: tuple[int, int] | None, season: int, episode: int,
+                    fresh: bool) -> str:
+    """Что значит событие блока обновлений (F13). Решают только записи самого бота и свежесть события.
+    Номер последней серии в полях страницы пишут пять мест (чтение страницы в поллере и в боте,
+    карточки поиска), и 10.09.2026 чтение, запущенное самим событием, превращало премьеру в «старую».
+      voice   — серия уже записана: вышла ещё в одной озвучке;
+      new     — старше всех записанных серий страницы, а если записей нет — событие свежее (сегодня, вчера);
+      catchup — старая серия без записи: дозвучка задним числом или выход до того, как бот узнал тайтл.
+                Записывается молча, иначе «вышла 3×3» придёт через неделю после 3×11."""
     if has_row:
         return "voice"
-    if known is None or (season, episode) > known:
-        return "new"
-    return "catchup"
+    if page_max is not None:
+        return "new" if (season, episode) > page_max else "catchup"
+    return "new" if fresh else "catchup"
 
 
-async def known_episode(s: AsyncSession, page: Page) -> tuple[int, int] | None:
-    """Старшая серия, от которой считаем «новое». Записи бота важнее полей страницы: страницу могли
-    перечитать уже после выхода серии, и тогда её last_episode не отличил бы новую серию от старой."""
+async def max_recorded_episode(s: AsyncSession, page_id: int) -> tuple[int, int] | None:
     row = (await s.execute(text(
         "SELECT season, episode FROM episodes WHERE page_id = :p ORDER BY season DESC, episode DESC LIMIT 1"),
-        {"p": page.id})).first()
-    if row:
-        return int(row[0]), int(row[1])
-    if page.last_season is not None and page.last_episode is not None:
-        return page.last_season, page.last_episode
-    return None
+        {"p": page_id})).first()
+    return (int(row[0]), int(row[1])) if row else None
+
+
+async def seed_known_episodes(s: AsyncSession, page_ids: list[int]) -> int:
+    """Страница стала важной (подписка) — её текущая последняя серия записывается как уже известная.
+    Иначе на странице без записей первая же дозвучка старой серии сошла бы за новую. Дата 1970 — чтобы
+    затравка не попала в «🆕 Новое» и в проверку здоровья."""
+    if not page_ids:
+        return 0
+    r = await s.execute(text("""
+        INSERT INTO episodes (page_id, season, episode, first_seen_at)
+        SELECT p.id, p.last_season, p.last_episode, CAST(:seen AS timestamptz) FROM pages p
+         WHERE p.id = ANY(CAST(:ids AS int[])) AND p.last_season IS NOT NULL AND p.last_episode IS NOT NULL
+           AND NOT EXISTS (SELECT 1 FROM episodes e WHERE e.page_id = p.id)
+        ON CONFLICT DO NOTHING"""), {"ids": list(page_ids), "seen": SEED_SEEN_AT})
+    return r.rowcount or 0
+
+
+def is_recent_part(part: Page, at: datetime | None = None) -> bool:
+    """Новой частью франшизы считается только недавняя: старые фильмы и сезоны, которые каталог
+    привязывает задним числом, подписчику не новость. Год неизвестен — считаем недавней."""
+    y = _year(part)
+    return y is None or y >= (at or now()).year - 1
 
 
 async def find_episode(s: AsyncSession, page_id: int, season: int, episode: int) -> int | None:
@@ -357,15 +380,10 @@ async def upsert_page_from_update(s: AsyncSession, item: UpdateItem, url: str) -
     return page
 
 
-async def voice_index(s: AsyncSession, page_id: int) -> dict[str, int]:
-    """Нормализованное имя озвучки → translator_id по списку со страницы тайтла."""
+async def voice_names(s: AsyncSession, page_id: int) -> dict[int, str]:
+    """Озвучки страницы: translator_id → имя, как его разобрал parse_title_page (с языком из флажка)."""
     rows = await s.execute(text("SELECT translator_id, name FROM voices WHERE page_id = :p"), {"p": page_id})
-    return {norm_voice(name): tid for tid, name in rows}
-
-
-async def drop_voice_check(s: AsyncSession, episode_id: int, translator_id: int) -> None:
-    await s.execute(delete(VoiceCheck).where(VoiceCheck.episode_id == episode_id,
-                                             VoiceCheck.translator_id == translator_id))
+    return {tid: name for tid, name in rows}
 
 
 _SUB_MATCH = "(sub.page_id = :page_id OR sub.franchise_id = :franchise_id)"
@@ -384,16 +402,6 @@ async def enqueue_episode(s: AsyncSession, page: Page, episode_id: int) -> int:
     return r.rowcount or 0
 
 
-async def wanted_translators(s: AsyncSession, page: Page) -> set[int]:
-    """Озвучки, которые ждут подписчики этой страницы/франшизы с фильтром."""
-    rows = await s.execute(text(f"""
-        SELECT DISTINCT unnest(sub.voice_filter)
-          FROM subscriptions sub JOIN users u ON u.id = sub.user_id AND u.is_active
-         WHERE sub.voice_filter IS NOT NULL AND {_SUB_MATCH}
-    """), {"page_id": page.id, "franchise_id": page.franchise_id or -1})
-    return {r[0] for r in rows}
-
-
 async def enqueue_voice(s: AsyncSession, page: Page, episode_id: int, translator_id: int) -> int:
     r = await s.execute(text(f"""
         INSERT INTO notifications (user_id, kind, ref_id, next_attempt_at)
@@ -407,21 +415,23 @@ async def enqueue_voice(s: AsyncSession, page: Page, episode_id: int, translator
     return r.rowcount or 0
 
 
-async def enqueue_new_part(s: AsyncSession, franchise_id: int, part: Page, user_id: int | None = None) -> int:
-    """Подписчикам франшизы и подписчикам любой её части: «нажал и забыл» — новый сезон, фильм или
-    спин-офф приходит и тому, кто следит за одним сезоном (06.09.2026).
-    С user_id — только ему (ждавший продолжения переведён на франшизу, остальные уже знают)."""
+async def enqueue_new_part(s: AsyncSession, franchise_id: int, part: Page, user_id: int | None = None,
+                           only_page_subscribers: bool = False) -> int:
+    """Подписчикам франшизы и подписчикам любой её части: новый сезон, фильм или спин-офф приходит и тому,
+    кто следит за одним сезоном (06.09.2026). only_page_subscribers — только подписанным на другие части:
+    о первой серии нового сезона подписчики франшизы узнают уведомлением о самой серии.
+    С user_id — только ему (ждавший продолжения переведён на франшизу)."""
     r = await s.execute(text("""
         INSERT INTO notifications (user_id, kind, ref_id, next_attempt_at)
         SELECT DISTINCT sub.user_id, 'new_part', CAST(:part_id AS bigint),
                notify_at(u.tz_offset, u.quiet_from, u.quiet_to, u.digest_hour)
           FROM subscriptions sub JOIN users u ON u.id = sub.user_id AND u.is_active
           LEFT JOIN pages p ON p.id = sub.page_id
-         WHERE (sub.franchise_id = :franchise_id OR p.franchise_id = :franchise_id)
+         WHERE ((sub.franchise_id = :franchise_id AND NOT CAST(:only_pages AS boolean)) OR p.franchise_id = :franchise_id)
            AND sub.page_id IS DISTINCT FROM :part_id          -- о своей же странице не пишем
            AND (CAST(:uid AS bigint) IS NULL OR sub.user_id = :uid)
         ON CONFLICT ON CONSTRAINT uq_notification DO NOTHING
-    """), {"part_id": part.id, "franchise_id": franchise_id, "uid": user_id})
+    """), {"part_id": part.id, "franchise_id": franchise_id, "uid": user_id, "only_pages": only_page_subscribers})
     return r.rowcount or 0
 
 
@@ -464,20 +474,6 @@ async def mark_voice_seen(s: AsyncSession, episode_id: int, translator_id: int) 
     stmt = (pg_insert(EpisodeVoice).values(episode_id=episode_id, translator_id=translator_id)
             .on_conflict_do_nothing().returning(EpisodeVoice.episode_id))
     return (await s.execute(stmt)).scalar_one_or_none() is not None
-
-
-async def schedule_voice_check(s: AsyncSession, episode_id: int, translator_id: int, attempts: int) -> None:
-    if attempts >= len(VOICE_CHECK_DELAYS):
-        await s.execute(delete(VoiceCheck).where(VoiceCheck.episode_id == episode_id,
-                                                 VoiceCheck.translator_id == translator_id))
-        return
-    nxt = now() + timedelta(hours=VOICE_CHECK_DELAYS[attempts])
-    await s.execute(
-        pg_insert(VoiceCheck).values(episode_id=episode_id, translator_id=translator_id,
-                                     next_check_at=nxt, attempts=attempts)
-        .on_conflict_do_update(index_elements=[VoiceCheck.episode_id, VoiceCheck.translator_id],
-                               set_={"next_check_at": nxt, "attempts": attempts})
-    )
 
 
 # ----------------------------------------------------------------------------- локальный поиск
@@ -563,7 +559,9 @@ async def subscribe_page(s: AsyncSession, user_id: int, page_id: int) -> bool:
             .on_conflict_do_nothing(index_elements=["user_id", "page_id"],
                                     index_where=text("page_id IS NOT NULL"))
             .returning(Subscription.id))
-    return (await s.execute(stmt)).scalar_one_or_none() is not None
+    created = (await s.execute(stmt)).scalar_one_or_none() is not None
+    await seed_known_episodes(s, [page_id])
+    return created
 
 
 async def subscribe_franchise(s: AsyncSession, user_id: int, franchise_id: int) -> bool:
@@ -578,6 +576,7 @@ async def subscribe_franchise(s: AsyncSession, user_id: int, franchise_id: int) 
         DELETE FROM subscriptions sub USING pages p
          WHERE sub.page_id = p.id AND sub.user_id = :uid AND p.franchise_id = :fid
     """), {"uid": user_id, "fid": franchise_id})
+    await seed_known_episodes(s, list((await s.execute(select(Page.id).where(Page.franchise_id == franchise_id))).scalars()))
     return created
 
 

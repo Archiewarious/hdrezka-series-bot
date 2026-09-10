@@ -6,7 +6,7 @@
 """
 from datetime import date
 
-from app.rezka.parser import match_voice, norm_voice, parse_updates
+from app.rezka.parser import match_voice, parse_updates, voice_key
 from app.service import classify_update
 
 
@@ -26,41 +26,44 @@ def test_parse_updates_live_case(html):
     assert {"Субтитры", "Дубляж"} <= {i.voice for i in ep12}
     assert all(i.day == date(2026, 9, 9) and i.section == "animation" for i in ep12)
     assert ep12[0].url == "/animation/fantasy/90694-krestyanin-999-urovnya-2026.html"
-    assert ep12[0].title == "Крестьянин 999 уровня"
-
-
-def test_norm_voice_matches_page_names():
-    assert norm_voice("Субтитры") == norm_voice("Оригинал (+субтитры)")
-    assert norm_voice("FanVoxUA (Украинский)") == norm_voice("FanVoxUA")
-    assert norm_voice("Дубляж") != norm_voice("ТО Дубляжная")
-    assert norm_voice("AniLibria") == "anilibria" and norm_voice(None) == ""
-
-
-def test_classify_update():
-    assert classify_update(1, 12, has_row=False, known=(1, 11)) == "new"
-    assert classify_update(2, 1, has_row=False, known=(1, 24)) == "new", "новый сезон"
-    assert classify_update(1, 1, has_row=False, known=None) == "new", "тайтл без истории"
-    assert classify_update(1, 12, has_row=True, known=(1, 12)) == "voice", "та же серия, другая озвучка"
-    assert classify_update(3, 3, has_row=False, known=(3, 11)) == "catchup", "дозвучка старой серии"
-    assert classify_update(1, 11, has_row=False, known=(1, 11)) == "catchup", "последняя известная, но не записанная"
 
 
 def test_voice_nested_parens_are_kept(html):
-    """Живая ошибка 10.09.2026: «(FanVoxUA (Украинский))» разбиралось в «FanVoxUA (Украинский»."""
+    """10.09.2026: «(FanVoxUA (Украинский))» разбиралось в «FanVoxUA (Украинский»."""
     voices = {i.voice for i in parse_updates(html("home_updates")) if i.voice}
     assert "FanVoxUA (Украинский)" in voices
-    assert all(v.count("(") == v.count(")") for v in voices), "скобки не должны обрезаться наполовину"
-    assert all(not v.startswith("(") for v in voices)
+    assert all(v.count("(") == v.count(")") and not v.startswith("(") for v in voices)
 
 
-def test_match_voice():
-    idx = {norm_voice(name): tid for tid, name in [
-        (1, "FanVoxUA"), (2, "Многоголосый закадровый"), (3, "Оригинал (+субтитры)"),
-        (4, "Дубляж"), (5, "ТО Дубляжная"), (6, "DEEP")]}
-    assert match_voice(idx, "FanVoxUA (Украинский)") == 1
-    assert match_voice(idx, "многоголосый") == 2, "единственное совпадение по началу имени"
-    assert match_voice(idx, "Субтитры") == 3
-    assert match_voice(idx, "Дубляж (18+)") == 4, "точное совпадение важнее похожего «ТО Дубляжная»"
-    assert match_voice(idx, "DEEP") == 6 and match_voice(idx, "DEEPStudio") is None, "короткие имена только точно"
-    assert match_voice(idx, "LostFilm") is None and match_voice(idx, None) is None
-    assert norm_voice("FanVoxUA (Украинский") == "fanvoxua", "незакрытая скобка"
+def test_voice_key_keeps_qualifiers():
+    assert voice_key("  Дубляж   (TVOË) ") == "дубляж (tvoë)"
+    assert voice_key("Дубляж (TVOË)") != voice_key("Дубляж (18+)"), "уточнение в скобках — другой переводчик"
+
+
+def test_match_voice_exact_and_safe_fallbacks():
+    names = {1: "FanVoxUA (Украинский)", 2: "Многоголосый закадровый", 3: "Оригинал (+субтитры)", 4: "Дубляж",
+             5: "ТО Дубляжная", 6: "лостфильм (LostFilm)", 7: "октопус (Octopus/Ultradox)",
+             8: "HDrezka Studio", 9: "HDrezka Studio (18+)"}
+    assert match_voice(names, "FanVoxUA (Украинский)") == 1
+    assert match_voice(names, "многоголосый") == 2
+    assert match_voice(names, "Субтитры") == 3
+    assert match_voice(names, "Дубляж") == 4, "точное имя важнее похожего «ТО Дубляжная»"
+    assert match_voice(names, "LostFilm") == 6 and match_voice(names, "Octopus") == 7
+    assert match_voice(names, "HDrezka Studio (18+)") == 9 and match_voice(names, "HDrezka Studio") == 8
+    assert match_voice(names, "Coldfilm") is None and match_voice(names, None) is None
+
+
+def test_match_voice_refuses_to_guess():
+    """10.09.2026: «Дубляж» отмечал случайного из нескольких «Дубляж (…)» на одной странице."""
+    assert match_voice({1: "Дубляж (HDrezka Studio)", 2: "Дубляж (TVOË)", 3: "Дубляж (неофициальный)"}, "Дубляж") is None
+    assert match_voice({1: "HDrezka Studio", 2: "HDrezka Studio"}, "HDrezka Studio") is None
+    assert match_voice({1: "HDrezka Studio"}, "HDrezka Studio (Украинский)") is None, "украинская версия — не русская"
+
+
+def test_classify_update():
+    assert classify_update(True, (1, 12), 1, 12, fresh=True) == "voice"
+    assert classify_update(False, (1, 11), 1, 12, fresh=False) == "new"
+    assert classify_update(False, (1, 24), 2, 1, fresh=True) == "new", "новый сезон"
+    assert classify_update(False, (3, 11), 3, 3, fresh=True) == "catchup", "дозвучка старой серии"
+    assert classify_update(False, None, 1, 1, fresh=True) == "new", "премьера на странице без записей"
+    assert classify_update(False, None, 1, 5, fresh=False) == "catchup", "старое событие о незнакомом тайтле"

@@ -1,8 +1,6 @@
 from datetime import date
 
-from app.rezka.parser import (
-    franchise_name, parse_episodes_html, parse_feed, parse_title_page,
-)
+from app.rezka.parser import franchise_name, parse_feed, parse_title_page
 
 
 def test_feed_cards(html):
@@ -57,10 +55,11 @@ def test_title_page_film(html):
     assert tp.poster_url and tp.poster_url.startswith("https://static.hdrezka.ac/")
 
 
-def test_ajax_episodes(html):
-    eps = parse_episodes_html(html("ajax_episodes_88337_509"))
-    assert eps and all(s == 4 for s, _ in eps)
-    assert (4, 1) in eps
+def test_translator_language_flag(html):
+    """«Украинский» висит у переводчика картинкой; без неё русская и украинская версии одной студии неразличимы."""
+    names = [t.name for t in parse_title_page(html("title_slime_tv4")).translators]
+    assert "FanVoxUA (Украинский)" in names
+    assert all(n.count("(Украинский)") <= 1 for n in names)
 
 
 def test_franchise_name():

@@ -146,17 +146,6 @@ class Subscription(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
-class VoiceCheck(Base):
-    """Отложенная проверка «озвучка X для серии уже появилась?» — с растущим интервалом."""
-    __tablename__ = "voice_checks"
-    __table_args__ = (Index("voice_checks_due", "next_check_at"),)
-
-    episode_id: Mapped[int] = mapped_column(ForeignKey("episodes.id", ondelete="CASCADE"), primary_key=True)
-    translator_id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    next_check_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
-    attempts: Mapped[int] = mapped_column(Integer, default=0, server_default=text("0"))
-
-
 class Notification(Base):
     """Outbox. Транзитная таблица: отправленное удаляется через 7 дней.
     Несколько sender'ов работают через FOR UPDATE SKIP LOCKED."""

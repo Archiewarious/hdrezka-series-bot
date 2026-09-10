@@ -3,6 +3,20 @@ on: [push, pull_request]
 jobs:
   pytest:
     runs-on: ubuntu-latest
+    # Интеграционные тесты идут на настоящем Postgres: все баги сессии 07–10.09.2026 сидели в SQL и порядке
+    # вызовов, которые тесты без базы не видели.
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: rezka
+          POSTGRES_PASSWORD: rezka
+          POSTGRES_DB: rezka_test
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U rezka" --health-interval 5s --health-timeout 5s --health-retries 20
+    env:
+      TEST_DATABASE_URL: postgresql+asyncpg://rezka:rezka@localhost:5432/rezka_test
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-python@v6

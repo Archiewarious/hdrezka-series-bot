@@ -188,7 +188,15 @@ def parse_title_page(html: str, url: str | None = None) -> TitlePage:
         raw = n.attributes.get("data-translator_id")
         if raw and raw.isdigit() and int(raw) not in seen:
             seen.add(int(raw))
-            translators.append(Translator(int(raw), n.text(strip=True) or f"#{raw}"))
+            name = n.text(strip=True) or f"#{raw}"
+            # Язык озвучки сайт показывает флажком-картинкой рядом с именем («FanVoxUA» + <img title=
+            # "Украинский">). Без него русская и украинская версии одной студии получают одинаковые имена,
+            # а блок обновлений пишет «FanVoxUA (Украинский)» (живой случай 10.09.2026).
+            flag = n.css_first("img")
+            lang = ((flag.attributes.get("title") or flag.attributes.get("alt") or "") if flag else "").strip()
+            if lang and lang.lower() not in name.lower():
+                name = f"{name} ({lang})"
+            translators.append(Translator(int(raw), name))
     if not translators and default_translator is not None:
         # Одна озвучка — списка нет; имя в строке «В переводе» инфо-таблицы.
         name = None
@@ -237,16 +245,6 @@ def parse_title_page(html: str, url: str | None = None) -> TitlePage:
     return TitlePage(hdrezka_id, title, _text(tree.css_first(".b-post__origtitle")), content_type,
                      default_translator, cur_season, cur_episode, translators, episodes,
                      franchise, schedule, poster_url)
-
-
-def parse_episodes_html(html: str) -> set[tuple[int, int]]:
-    """Поле `episodes` из ответа /ajax/get_cdn_series/ → множество (сезон, серия)."""
-    out: set[tuple[int, int]] = set()
-    for n in HTMLParser(html or "").css(".b-simple_episode__item"):
-        s, e = n.attributes.get("data-season_id"), n.attributes.get("data-episode_id")
-        if s and e and s.isdigit() and e.isdigit():
-            out.add((int(s), int(e)))
-    return out
 
 
 def franchise_name(titles: list[tuple[str, str | None]]) -> str:
@@ -312,30 +310,38 @@ def parse_updates(html: str) -> list[UpdateItem]:
     return out
 
 
-_VOICE_SYNONYMS = {"субтитры": "оригинал"}
+def voice_key(name: str | None) -> str:
+    """Имя озвучки для сравнения: без регистра и лишних пробелов. Уточнения в скобках значимы —
+    «Дубляж (TVOË)» и «Дубляж (18+)» разные переводчики. 10.09.2026 скобки отбрасывались, и на 65
+    страницах разные озвучки сливались в одно имя."""
+    return re.sub(r"\s+", " ", (name or "").strip().lower())
 
 
-def norm_voice(name: str | None) -> str:
-    """Имя озвучки для сопоставления блока обновлений со списком на странице тайтла:
-    «FanVoxUA (Украинский)» ↔ «FanVoxUA», «Субтитры» ↔ «Оригинал (+субтитры)»."""
-    key = re.sub(r"\(.*?(?:\)|$)", " ", (name or "").lower())      # и незакрытая скобка тоже
-    key = re.sub(r"[^0-9a-zа-яё]+", "", key)
-    return _VOICE_SYNONYMS.get(key, key)
+_LATIN_RX = re.compile(r"[a-z]", re.I)
+PREFIX_MIN = 5
 
 
-PREFIX_MATCH_MIN = 5
-
-
-def match_voice(index: dict[str, int], voice: str | None) -> int | None:
-    """translator_id для озвучки из блока обновлений по списку страницы (ключи — norm_voice).
-    Сначала точное совпадение, иначе единственное совпадение по началу имени: «многоголосый» в блоке ↔
-    «Многоголосый закадровый» на странице. Несколько кандидатов или короткое имя — не угадываем."""
-    key = norm_voice(voice)
+def match_voice(names: dict[int, str], voice: str | None) -> int | None:
+    """translator_id события блока обновлений по озвучкам страницы (translator_id → имя). Шаги по порядку,
+    решает первый шаг, где нашёлся кандидат:
+      1. полное имя: «HDrezka Studio (18+)»;
+      2. «Субтитры» в блоке — «Оригинал (+субтитры)» на странице;
+      3. латиница в скобках у транслитерации: «LostFilm» — «лостфильм (LostFilm)», «Octopus» — «октопус (Octopus/Ultradox)»;
+      4. имя на странице начинается с имени события и пробела: «многоголосый» — «Многоголосый закадровый».
+    Два и больше кандидата — None: лучше промолчать, чем отметить чужую озвучку."""
+    key = voice_key(voice)
     if not key:
         return None
-    if key in index:
-        return index[key]
-    cands = {tid for name, tid in index.items()
-             if min(len(name), len(key)) >= PREFIX_MATCH_MIN and (name.startswith(key) or key.startswith(name))}
-    return cands.pop() if len(cands) == 1 else None
-
+    keyed = {tid: voice_key(n) for tid, n in names.items()}
+    steps = (
+        [t for t, k in keyed.items() if k == key],
+        [t for t, k in keyed.items() if key == "субтитры" and k.startswith("оригинал")],
+        [t for t, n in names.items()
+         if not _LATIN_RX.search(re.sub(r"\(.*?\)", "", n))
+         and any(voice_key(part) == key for inner in re.findall(r"\(([^)]*)\)", n) for part in inner.split("/"))],
+        [t for t, k in keyed.items() if len(key) >= PREFIX_MIN and k.startswith(key + " ")],
+    )
+    for cands in steps:
+        if cands:
+            return cands[0] if len(set(cands)) == 1 else None
+    return None

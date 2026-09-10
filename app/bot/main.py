@@ -25,7 +25,7 @@ from aiogram.types import (BotCommand, CallbackQuery, ErrorEvent, InlineKeyboard
                            InlineKeyboardMarkup, KeyboardButton, Message, ReplyKeyboardMarkup, Update)
 from sqlalchemy import func, select, text
 
-from app import posters
+from app import health, posters
 from app import service as svc
 from app.bot import guard
 from app.bot.search import MAX_WAITING, group_hits
@@ -325,14 +325,16 @@ async def cmd_stats(msg: Message) -> None:
         sent = await s.scalar(text("SELECT count(*) FROM notifications WHERE status = 'sent'"))
         langs = (await s.execute(text("SELECT lang, count(*) FROM users GROUP BY lang ORDER BY 2 DESC"))).all()
         last = await svc.meta_get(s, "last_poll_ok")
-        stale = await svc.meta_get(s, "poller_stale") == "1"
+        events = await svc.meta_get(s, "updates_events")
+        problems = await health.check(s)
     await msg.answer(
-        ("⚠️ Поллер молчит дольше порога — проверьте туннель и логи\n" if stale else "")
+        "".join(f"⚠️ {p}\n" for p in problems)
         + f"Пользователей: {users} (активных {active}; " + ", ".join(f"{l} {n}" for l, n in langs) + ")\n"
         f"Подписок: на страницы {sp}, на франшизы {sf}\n"
         f"Страниц в базе: {pages} (не прочитано {unread}), франшиз: {frs}\n"
         f"Уведомлений: в очереди {pending}, отправлено (7 дн.) {sent}\n"
-        f"Последний обход: {last}")
+        f"Последний обход: {last}\n"
+        f"Событий в блоке обновлений: {events}")
 
 
 # ----------------------------------------------------------------------------- текст: ссылка или поиск

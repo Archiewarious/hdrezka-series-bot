@@ -1,12 +1,14 @@
-"""Проверка доступа к сайту. Запускать при смене IP, прокси или зеркала.
+"""Проверка доступа к сайту и источника событий. Запускать при смене IP, прокси или зеркала.
 
     python -m app.check_access
 """
-import asyncio, logging, sys
+import asyncio
+import logging
+import sys
 
 from app.config import cfg
 from app.rezka.client import AccessBlocked, RezkaClient
-from app.rezka.parser import parse_feed
+from app.rezka.parser import parse_updates
 
 
 async def main() -> int:
@@ -16,13 +18,14 @@ async def main() -> int:
 
     client = RezkaClient()
     try:
-        for section in cfg.feed_sections:
-            items = parse_feed(await client.feed(section))
-            with_eps = [i for i in items if i.has_episode]
-            status = "OK" if items else "ПУСТО — верстка изменилась?"
-            print(f"  {section:12} карточек={len(items):3} с сериями={len(with_eps):3}  {status}")
-            for i in with_eps[:3]:
-                print(f"      id={i.hdrezka_id:>6} s{i.season}e{i.episode} — {i.title[:40]}")
+        items = parse_updates(await client.home())
+        days = {i.day for i in items if i.day}
+        print(f"  блок обновлений: событий={len(items)}, дней={len(days)}"
+              + ("" if items else "  ПУСТО — вёрстка блока изменилась?"))
+        for i in items[:3]:
+            print(f"      id={i.hdrezka_id:>6} s{i.season}e{i.episode} {i.voice or ''} — {i.title[:40]}")
+        if not items:
+            return 1
         print("\nДоступ есть.")
         return 0
     except AccessBlocked as exc:

@@ -11,7 +11,7 @@ token bucket под лимит Telegram (~30 сообщений/сек всем,
 file_id → pages.poster_file_id; дальше все уведомления по сериалу идут по нему.
 Кнопка «▶ Смотреть» ведёт на серию и озвучку: url#t:{translator}-s:{s}-e:{e}.
 
-Здесь же: watchdog (поллер молчит → запись в лог, флаг для /stats) и очистка отправленного.
+Здесь же: очистка отправленного. Здоровье потока событий — app/health.py.
 Правило: технические сообщения в Telegram не отправляются никогда.
 """
 from __future__ import annotations
@@ -22,7 +22,6 @@ import logging
 import time
 from collections import defaultdict
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
 
 from aiogram import Bot
 from aiogram.client.default import DefaultBotProperties
@@ -32,7 +31,6 @@ from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 from sqlalchemy import text
 
 from app import posters
-from app import service as svc
 from app.config import cfg
 from app.db import init_db, session
 from app.i18n import t
@@ -41,7 +39,6 @@ log = logging.getLogger("sender")
 
 MAX_ATTEMPTS = 5
 PURGE_AFTER_DAYS = 7
-WATCHDOG_EVERY = 300
 TG_MAX_LEN = 4000
 BUTTON_MAX_LEN = 40
 DIGEST_MAX_BUTTONS = 10
@@ -148,9 +145,15 @@ async def _render(s, user_id: int, kind: str, ref_id: int, lang: str = "ru") -> 
             voice = html.escape(name or f"#{tid}")
             body += t(lang, "n_voice_suffix", v=voice)
         else:
-            # Озвучка «любая»: ведём в ту, где серия появилась первой, иначе — в озвучку по умолчанию.
+            # Озвучка «любая»: ведём в ту, где серия появилась первой, и подписываем её в тексте;
+            # неизвестна — в озвучку по умолчанию, без подписи.
             tid = await s.scalar(FIRST_VOICE_SQL, {"id": ref_id})
-            if tid is None:
+            if tid is not None:
+                name = await s.scalar(VOICE_NAME_SQL, {"id": ref_id, "tid": tid})
+                if name:
+                    voice = html.escape(name)
+                    body += t(lang, "n_voice_suffix", v=voice)
+            else:
                 tid = default_tid
         sub_id, scope = await _sub_for(s, user_id, page_id, franchise_id)
         return Rendered(
@@ -295,29 +298,13 @@ async def purge(s) -> int:
     return r.rowcount or 0
 
 
-async def watchdog() -> None:
-    """Поллер обязан отмечаться в meta.last_poll_ok. Молчит дольше порога —
-    пишем в лог и ставим флаг для /stats. В Telegram НЕ отправляем ничего:
-    это прод, туда уходят только уведомления пользователям о сериях."""
-    async with session() as s:
-        last = await svc.meta_get(s, "last_poll_ok")
-        stale = True
-        if last:
-            age = datetime.now(timezone.utc) - datetime.fromisoformat(last)
-            stale = age > timedelta(minutes=cfg.stale_alert_minutes)
-        await svc.meta_set(s, "poller_stale", "1" if stale else "0")
-        await s.commit()
-    if stale:
-        log.error("WATCHDOG: поллер молчит, последний успешный обход — %s", last or "никогда")
-
-
 async def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     await init_db()
     bot = Bot(cfg.bot_token, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     limiter = RateLimiter(cfg.send_rate)
-    log.info("Sender запущен: %s сообщений/сек, watchdog каждые %s с", cfg.send_rate, WATCHDOG_EVERY)
-    last_watchdog = last_purge = 0.0
+    log.info("Sender запущен: %s сообщений/сек", cfg.send_rate)
+    last_purge = 0.0
     try:
         while True:
             sent = await send_batch(bot, limiter)
@@ -326,9 +313,6 @@ async def main() -> None:
             else:
                 await asyncio.sleep(5)
             now = time.monotonic()
-            if now - last_watchdog > WATCHDOG_EVERY:
-                last_watchdog = now
-                await watchdog()
             if now - last_purge > 3600:
                 last_purge = now
                 async with session() as s:

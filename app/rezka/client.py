@@ -190,23 +190,6 @@ class RezkaClient:
         """Страница тайтла: озвучки, серии, франшиза, расписание."""
         return await self.get(url)
 
-    async def episodes_html(self, hdrezka_id: int, translator_id: int) -> str:
-        """Список серий конкретной озвучки — тот же ajax, что дёргает плеер сайта.
-        Возвращает HTML-фрагмент с .b-simple_episode__item (см. parser.parse_episodes_html)."""
-        import json, time
-        body = await self.request(
-            "POST", f"/ajax/get_cdn_series/?t={int(time.time() * 1000)}",
-            data={"id": str(hdrezka_id), "translator_id": str(translator_id), "action": "get_episodes"},
-            headers={"X-Requested-With": "XMLHttpRequest", "Referer": f"{self.base_url}/"},
-        )
-        try:
-            payload = json.loads(body)
-        except ValueError as exc:
-            raise AccessBlocked(f"ajax get_cdn_series: не JSON ({body[:60]!r})") from exc
-        if not payload.get("success", False):
-            raise AccessBlocked(f"ajax get_cdn_series: success={payload.get('success')}")
-        return payload.get("episodes", "")
-
     async def search(self, query: str) -> str:
         from urllib.parse import quote_plus
         return await self.get(
