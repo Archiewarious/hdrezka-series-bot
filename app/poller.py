@@ -22,7 +22,7 @@ from app.config import cfg
 from app.db import engine, init_db, session
 from app.models import Episode, EpisodeVoice, Franchise, Page, VoiceCheck
 from app.rezka.client import AccessBlocked, RezkaClient
-from app.rezka.parser import FeedItem, norm_voice, parse_episodes_html, parse_feed, parse_updates
+from app.rezka.parser import FeedItem, match_voice, parse_episodes_html, parse_feed, parse_updates
 
 log = logging.getLogger("poller")
 
@@ -190,7 +190,7 @@ class Poller:
         # Озвучка события — сразу в episode_voices, подписчикам с этим фильтром — уведомление.
         if page.id not in voices:
             voices[page.id] = await svc.voice_index(s, page.id)
-        tid = voices[page.id].get(norm_voice(item.voice))
+        tid = match_voice(voices[page.id], item.voice)
         if tid is not None and await svc.mark_voice_seen(s, eid, tid):
             await svc.drop_voice_check(s, eid, tid)
             if not silent and kind != "catchup":

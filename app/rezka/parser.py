@@ -301,7 +301,11 @@ def parse_updates(html: str) -> list[UpdateItem]:
             if not (a and m and sm and em):
                 continue
             voice_node = cell.css_first("i")
-            voice = voice_node.text(strip=True).strip("() ") if voice_node else ""
+            # Снимаем одну внешнюю пару скобок: «(FanVoxUA (Украинский))» → «FanVoxUA (Украинский)».
+            # strip("()") срезал бы и закрывающую скобку внутреннего уточнения.
+            voice = voice_node.text(strip=True) if voice_node else ""
+            if voice.startswith("(") and voice.endswith(")"):
+                voice = voice[1:-1].strip()
             section = href.strip("/").split("/", 1)[0] or None
             out.append(UpdateItem(day, int(m.group(1)), a.text(strip=True), href, section,
                                   int(sm.group(1)), int(em.group(1)), voice or None))
@@ -314,7 +318,24 @@ _VOICE_SYNONYMS = {"субтитры": "оригинал"}
 def norm_voice(name: str | None) -> str:
     """Имя озвучки для сопоставления блока обновлений со списком на странице тайтла:
     «FanVoxUA (Украинский)» ↔ «FanVoxUA», «Субтитры» ↔ «Оригинал (+субтитры)»."""
-    key = re.sub(r"\(.*?\)", " ", (name or "").lower())
+    key = re.sub(r"\(.*?(?:\)|$)", " ", (name or "").lower())      # и незакрытая скобка тоже
     key = re.sub(r"[^0-9a-zа-яё]+", "", key)
     return _VOICE_SYNONYMS.get(key, key)
+
+
+PREFIX_MATCH_MIN = 5
+
+
+def match_voice(index: dict[str, int], voice: str | None) -> int | None:
+    """translator_id для озвучки из блока обновлений по списку страницы (ключи — norm_voice).
+    Сначала точное совпадение, иначе единственное совпадение по началу имени: «многоголосый» в блоке ↔
+    «Многоголосый закадровый» на странице. Несколько кандидатов или короткое имя — не угадываем."""
+    key = norm_voice(voice)
+    if not key:
+        return None
+    if key in index:
+        return index[key]
+    cands = {tid for name, tid in index.items()
+             if min(len(name), len(key)) >= PREFIX_MATCH_MIN and (name.startswith(key) or key.startswith(name))}
+    return cands.pop() if len(cands) == 1 else None
 
