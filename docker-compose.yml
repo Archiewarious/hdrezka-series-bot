@@ -48,7 +48,7 @@ services:
     stop_grace_period: 60s   # цикл поллера должен завершиться и закоммититься
     # Здоровье — не «цикл завершился», а «события идут» (app/health.py): видно в `docker compose ps`.
     healthcheck:
-      test: ["CMD", "python", "-m", "app.health"]
+      test: ["CMD", "python", "-m", "app.health", "events"]
       interval: 5m
       timeout: 60s
       start_period: 10m
@@ -63,6 +63,13 @@ services:
     build: .
     env_file: .env
     command: python -m app.sender
+    # Здоровье доставки: уведомления не залёживаются, не зависают в повторах и не падают (app/health.py).
+    healthcheck:
+      test: ["CMD", "python", "-m", "app.health", "delivery"]
+      interval: 5m
+      timeout: 60s
+      start_period: 5m
+      retries: 2
     depends_on:
       migrate: {condition: service_completed_successfully}
     restart: unless-stopped

@@ -37,7 +37,7 @@ from app.i18n import t
 
 log = logging.getLogger("sender")
 
-MAX_ATTEMPTS = 5
+RETRY_MAX = 1800                        # сек: временный сбой Telegram повторяем бесконечно, пауза не больше 30 мин
 PURGE_AFTER_DAYS = 7
 TG_MAX_LEN = 4000
 BUTTON_MAX_LEN = 40
@@ -67,13 +67,13 @@ class RateLimiter:
 CLAIM_SQL = text("""
     WITH claimed AS (
         SELECT id FROM notifications
-         WHERE status = 'pending' AND next_attempt_at <= now() AND attempts < :max_attempts
+         WHERE status = 'pending' AND next_attempt_at <= now()
          ORDER BY user_id, id
          LIMIT :limit
          FOR UPDATE SKIP LOCKED)
     UPDATE notifications n SET status = 'sending', attempts = n.attempts + 1, next_attempt_at = now()
       FROM claimed c WHERE n.id = c.id
-    RETURNING n.id, n.user_id, n.kind, n.ref_id
+    RETURNING n.id, n.user_id, n.kind, n.ref_id, n.attempts
 """)
 # Процесс упал между захватом и отметкой — уведомление осталось «отправляется» и не ушло бы никогда.
 # Время захвата лежит в next_attempt_at: зависшие дольше STUCK_MINUTES возвращаются в очередь.
@@ -105,6 +105,12 @@ class Rendered:
     watch_url: str
     poster_url: str | None
     poster_file_id: str | None
+
+
+def retry_delay(attempts: int) -> int:
+    """Пауза перед повтором после временного сбоя: 1, 2, 4, 8, 16 минут, дальше раз в 30. Попыток не ограничиваем:
+    до 11.09.2026 после пятой неудачи уведомление навсегда оставалось «в очереди» — не уходило и не считалось сбоем."""
+    return min(60 * 2 ** max(attempts - 1, 0), RETRY_MAX)
 
 
 def watch_url(url: str, translator: int | None, season: int, episode: int) -> str:
@@ -214,14 +220,14 @@ async def send_batch(bot: Bot, limiter: RateLimiter) -> int:
     Отметка «отправлено» — сразу после каждого поста, с коммитом: сбой посреди рассылки не дублирует ушедшее."""
     async with session() as s:
         await s.execute(RECOVER_SQL, {"mins": STUCK_MINUTES})
-        rows = (await s.execute(CLAIM_SQL, {"limit": cfg.send_batch, "max_attempts": MAX_ATTEMPTS})).all()
+        rows = (await s.execute(CLAIM_SQL, {"limit": cfg.send_batch})).all()
         await s.commit()
         if not rows:
             return 0
 
         by_user: dict[int, list] = defaultdict(list)
-        for nid, uid, kind, ref in rows:
-            by_user[uid].append((nid, kind, ref))
+        for nid, uid, kind, ref, attempts in rows:
+            by_user[uid].append((nid, kind, ref, attempts))
 
         sent_total = 0
         for user_id, items in by_user.items():
@@ -229,7 +235,8 @@ async def send_batch(bot: Bot, limiter: RateLimiter) -> int:
                                      {"u": user_id})).first()
             photos, lang, digest = ((prefs[0] is not False, prefs[1] or "ru", prefs[2] is not None)
                                     if prefs else (True, "ru", False))
-            pairs = [(nid, await _render(s, user_id, k, r, lang)) for nid, k, r in items]
+            tries = {nid: a for nid, _, _, a in items}
+            pairs = [(nid, await _render(s, user_id, k, r, lang)) for nid, k, r, _ in items]
             dead = [nid for nid, r in pairs if r is None]
             if dead:
                 await _mark(s, dead, "failed", "nothing to render")
@@ -264,7 +271,7 @@ async def send_batch(bot: Bot, limiter: RateLimiter) -> int:
                     await _mark(s, ids, "failed", str(exc)[:400])
                 except Exception as exc:
                     log.exception("Не отправилось пользователю %s", user_id)
-                    await _requeue(s, ids, seconds=60, error=str(exc)[:400])
+                    await _requeue(s, ids, seconds=retry_delay(max(tries[i] for i in ids)), error=str(exc)[:400])
                 await s.commit()
         await s.commit()
         return sent_total

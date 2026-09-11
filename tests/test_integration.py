@@ -350,6 +350,74 @@ def test_stuck_sending_notification_is_retried(db):
     assert len(sent) == 2 and [st for st, _ in statuses] == ["sent", "sent"]
 
 
+class FailingBot(FakeBot):
+    async def send_message(self, chat_id, text, reply_markup=None, **kw):
+        raise RuntimeError("Telegram недоступен")
+
+
+def test_notification_is_never_abandoned(db):
+    """До 11.09.2026 уведомление с пятью неудачными попытками больше не бралось в отправку — никогда."""
+    async def scenario():
+        await _two_new_episodes(14)
+        async with session() as s:
+            await s.execute(text("UPDATE notifications SET attempts = 7"))
+            await s.commit()
+        return await _send()
+
+    sent, statuses = db(scenario)
+    assert len(sent) == 2 and [st for st, _ in statuses] == ["sent", "sent"]
+
+
+def test_transient_failure_is_retried_later_and_visible_in_health(db):
+    from app import health, sender
+
+    async def scenario():
+        await _two_new_episodes(15)
+        sender.PER_CHAT_GAP = 0
+        await sender.send_batch(FailingBot(), sender.RateLimiter(1000))
+        async with session() as s:
+            rows = (await s.execute(text(
+                "SELECT status, attempts, next_attempt_at > now() + interval '50 seconds' FROM notifications"))).all()
+            quiet = await health.check(s, part="delivery")
+            await s.execute(text("UPDATE notifications SET created_at = now() - interval '20 minutes'"))
+            loud = await health.check(s, part="delivery")
+        return rows, quiet, loud
+
+    rows, quiet, loud = db(scenario)
+    assert [tuple(r) for r in rows] == [("pending", 1, True), ("pending", 1, True)], "в очереди, повтор через минуту"
+    assert quiet == [] and any("повторы после сбоя" in p for p in loud)
+
+
+def test_health_sees_undelivered_and_skipped(db):
+    from app import health
+
+    async def scenario():
+        await _two_new_episodes(16)
+        async with session() as s:
+            await s.execute(text("UPDATE notifications SET next_attempt_at = now() - interval '30 minutes'"))
+            await svc.meta_set(s, "updates_failed", "2")
+            problems = await health.check(s)
+            await s.commit()
+        return problems
+
+    problems = db(scenario)
+    assert any("не взято в отправку" in p for p in problems)
+    assert any("не разобрано" in p for p in problems)
+
+
+def test_poller_counts_skipped_events(db, monkeypatch):
+    async def boom(*args, **kwargs):
+        raise RuntimeError("кривая страница")
+
+    async def scenario():
+        monkeypatch.setattr(svc, "find_episode", boom)
+        await _run(FakeSite(block({TODAY: [(990, "Сериал", "series", 1, 1, "Дубляж")]})))
+        async with session() as s:
+            return await svc.meta_get(s, "updates_failed")
+
+    assert db(scenario) == "1"
+
+
 def test_health_sees_that_events_stopped(db):
     from app import health
 

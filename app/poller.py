@@ -138,7 +138,7 @@ class Poller:
         await svc.meta_set(s, "updates_events", str(len(items)))
         fresh_from = svc.now().date() - timedelta(days=1)          # «Сегодня» и «Вчера»
         self._reads_left = EVENT_READS
-        new_eps = queued = deferred = 0
+        new_eps = queued = deferred = failed = 0
         for item in reversed(items):                                # от старых к новым
             fresh = item.day is not None and item.day >= fresh_from
             try:
@@ -151,11 +151,13 @@ class Poller:
             except AccessBlocked:
                 raise
             except Exception:
+                failed += 1
                 log.exception("Событие блока обновлений пропущено: %s s%se%s", item.hdrezka_id, item.season, item.episode)
                 continue
             new_eps, queued = new_eps + e, queued + q
         if deferred:
             log.info("Блок обновлений: отложено до следующего цикла событий %s — кончился лимит чтения страниц", deferred)
+        await svc.meta_set(s, "updates_failed", str(failed))      # видно в проверке здоровья, а не только в логе
         return new_eps, queued
 
     async def _apply_update(self, s, item: UpdateItem, fresh: bool) -> tuple[int, int]:

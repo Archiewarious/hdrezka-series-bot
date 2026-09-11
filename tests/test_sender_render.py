@@ -1,5 +1,5 @@
 """Уведомление — пост (решение 11.09.2026): название, сезон и серия, озвучка, одна кнопка на сайт."""
-from app.sender import BUTTON_MAX_LEN, TG_MAX_LEN, Rendered, _digest, _single_keyboard, fit_button, watch_url
+from app.sender import BUTTON_MAX_LEN, TG_MAX_LEN, Rendered, _digest, _single_keyboard, fit_button, retry_delay, watch_url
 
 
 def _r(kind, title, page_id=1, line=None, url="https://x/a.html#t:1-s:1-e:1"):
@@ -41,3 +41,8 @@ def test_digest_never_cuts_html():
     body, kb = _digest(items)
     assert len(body) <= TG_MAX_LEN and body.count("<b>") == body.count("</b>") and body.endswith("…")
     assert len(kb.inline_keyboard) == 10
+
+
+def test_retry_delay_grows_and_never_gives_up():
+    """11.09.2026: после пятой неудачи уведомление навсегда оставалось «в очереди»."""
+    assert [retry_delay(a) for a in (1, 2, 3, 4, 5, 6, 50)] == [60, 120, 240, 480, 960, 1800, 1800]
