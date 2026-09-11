@@ -23,7 +23,7 @@ from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command, CommandObject, CommandStart
 from aiogram.types import (BotCommand, CallbackQuery, ErrorEvent, InlineKeyboardButton,
                            InlineKeyboardMarkup, KeyboardButton, Message, ReplyKeyboardMarkup, Update)
-from sqlalchemy import func, select, text
+from sqlalchemy import exists, func, select, text
 
 from app import health, posters
 from app import service as svc
@@ -32,7 +32,7 @@ from app.bot.search import MAX_WAITING, group_hits
 from app.config import cfg
 from app.db import init_db, session
 from app.i18n import DETECT_FALLBACK, LANGS, fmt_date, t, when
-from app.models import Franchise, Page, Schedule, Subscription, User, Voice
+from app.models import Episode, Franchise, Page, Schedule, Subscription, User, Voice
 from app.rezka.client import AccessBlocked, RezkaClient
 from app.rezka.parser import FeedItem, parse_feed
 from app.sender import fit_button, watch_url
@@ -271,6 +271,13 @@ async def cmd_settings(msg: Message) -> None:
     await msg.answer(text_, reply_markup=kb)
 
 
+def _released():
+    """Серия из расписания уже записана ботом. Флаг «вышла» в расписании сайта обновляется только при
+    перечитывании страницы и отстаёт от загрузок, поэтому «следующая серия» считается без таких."""
+    return exists().where(Episode.page_id == Schedule.page_id, Episode.season == Schedule.season,
+                          Episode.episode == Schedule.episode)
+
+
 CALENDAR_SQL = text("""
     SELECT DISTINCT p.title, sc.season, sc.episode, sc.air_date
       FROM subscriptions sub
@@ -280,6 +287,13 @@ CALENDAR_SQL = text("""
        -- CAST обязателен: asyncpg шлёт параметр без типа, а «date + unknown» неоднозначен
        AND sc.air_date >= current_date AND sc.air_date < current_date + CAST(:days AS int)
        AND coalesce(p.content_type, 'series') = 'series'
+       -- Уже вышла в озвучке подписки — не «ожидается». Расписание сайта отстаёт от загрузок: 11.09.2026
+       -- календарь показывал «сегодня» серии, вышедшие и разосланные двумя днями раньше.
+       AND NOT EXISTS (
+           SELECT 1 FROM episodes e
+            WHERE e.page_id = p.id AND e.season = sc.season AND e.episode = sc.episode
+              AND (sub.voice_filter IS NULL OR EXISTS (
+                   SELECT 1 FROM episode_voices ev WHERE ev.episode_id = e.id AND ev.translator_id = ANY(sub.voice_filter))))
      ORDER BY sc.air_date, p.title, sc.season, sc.episode
      LIMIT 60
 """)
@@ -556,7 +570,7 @@ async def _render_page_card(user_id: int, page_id: int, just_created: bool = Fal
         sub = await s.scalar(select(Subscription).where(Subscription.user_id == user_id,
                                                         Subscription.page_id == page_id))
         nxt = await s.scalar(select(func.min(Schedule.air_date)).where(
-            Schedule.page_id == page_id, Schedule.aired.is_(False), Schedule.air_date >= date.today()))
+            Schedule.page_id == page_id, Schedule.aired.is_(False), ~_released(), Schedule.air_date >= date.today()))
         voices = (await s.execute(select(Voice).where(Voice.page_id == page_id))).scalars().all()
         fr = await s.get(Franchise, page.franchise_id) if page.franchise_id else None
         parts = (await s.scalar(select(func.count()).select_from(Page).where(Page.franchise_id == page.franchise_id))
@@ -867,7 +881,9 @@ async def _render_franchise_card(user_id: int, fid: int, created: bool = True):
 
 # Неделя назад (✓ — уже вышли) и всё, что запланировано вперёд.
 SCHED_TEMPLATE = """
-    SELECT p.id, p.title, sc.season, sc.episode, sc.air_date, sc.aired
+    SELECT p.id, p.title, sc.season, sc.episode, sc.air_date,
+           sc.aired OR EXISTS (SELECT 1 FROM episodes e
+                                WHERE e.page_id = p.id AND e.season = sc.season AND e.episode = sc.episode) AS aired
       FROM schedule sc JOIN pages p ON p.id = sc.page_id
      WHERE {where} AND coalesce(p.content_type, 'series') = 'series'
        AND sc.air_date IS NOT NULL AND sc.air_date >= current_date - 7
@@ -1067,7 +1083,7 @@ async def _render_my(user_id: int):
             else:
                 p = await s.get(Page, sub.page_id)
                 nxt = await s.scalar(select(func.min(Schedule.air_date)).where(
-                    Schedule.page_id == p.id, Schedule.aired.is_(False), Schedule.air_date >= date.today()))
+                    Schedule.page_id == p.id, Schedule.aired.is_(False), ~_released(), Schedule.air_date >= date.today()))
                 st = f"{p.last_season}×{p.last_episode}" if p.last_episode else "—"
                 extra = t(lang, "my_next", d=fmt_date(lang, nxt)) if nxt else ""
                 fin = t(lang, "my_waiting") if p.is_finished else ""

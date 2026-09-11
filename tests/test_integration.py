@@ -10,7 +10,7 @@ from sqlalchemy import select, text
 
 from app import service as svc
 from app.db import session
-from app.models import Episode, Franchise, Page, Subscription, User, Voice
+from app.models import Episode, Franchise, Page, Schedule, Subscription, User, Voice
 from app.poller import Poller
 
 TODAY = date.today()
@@ -258,6 +258,29 @@ def test_calendar_sql_runs(db):
             return (await s.execute(CALENDAR_SQL, {"uid": 1, "days": CAL_DAYS})).all()
 
     assert db(scenario) == []
+
+
+def test_calendar_hides_episodes_already_out_in_your_dub(db):
+    """11.09.2026: календарь показывал «сегодня» и «завтра» серии, которые уже вышли в дубляже и были
+    разосланы 10 сентября — расписание сайта отстаёт от загрузок."""
+    from app.bot.main import CAL_DAYS, CALENDAR_SQL
+
+    async def scenario():
+        async with session() as s:
+            s.add(User(id=9))
+            page = await _page(s, 960, "Сериал", last=(1, 11), rows=[(1, 10), (1, 11)],
+                               voices=[(56, "Дубляж"), (238, "Оригинал (+субтитры)")])
+            s.add(Subscription(user_id=9, scope="page", page_id=page.id, voice_filter=[56]))
+            e10 = await s.scalar(select(Episode.id).where(Episode.page_id == page.id, Episode.episode == 10))
+            e11 = await s.scalar(select(Episode.id).where(Episode.page_id == page.id, Episode.episode == 11))
+            await svc.mark_voice_seen(s, e10, 56)       # вышла в озвучке подписки
+            await svc.mark_voice_seen(s, e11, 238)      # вышла только в оригинале
+            for ep, days in ((10, 0), (11, 1), (12, 2)):
+                s.add(Schedule(page_id=page.id, season=1, episode=ep, air_date=TODAY + timedelta(days=days), aired=False))
+            await s.commit()
+            return [(r[1], r[2]) for r in (await s.execute(CALENDAR_SQL, {"uid": 9, "days": CAL_DAYS})).all()]
+
+    assert db(scenario) == [(1, 11), (1, 12)], "1×10 уже в дубляже — не ожидается; 1×11 только в оригинале — ждём"
 
 
 def test_health_sees_that_events_stopped(db):
