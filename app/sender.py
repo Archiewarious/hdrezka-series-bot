@@ -43,6 +43,8 @@ TG_MAX_LEN = 4000
 BUTTON_MAX_LEN = 40
 DIGEST_MAX_BUTTONS = 10
 TITLE_MAX_LEN = 150
+STUCK_MINUTES = 10
+PER_CHAT_GAP = 1.1                      # Telegram: не чаще сообщения в секунду в один чат
 
 
 class RateLimiter:
@@ -69,9 +71,15 @@ CLAIM_SQL = text("""
          ORDER BY user_id, id
          LIMIT :limit
          FOR UPDATE SKIP LOCKED)
-    UPDATE notifications n SET status = 'sending', attempts = n.attempts + 1
+    UPDATE notifications n SET status = 'sending', attempts = n.attempts + 1, next_attempt_at = now()
       FROM claimed c WHERE n.id = c.id
     RETURNING n.id, n.user_id, n.kind, n.ref_id
+""")
+# Процесс упал между захватом и отметкой — уведомление осталось «отправляется» и не ушло бы никогда.
+# Время захвата лежит в next_attempt_at: зависшие дольше STUCK_MINUTES возвращаются в очередь.
+RECOVER_SQL = text("""
+    UPDATE notifications SET status = 'pending'
+     WHERE status = 'sending' AND next_attempt_at < now() - make_interval(mins => CAST(:mins AS int))
 """)
 
 EPISODE_SQL = text("""
@@ -205,7 +213,11 @@ async def _deliver(bot: Bot, s, user_id: int, items: list[Rendered], photos: boo
 
 
 async def send_batch(bot: Bot, limiter: RateLimiter) -> int:
+    """Каждое событие — отдельный пост (11.09.2026): склейка двух серий в текстовое сообщение без постера
+    выглядела как «уведомления не было». Одним сообщением — только в режиме «дайджест раз в день».
+    Отметка «отправлено» — сразу после каждого поста, с коммитом: сбой посреди рассылки не дублирует ушедшее."""
     async with session() as s:
+        await s.execute(RECOVER_SQL, {"mins": STUCK_MINUTES})
         rows = (await s.execute(CLAIM_SQL, {"limit": cfg.send_batch, "max_attempts": MAX_ATTEMPTS})).all()
         await s.commit()
         if not rows:
@@ -217,35 +229,46 @@ async def send_batch(bot: Bot, limiter: RateLimiter) -> int:
 
         sent_total = 0
         for user_id, items in by_user.items():
-            prefs = (await s.execute(text("SELECT photos, lang FROM users WHERE id = :u"), {"u": user_id})).first()
-            photos, lang = (prefs[0], prefs[1] or "ru") if prefs else (True, "ru")
-            rendered = [await _render(s, user_id, k, r, lang) for _, k, r in items]
-            rendered = [r for r in rendered if r]
-            ids = [nid for nid, _, _ in items]
-            if not rendered:
-                await _mark(s, ids, "failed", "nothing to render")
-                continue
+            prefs = (await s.execute(text("SELECT photos, lang, digest_hour FROM users WHERE id = :u"),
+                                     {"u": user_id})).first()
+            photos, lang, digest = ((prefs[0] is not False, prefs[1] or "ru", prefs[2] is not None)
+                                    if prefs else (True, "ru", False))
+            pairs = [(nid, await _render(s, user_id, k, r, lang)) for nid, k, r in items]
+            dead = [nid for nid, r in pairs if r is None]
+            if dead:
+                await _mark(s, dead, "failed", "nothing to render")
+            pairs = [(nid, r) for nid, r in pairs if r is not None]
+            messages = [pairs] if digest and len(pairs) > 1 else [[pair] for pair in pairs]
 
-            await limiter.acquire()
-            try:
-                await _deliver(bot, s, user_id, rendered, photos is not False, lang)
-                await _mark(s, ids, "sent")
-                sent_total += len(ids)
-            except TelegramRetryAfter as exc:
-                log.warning("Flood control от Telegram: пауза %s с", exc.retry_after)
-                await _requeue(s, ids, seconds=exc.retry_after)
+            for n, message in enumerate(messages):
+                ids = [nid for nid, _ in message]
+                if n:
+                    await asyncio.sleep(PER_CHAT_GAP)
+                await limiter.acquire()
+                try:
+                    await _deliver(bot, s, user_id, [r for _, r in message], photos, lang)
+                    await _mark(s, ids, "sent")
+                    sent_total += len(ids)
+                except TelegramRetryAfter as exc:
+                    rest = [nid for m in messages[n:] for nid, _ in m]
+                    log.warning("Flood control от Telegram: пауза %s с", exc.retry_after)
+                    await _requeue(s, rest, seconds=exc.retry_after)
+                    await s.commit()
+                    await asyncio.sleep(exc.retry_after)
+                    break
+                except TelegramForbiddenError:
+                    # Пользователь заблокировал бота — больше не пишем и не копим очередь.
+                    await s.execute(text("UPDATE users SET is_active = false, blocked_at = now() WHERE id = :u"), {"u": user_id})
+                    await s.execute(text("UPDATE notifications SET status = 'failed', error = 'bot blocked' "
+                                         "WHERE user_id = :u AND status IN ('pending', 'sending')"), {"u": user_id})
+                    await s.commit()
+                    break
+                except TelegramBadRequest as exc:
+                    await _mark(s, ids, "failed", str(exc)[:400])
+                except Exception as exc:
+                    log.exception("Не отправилось пользователю %s", user_id)
+                    await _requeue(s, ids, seconds=60, error=str(exc)[:400])
                 await s.commit()
-                await asyncio.sleep(exc.retry_after)
-            except TelegramForbiddenError:
-                # Пользователь заблокировал бота — больше не пишем и не копим очередь.
-                await s.execute(text("UPDATE users SET is_active = false, blocked_at = now() WHERE id = :u"), {"u": user_id})
-                await s.execute(text("UPDATE notifications SET status = 'failed', error = 'bot blocked' "
-                                     "WHERE user_id = :u AND status IN ('pending', 'sending')"), {"u": user_id})
-            except TelegramBadRequest as exc:
-                await _mark(s, ids, "failed", str(exc)[:400])
-            except Exception as exc:
-                log.exception("Не отправилось пользователю %s", user_id)
-                await _requeue(s, ids, seconds=60, error=str(exc)[:400])
         await s.commit()
         return sent_total
 

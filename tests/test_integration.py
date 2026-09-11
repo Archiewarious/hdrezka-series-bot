@@ -283,6 +283,70 @@ def test_calendar_hides_episodes_already_out_in_your_dub(db):
     assert db(scenario) == [(1, 11), (1, 12)], "1×10 уже в дубляже — не ожидается; 1×11 только в оригинале — ждём"
 
 
+class FakeBot:
+    """Подставной Telegram: запоминает отправленное. Постеров в тестовых страницах нет — уходит текст."""
+
+    def __init__(self):
+        self.sent = []
+
+    async def send_message(self, chat_id, text, reply_markup=None, **kw):
+        self.sent.append((chat_id, text, [[b.text for b in row] for row in reply_markup.inline_keyboard]))
+
+    async def send_photo(self, chat_id, photo, caption=None, reply_markup=None, **kw):
+        raise AssertionError("в тестовых страницах постеров нет")
+
+
+async def _two_new_episodes(user_id: int, digest_hour: int | None = None, stuck: bool = False) -> None:
+    async with session() as s:
+        s.add(User(id=user_id, quiet_from=None, quiet_to=None, digest_hour=digest_hour))
+        page = await _page(s, 970 + user_id, f"Сериал {user_id}", last=(1, 2), rows=[(1, 1), (1, 2)])
+        for eid in (await s.execute(select(Episode.id).where(Episode.page_id == page.id))).scalars():
+            status, at = ("sending", "now() - interval '20 minutes'") if stuck else ("pending", "now()")
+            await s.execute(text(f"INSERT INTO notifications (user_id, kind, ref_id, status, next_attempt_at) "
+                                 f"VALUES (:u, 'episode', :e, '{status}', {at})"), {"u": user_id, "e": eid})
+        await s.commit()
+
+
+async def _send(monkeypatch_gap=True):
+    from app import sender
+    sender.PER_CHAT_GAP = 0
+    bot = FakeBot()
+    await sender.send_batch(bot, sender.RateLimiter(1000))
+    async with session() as s:
+        statuses = (await s.execute(text("SELECT status FROM notifications ORDER BY id"))).scalars().all()
+    return bot.sent, statuses
+
+
+def test_each_episode_is_its_own_post(db):
+    """11.09.2026: две серии склеились в одно текстовое сообщение без постера — «уведомления не было»."""
+    async def scenario():
+        await _two_new_episodes(11)
+        return await _send()
+
+    sent, statuses = db(scenario)
+    assert len(sent) == 2 and all(buttons == [["▶ Смотреть на HDrezka"]] for _, _, buttons in sent)
+    assert statuses == ["sent", "sent"]
+
+
+def test_daily_digest_is_one_message(db):
+    async def scenario():
+        await _two_new_episodes(12, digest_hour=20)
+        return await _send()
+
+    sent, statuses = db(scenario)
+    assert len(sent) == 1 and sent[0][1].startswith("🆕 <b>Вышли новые серии</b>") and statuses == ["sent", "sent"]
+
+
+def test_stuck_sending_notification_is_retried(db):
+    """Процесс упал между захватом и отправкой: уведомление не должно навсегда остаться «отправляется»."""
+    async def scenario():
+        await _two_new_episodes(13, stuck=True)
+        return await _send()
+
+    sent, statuses = db(scenario)
+    assert len(sent) == 2 and statuses == ["sent", "sent"]
+
+
 def test_health_sees_that_events_stopped(db):
     from app import health
 
