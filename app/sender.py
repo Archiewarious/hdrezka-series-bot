@@ -194,22 +194,18 @@ def _digest(items: list[Rendered], lang: str = "ru") -> tuple[str, InlineKeyboar
     return "\n\n".join(parts), InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-async def _send_photo(bot: Bot, s, user_id: int, r: Rendered, kb: InlineKeyboardMarkup) -> bool:
-    """True — ушло фото. False — постера нет или Telegram его не принял: отправим текстом."""
-    msg = await posters.send_photo_cached(bot, s, user_id, r.page_id, r.poster_url, r.poster_file_id, r.text, kb)
-    return msg is not None
-
-
-async def _deliver(bot: Bot, s, user_id: int, items: list[Rendered], photos: bool, lang: str) -> None:
+async def _deliver(bot: Bot, s, user_id: int, items: list[Rendered], photos: bool, lang: str) -> int:
+    """Отправляет пост или дайджест и возвращает номер сообщения Telegram — он сохраняется у уведомления."""
     if len(items) == 1:
         r = items[0]
         kb = _single_keyboard(r, lang)
-        if photos and await _send_photo(bot, s, user_id, r, kb):
-            return
-        await bot.send_message(user_id, r.text, reply_markup=kb, disable_web_page_preview=True)
-        return
+        if photos:
+            msg = await posters.send_photo_cached(bot, s, user_id, r.page_id, r.poster_url, r.poster_file_id, r.text, kb)
+            if msg is not None:
+                return msg.message_id
+        return (await bot.send_message(user_id, r.text, reply_markup=kb, disable_web_page_preview=True)).message_id
     body, kb = _digest(items, lang)
-    await bot.send_message(user_id, body, reply_markup=kb, disable_web_page_preview=True)
+    return (await bot.send_message(user_id, body, reply_markup=kb, disable_web_page_preview=True)).message_id
 
 
 async def send_batch(bot: Bot, limiter: RateLimiter) -> int:
@@ -246,9 +242,10 @@ async def send_batch(bot: Bot, limiter: RateLimiter) -> int:
                     await asyncio.sleep(PER_CHAT_GAP)
                 await limiter.acquire()
                 try:
-                    await _deliver(bot, s, user_id, [r for _, r in message], photos, lang)
-                    await _mark(s, ids, "sent")
+                    message_id = await _deliver(bot, s, user_id, [r for _, r in message], photos, lang)
+                    await _mark(s, ids, "sent", message_id=message_id)
                     sent_total += len(ids)
+                    log.info("Доставлено пользователю %s: сообщение Telegram №%s, уведомления %s", user_id, message_id, ids)
                 except TelegramRetryAfter as exc:
                     rest = [nid for m in messages[n:] for nid, _ in m]
                     log.warning("Flood control от Telegram: пауза %s с", exc.retry_after)
@@ -273,11 +270,12 @@ async def send_batch(bot: Bot, limiter: RateLimiter) -> int:
         return sent_total
 
 
-async def _mark(s, ids: list[int], status: str, error: str | None = None) -> None:
+async def _mark(s, ids: list[int], status: str, error: str | None = None, message_id: int | None = None) -> None:
     await s.execute(text("UPDATE notifications SET status = CAST(:st AS varchar), error = CAST(:e AS text), "
-                         "sent_at = CASE WHEN CAST(:st AS varchar) = 'sent' THEN now() END "
+                         "sent_at = CASE WHEN CAST(:st AS varchar) = 'sent' THEN now() END, "
+                         "tg_message_id = CAST(:m AS bigint) "
                          "WHERE id = ANY(CAST(:ids AS bigint[]))"),
-                    {"st": status, "e": error, "ids": ids})
+                    {"st": status, "e": error, "ids": ids, "m": message_id})
 
 
 async def _requeue(s, ids: list[int], seconds: int, error: str | None = None) -> None:

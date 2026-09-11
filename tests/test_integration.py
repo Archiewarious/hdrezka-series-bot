@@ -5,6 +5,7 @@
 """
 import re
 from datetime import date, timedelta
+from types import SimpleNamespace
 
 from sqlalchemy import select, text
 
@@ -291,6 +292,7 @@ class FakeBot:
 
     async def send_message(self, chat_id, text, reply_markup=None, **kw):
         self.sent.append((chat_id, text, [[b.text for b in row] for row in reply_markup.inline_keyboard]))
+        return SimpleNamespace(message_id=1000 + len(self.sent), photo=None)
 
     async def send_photo(self, chat_id, photo, caption=None, reply_markup=None, **kw):
         raise AssertionError("в тестовых страницах постеров нет")
@@ -313,7 +315,7 @@ async def _send(monkeypatch_gap=True):
     bot = FakeBot()
     await sender.send_batch(bot, sender.RateLimiter(1000))
     async with session() as s:
-        statuses = (await s.execute(text("SELECT status FROM notifications ORDER BY id"))).scalars().all()
+        statuses = [tuple(r) for r in (await s.execute(text("SELECT status, tg_message_id FROM notifications ORDER BY id"))).all()]
     return bot.sent, statuses
 
 
@@ -325,7 +327,7 @@ def test_each_episode_is_its_own_post(db):
 
     sent, statuses = db(scenario)
     assert len(sent) == 2 and all(buttons == [["▶ Смотреть на HDrezka"]] for _, _, buttons in sent)
-    assert statuses == ["sent", "sent"]
+    assert statuses == [("sent", 1001), ("sent", 1002)], "у каждого уведомления номер своего сообщения Telegram"
 
 
 def test_daily_digest_is_one_message(db):
@@ -334,7 +336,8 @@ def test_daily_digest_is_one_message(db):
         return await _send()
 
     sent, statuses = db(scenario)
-    assert len(sent) == 1 and sent[0][1].startswith("🆕 <b>Вышли новые серии</b>") and statuses == ["sent", "sent"]
+    assert len(sent) == 1 and sent[0][1].startswith("🆕 <b>Вышли новые серии</b>")
+    assert statuses == [("sent", 1001), ("sent", 1001)], "дайджест — одно сообщение на оба уведомления"
 
 
 def test_stuck_sending_notification_is_retried(db):
@@ -344,7 +347,7 @@ def test_stuck_sending_notification_is_retried(db):
         return await _send()
 
     sent, statuses = db(scenario)
-    assert len(sent) == 2 and statuses == ["sent", "sent"]
+    assert len(sent) == 2 and [st for st, _ in statuses] == ["sent", "sent"]
 
 
 def test_health_sees_that_events_stopped(db):

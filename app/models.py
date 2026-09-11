@@ -165,6 +165,7 @@ class Notification(Base):
     error: Mapped[str | None] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     sent_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    tg_message_id: Mapped[int | None] = mapped_column(BigInteger)       # номер сообщения Telegram: доставку можно проверить
 
 
 class Meta(Base):
