@@ -423,19 +423,16 @@ STRINGS: dict[str, dict[str, str | tuple]] = {
     "lang_head": {"ru": "🌐 <b>Язык</b>\nВыберите язык бота:", "uk": "🌐 <b>Мова</b>\nВиберіть мову бота:", "en": "🌐 <b>Language</b>\nChoose the bot language:"},
     "lang_switched": {"ru": "Язык: Русский 🇷🇺", "uk": "Мова: Українська 🇺🇦", "en": "Language: English 🇬🇧"},
     # --- ошибки
+    # --- уведомления (sender): пост с одной кнопкой, 11.09.2026
+    "n_season_episode": {"ru": "📺 {s} сезон · {e} серия", "uk": "📺 {s} сезон · {e} серія", "en": "📺 Season {s} · Episode {e}"},
+    "n_voice": {"ru": "🎙 {v}", "uk": "🎙 {v}", "en": "🎙 {v}"},
+    "n_new_part": {"ru": "🆕 <b>Новая часть: {f}</b>", "uk": "🆕 <b>Нова частина: {f}</b>", "en": "🆕 <b>New part: {f}</b>"},
+    "btn_watch_site": {"ru": "▶ Смотреть на HDrezka", "uk": "▶ Дивитися на HDrezka", "en": "▶ Watch on HDrezka"},
+    "digest_episodes": {"ru": "🆕 <b>Вышли новые серии</b>", "uk": "🆕 <b>Вийшли нові серії</b>", "en": "🆕 <b>New episodes are out</b>"},
+    "digest_parts": {"ru": "🆕 <b>Новые части</b>", "uk": "🆕 <b>Нові частини</b>", "en": "🆕 <b>New parts</b>"},
     "error_msg": {"ru": "Что-то пошло не так. Попробуйте ещё раз чуть позже.",
                   "uk": "Щось пішло не так. Спробуйте ще раз трохи пізніше.",
                   "en": "Something went wrong. Try again a bit later."},
     "error_cb": {"ru": "Что-то пошло не так. Попробуйте ещё раз.", "uk": "Щось пішло не так. Спробуйте ще раз.", "en": "Something went wrong. Try again."},
     # --- уведомления (sender)
-    "n_episode_body": {"ru": "{s} сезон, {e} серия", "uk": "{s} сезон, {e} серія", "en": "Season {s}, episode {e}"},
-    "n_voice_suffix": {"ru": " · вышла в озвучке <b>{v}</b>", "uk": " · вийшла в озвучці <b>{v}</b>", "en": " · out in the <b>{v}</b> dub"},
-    "btn_watch": {"ru": "▶ Смотреть {sxe}", "uk": "▶ Дивитися {sxe}", "en": "▶ Watch {sxe}"},
-    "n_new_part": {"ru": "🆕 Новая часть франшизы «{f}»\n<b>{t}</b>", "uk": "🆕 Нова частина франшизи «{f}»\n<b>{t}</b>", "en": "🆕 New part of the “{f}” franchise\n<b>{t}</b>"},
-    "n_new_part_line": {"ru": "• 🆕 «{f}»: <b>{t}</b>", "uk": "• 🆕 «{f}»: <b>{t}</b>", "en": "• 🆕 “{f}”: <b>{t}</b>"},
-    "btn_open": {"ru": "▶ Открыть", "uk": "▶ Відкрити", "en": "▶ Open"},
-    "btn_follow_part": {"ru": "➕ Следить за этой частью", "uk": "➕ Стежити за цією частиною", "en": "➕ Follow this part"},
-    "btn_other_voices": {"ru": "🎙 Другие озвучки", "uk": "🎙 Інші озвучки", "en": "🎙 Other dubs"},
-    "digest_episodes": {"ru": "🆕 Вышли новые серии", "uk": "🆕 Вийшли нові серії", "en": "🆕 New episodes are out"},
-    "digest_parts": {"ru": "🆕 Новые части франшиз", "uk": "🆕 Нові частини франшиз", "en": "🆕 New franchise parts"},
 }

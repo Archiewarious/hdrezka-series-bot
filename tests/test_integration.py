@@ -245,7 +245,7 @@ def test_notification_text_names_the_dub(db):
         return any_voice.text, chosen.text
 
     any_text, chosen_text = db(scenario)
-    assert "FanVoxUA (Украинский)" in any_text, "«любая» — подписана первой вышедшей озвучкой"
+    assert any_text == "🎬 <b>Сериал</b>\n\n📺 1 сезон · 3 серия\n🎙 FanVoxUA (Украинский)", "пост: название, серия, озвучка"
     assert "Дубляж" in chosen_text and "FanVoxUA" not in chosen_text
 
 

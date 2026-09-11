@@ -75,8 +75,7 @@ CLAIM_SQL = text("""
 """)
 
 EPISODE_SQL = text("""
-    SELECT p.id, p.hdrezka_id, p.title, p.url, p.poster_url, p.poster_file_id,
-           p.default_translator, p.franchise_id, e.season, e.episode
+    SELECT p.id, p.title, p.url, p.poster_url, p.poster_file_id, p.default_translator, e.season, e.episode
       FROM episodes e JOIN pages p ON p.id = e.page_id WHERE e.id = :id""")
 FIRST_VOICE_SQL = text("""
     SELECT translator_id FROM episode_voices WHERE episode_id = :id ORDER BY seen_at LIMIT 1""")
@@ -84,30 +83,20 @@ VOICE_NAME_SQL = text("""
     SELECT v.name FROM voices v JOIN episodes e ON e.page_id = v.page_id
      WHERE e.id = :id AND v.translator_id = :tid LIMIT 1""")
 PART_SQL = text("""
-    SELECT p.id, p.hdrezka_id, p.title, p.url, p.poster_url, p.poster_file_id,
-           p.content_type, p.year, p.is_finished, p.franchise_id, f.name
+    SELECT p.id, p.title, p.url, p.poster_url, p.poster_file_id, p.content_type, p.year, f.name
       FROM pages p LEFT JOIN franchises f ON f.id = p.franchise_id WHERE p.id = :id""")
-SUB_SQL = text("""
-    SELECT id, scope FROM subscriptions
-     WHERE user_id = :u AND (page_id = :p OR franchise_id = :f)
-     ORDER BY (scope = 'page') DESC LIMIT 1""")
 
 
 @dataclass
 class Rendered:
     kind: str
     page_id: int
-    hdrezka_id: int
-    title: str                 # без экранирования — для кнопок
-    text: str                  # HTML одиночного сообщения / подписи к фото
-    line: str                  # HTML-строка дайджеста
-    watch_label: str           # «▶ Смотреть 4×22» / «▶ Открыть»
+    title: str                 # без экранирования — для кнопки дайджеста
+    text: str                  # HTML поста: подпись к фото или отдельное сообщение
+    line: str                  # HTML-блок этого события в дайджесте
     watch_url: str
     poster_url: str | None
     poster_file_id: str | None
-    sub_id: int | None
-    sub_scope: str | None      # 'page' | 'franchise'
-    can_follow: bool = False   # new_part: показывать «➕ Следить за этой частью»
 
 
 def watch_url(url: str, translator: int | None, season: int, episode: int) -> str:
@@ -116,101 +105,85 @@ def watch_url(url: str, translator: int | None, season: int, episode: int) -> st
 
 
 def fit_button(prefix: str, title: str, suffix: str = "", limit: int = BUTTON_MAX_LEN) -> str:
-    """Текст кнопки ≤ limit символов: режем название, суффикс (S×E) сохраняем."""
+    """Текст кнопки ≤ limit символов: режем название, суффикс сохраняем."""
     room = limit - len(prefix) - len(suffix)
     if len(title) > room:
         title = title[: max(room - 1, 0)] + "…"
     return f"{prefix}{title}{suffix}"
 
 
-async def _sub_for(s, user_id: int, page_id: int, franchise_id: int | None) -> tuple[int | None, str | None]:
-    row = (await s.execute(SUB_SQL, {"u": user_id, "p": page_id, "f": franchise_id or -1})).first()
-    return (row[0], row[1]) if row else (None, None)
-
-
 async def _render(s, user_id: int, kind: str, ref_id: int, lang: str = "ru") -> Rendered | None:
+    """Уведомление как пост (11.09.2026): название, пустая строка, сезон и серия, озвучка."""
     if kind == "episode" or kind.startswith("voice:"):
         row = (await s.execute(EPISODE_SQL, {"id": ref_id})).first()
         if not row:
             return None
-        page_id, hid, title, url, poster_url, file_id, default_tid, franchise_id, season, episode = row
-        title = title[:TITLE_MAX_LEN]
-        esc_title = html.escape(title)
-        sxe = f"{season}×{episode}"
-        body = t(lang, "n_episode_body", s=season, e=episode)
+        page_id, title, url, poster_url, file_id, default_tid, season, episode = row
         voice = None
         if kind.startswith("voice:"):
             tid = int(kind.split(":")[1])
-            name = await s.scalar(VOICE_NAME_SQL, {"id": ref_id, "tid": tid})
-            voice = html.escape(name or f"#{tid}")
-            body += t(lang, "n_voice_suffix", v=voice)
+            voice = await s.scalar(VOICE_NAME_SQL, {"id": ref_id, "tid": tid}) or f"#{tid}"
         else:
-            # Озвучка «любая»: ведём в ту, где серия появилась первой, и подписываем её в тексте;
+            # «Любая» озвучка: ведём в ту, где серия появилась первой, и подписываем её;
             # неизвестна — в озвучку по умолчанию, без подписи.
             tid = await s.scalar(FIRST_VOICE_SQL, {"id": ref_id})
             if tid is not None:
-                name = await s.scalar(VOICE_NAME_SQL, {"id": ref_id, "tid": tid})
-                if name:
-                    voice = html.escape(name)
-                    body += t(lang, "n_voice_suffix", v=voice)
+                voice = await s.scalar(VOICE_NAME_SQL, {"id": ref_id, "tid": tid})
             else:
                 tid = default_tid
-        sub_id, scope = await _sub_for(s, user_id, page_id, franchise_id)
+        title = title[:TITLE_MAX_LEN]
+        head = f"🎬 <b>{html.escape(title)}</b>"
+        ep = t(lang, "n_season_episode", s=season, e=episode)
+        dub = t(lang, "n_voice", v=html.escape(voice)) if voice else ""
         return Rendered(
-            kind=kind, page_id=page_id, hdrezka_id=hid, title=title,
-            text=f"🎬 <b>{esc_title}</b>\n{body}",
-            line=f"• <b>{esc_title}</b> — {sxe}" + (f" ({voice})" if voice else ""),
-            watch_label=t(lang, "btn_watch", sxe=sxe), watch_url=watch_url(url, tid, season, episode),
-            poster_url=poster_url, poster_file_id=file_id, sub_id=sub_id, sub_scope=scope,
+            kind=kind, page_id=page_id, title=title,
+            text=f"{head}\n\n{ep}" + (f"\n{dub}" if dub else ""),
+            line=f"{head}\n{ep}" + (f" · {dub}" if dub else ""),
+            watch_url=watch_url(url, tid, season, episode), poster_url=poster_url, poster_file_id=file_id,
         )
     if kind == "new_part":
         row = (await s.execute(PART_SQL, {"id": ref_id})).first()
         if not row:
             return None
-        page_id, hid, title, url, poster_url, file_id, ctype, year, finished, franchise_id, fname = row
+        page_id, title, url, poster_url, file_id, ctype, year, fname = row
         title = title[:TITLE_MAX_LEN]
-        esc_title, esc_fname = html.escape(title), html.escape(fname or "")
         what = t(lang, "kind_film") if ctype == "film" else (t(lang, "kind_series") if ctype == "series" else None)
         tail = " · ".join(x for x in (what, year) if x)
-        sub_id, scope = await _sub_for(s, user_id, page_id, franchise_id)
+        head = t(lang, "n_new_part", f=html.escape(fname or title))
+        name = f"🎬 <b>{html.escape(title)}</b>"
         return Rendered(
-            kind=kind, page_id=page_id, hdrezka_id=hid, title=title,
-            text=t(lang, "n_new_part", f=esc_fname, t=esc_title) + (f" · {tail}" if tail else ""),
-            line=t(lang, "n_new_part_line", f=esc_fname, t=esc_title) + (f" · {tail}" if tail else ""),
-            watch_label=t(lang, "btn_open"), watch_url=url,
-            poster_url=poster_url, poster_file_id=file_id, sub_id=sub_id, sub_scope=scope,
-            can_follow=ctype != "film" and not finished,
+            kind=kind, page_id=page_id, title=title,
+            text=f"{head}\n\n{name}" + (f"\n🎞 {tail}" if tail else ""),
+            line=f"{head}\n{name}" + (f" · {tail}" if tail else ""),
+            watch_url=url, poster_url=poster_url, poster_file_id=file_id,
         )
     return None
 
 
-def _unfollow_button(r: Rendered, lang: str = "ru") -> InlineKeyboardButton:
-    label = t(lang, "btn_unfollow_fr" if r.sub_scope == "franchise" else "btn_unfollow")
-    return InlineKeyboardButton(text=label, callback_data=f"unsubq:{r.sub_id}")
-
-
 def _single_keyboard(r: Rendered, lang: str = "ru") -> InlineKeyboardMarkup:
-    rows = [[InlineKeyboardButton(text=r.watch_label, url=r.watch_url)]]
-    if r.kind == "new_part":
-        if r.can_follow:
-            rows.append([InlineKeyboardButton(text=t(lang, "btn_follow_part"), callback_data=f"sub:{r.hdrezka_id}")])
-    elif r.sub_id:
-        rows.append([InlineKeyboardButton(text=t(lang, "btn_other_voices"), callback_data=f"voices:{r.sub_id}")])
-    if r.sub_id:
-        rows.append([_unfollow_button(r, lang)])
-    return InlineKeyboardMarkup(inline_keyboard=rows)
+    """Пост с одной кнопкой (решение 11.09.2026). Озвучки и отписка — в «📋 Мои подписки»;
+    нажатия на кнопки старых уведомлений бот по-прежнему обрабатывает."""
+    return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=t(lang, "btn_watch_site"), url=r.watch_url)]])
 
 
 def _digest(items: list[Rendered], lang: str = "ru") -> tuple[str, InlineKeyboardMarkup]:
+    """Несколько событий одним сообщением. Текст режется только между событиями — обрезка посреди HTML-тега
+    ломает разметку, и Telegram отклоняет сообщение. Кнопка — одна на сериал: две озвучки одной серии или
+    две серии подряд ведут к последнему событию."""
     head = t(lang, "digest_episodes" if any(r.kind != "new_part" for r in items) else "digest_parts")
-    body = head + "\n\n" + "\n".join(r.line for r in items)
-    if len(body) > TG_MAX_LEN:
-        body = body[:TG_MAX_LEN - 1] + "…"
-    rows = []
-    for r in items[:DIGEST_MAX_BUTTONS]:
-        suffix = "" if r.kind == "new_part" else " " + r.watch_label.split()[-1]   # S×E
-        rows.append([InlineKeyboardButton(text=fit_button("▶ ", r.title, suffix), url=r.watch_url)])
-    return body, InlineKeyboardMarkup(inline_keyboard=rows)
+    parts, size = [head], len(head)
+    for r in items:
+        if size + len(r.line) + 2 > TG_MAX_LEN - 3:
+            parts.append("…")
+            break
+        parts.append(r.line)
+        size += len(r.line) + 2
+    buttons: dict[int, tuple[str, str]] = {}
+    for r in items:
+        buttons[r.page_id] = (r.title, r.watch_url)
+    rows = [[InlineKeyboardButton(text=fit_button("▶ ", title), url=url)]
+            for title, url in list(buttons.values())[:DIGEST_MAX_BUTTONS]]
+    return "\n\n".join(parts), InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 async def _send_photo(bot: Bot, s, user_id: int, r: Rendered, kb: InlineKeyboardMarkup) -> bool:
