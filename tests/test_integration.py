@@ -418,6 +418,50 @@ def test_poller_counts_skipped_events(db, monkeypatch):
     assert db(scenario) == "1"
 
 
+def test_my_subscriptions_list(db):
+    """11.09.2026: узкие кнопки «🎙 …» и «❌» не вмещали названий. Теперь по широкой кнопке на сериал, в тексте —
+    серия, следующая и озвучка, без слова «франшиза»; сверху то, что выйдет раньше; до 15 на страницу поровну."""
+    from app.bot.main import _render_my
+    from app.i18n import fmt_date
+
+    async def scenario():
+        async with session() as s:
+            s.add(User(id=20))
+            soon = await _page(s, 1001, "Скоро", last=(1, 11), voices=[(56, "Дубляж")])
+            later = await _page(s, 1002, "Позже", last=(2, 3))
+            done = await _page(s, 1003, "Завершённый", last=(1, 12), finished=True)
+            fr = Franchise(key_hdrezka_id=1004, name="Сага")
+            s.add(fr)
+            await s.flush()
+            await _page(s, 1004, "Сага [ТВ-2]", last=(2, 5), franchise_id=fr.id)
+            s.add_all([Schedule(page_id=soon.id, season=1, episode=12, air_date=TODAY + timedelta(days=1)),
+                       Schedule(page_id=later.id, season=2, episode=4, air_date=TODAY + timedelta(days=5))])
+            s.add(Subscription(user_id=20, scope="page", page_id=soon.id, voice_filter=[56]))
+            await s.commit()
+            small = await _render_my(20)
+            await svc.subscribe_page(s, 20, later.id)
+            await svc.subscribe_page(s, 20, done.id)
+            await svc.subscribe_franchise(s, 20, fr.id)
+            for i in range(14):
+                extra = await _page(s, 1100 + i, f"Сериал {i}", last=(1, 1))
+                await svc.subscribe_page(s, 20, extra.id)
+            await s.commit()
+        return small, await _render_my(20), await _render_my(20, page=1)
+
+    (_, kb0), (text1, kb1), (text2, kb2) = db(scenario)
+    assert len(kb0.inline_keyboard) == 1, "одна подписка — без переключателя страниц"
+    soon_line = f"📺 <b>Скоро</b>\n1×11 · след. {fmt_date('ru', TODAY + timedelta(days=1))} · 🎙 Дубляж"
+    assert text1.startswith("📋 <b>Ваши подписки (18)</b>\n\n" + soon_line)
+    assert "📺 <b>Сага</b>\n2×5 · 🎙 любая" in text1 and "франшиз" not in text1
+    buttons1 = [row[0].text for row in kb1.inline_keyboard]
+    assert buttons1[:3] == ["📺 Скоро", "📺 Позже", "📺 Сага"] and len(buttons1) == 10, "18 записей — по 9"
+    assert kb1.inline_keyboard[0][0].callback_data.endswith(":0")
+    assert [b.text for b in kb1.inline_keyboard[-1]] == ["·", "1/2", "▶"]
+    assert text2.rstrip().endswith("<i>Нажмите на сериал — там озвучка и отписка.</i>")
+    assert "🔔 <b>Завершённый</b>\nзавершён, жду продолжения" in text2, "ждущие продолжения — в конце"
+    assert [b.text for b in kb2.inline_keyboard[-1]] == ["◀", "2/2", "·"]
+
+
 def test_health_sees_that_events_stopped(db):
     from app import health
 

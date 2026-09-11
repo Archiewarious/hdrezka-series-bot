@@ -1048,51 +1048,96 @@ async def cb_voice_any(cb: CallbackQuery) -> None:
 
 @dp.callback_query(F.data.startswith("card:"))
 async def cb_card(cb: CallbackQuery) -> None:
-    sub = await _own_sub(cb.from_user.id, int(cb.data.split(":")[1]))
+    """Карточка подписки: из «Мои подписки» (card:<id>:<страница>) или после выбора озвучки (card:<id>).
+    Внизу — возврат к списку на ту же страницу."""
+    parts = cb.data.split(":")
+    sub = await _own_sub(cb.from_user.id, int(parts[1]))
+    back_page = int(parts[2]) if len(parts) > 2 else 0
     await cb.answer()
+    lang = await _lang(cb.from_user.id)
     if not sub:
-        await _edit(cb, t(await _lang(cb.from_user.id), "sub_not_found"), _kb([]))
+        await _edit(cb, t(lang, "sub_not_found"), _kb([[(t(lang, "btn_back_to_my"), f"my:{back_page}")]]))
         return
     if sub.page_id:
         text_, kb = await _render_page_card(cb.from_user.id, sub.page_id)
     else:
         text_, kb = await _render_franchise_card(cb.from_user.id, sub.franchise_id, created=False)
+    kb = InlineKeyboardMarkup(inline_keyboard=list(kb.inline_keyboard) + [
+        [InlineKeyboardButton(text=t(lang, "btn_back_to_my"), callback_data=f"my:{back_page}")]])
     await _edit(cb, text_, kb)
 
 
 # ----------------------------------------------------------------------------- /my и отписка
 
-async def _render_my(user_id: int):
+MY_PAGE_MAX = 15   # 15 записей с длинными названиями — меньше 4096 символов сообщения
+
+
+async def _render_my(user_id: int, page: int = 0):
+    """«Мои подписки» (11.09.2026): у каждого сериала название и одна строка — серия, дата следующей, озвучка;
+    по широкой кнопке на сериал, она ведёт в карточку, где озвучка и отписка. Узкие кнопки «🎙 …» и «❌» не
+    вмещали названий, а слово «франшиза» зрителю не нужно. Сверху то, что выйдет раньше. Страниц — сколько нужно
+    по 15, записи делятся между ними поровну: одинокая запись на последней странице выглядела бы потерянной."""
     lang = await _lang(user_id)
+    entries = []
     async with session() as s:
-        subs = (await s.execute(select(Subscription).where(Subscription.user_id == user_id)
-                                .order_by(Subscription.scope, Subscription.created_at))).scalars().all()
+        subs = (await s.execute(select(Subscription).where(Subscription.user_id == user_id))).scalars().all()
         if not subs:
             return t(lang, "my_empty"), _kb([])
-        lines, rows = [t(lang, "my_head", n=len(subs))], []
         for sub in subs:
             if sub.scope == "franchise":
                 fr = await s.get(Franchise, sub.franchise_id)
-                n = await s.scalar(select(func.count()).select_from(Page).where(Page.franchise_id == fr.id))
-                ongoing = (await s.execute(select(Page).where(Page.franchise_id == fr.id, Page.is_finished.is_(False),
-                                                              Page.last_episode.isnot(None), Page.content_type != "film"))).scalars().all()
-                tail = "; ".join(f"{p.title[:28]} {p.last_season}×{p.last_episode}" for p in ongoing[:2])
-                lines.append(t(lang, "my_fr_line", name=fr.name, parts=t(lang, "parts_n", n=n))
-                             + (t(lang, "my_airing", tail=tail) if tail else ""))
-                label = fr.name
+                parts = (await s.execute(
+                    select(Page).where(Page.franchise_id == sub.franchise_id, Page.is_finished.is_(False),
+                                       Page.last_episode.isnot(None), func.coalesce(Page.content_type, "series") != "film")
+                    .order_by(Page.year.desc().nulls_last(), Page.id.desc()))).scalars().all()
+                title, airing, waiting, page_ids = fr.name, (parts[0] if parts else None), False, [x.id for x in parts]
             else:
-                p = await s.get(Page, sub.page_id)
+                pg = await s.get(Page, sub.page_id)
+                waiting = pg.is_finished and pg.content_type != "film"
+                airing = pg if (not pg.is_finished and pg.last_episode) else None
+                title, page_ids = pg.title, [pg.id]
+            nxt = None
+            if page_ids and not waiting:
                 nxt = await s.scalar(select(func.min(Schedule.air_date)).where(
-                    Schedule.page_id == p.id, Schedule.aired.is_(False), ~_released(), Schedule.air_date >= date.today()))
-                st = f"{p.last_season}×{p.last_episode}" if p.last_episode else "—"
-                extra = t(lang, "my_next", d=fmt_date(lang, nxt)) if nxt else ""
-                fin = t(lang, "my_waiting") if p.is_finished else ""
-                lines.append(f'📺 <a href="{p.url}">{p.title}</a> — {st}{extra}{fin}')
-                label = p.title
-            voices = await _voices_for_sub(s, sub)
-            lines[-1] += t(lang, "my_voice", v=_voice_label(lang, sub, voices))
-            rows.append([(f"🎙 {label[:22]}", f"voices:{sub.id}"), ("❌", f"unsub:{sub.id}")])
+                    Schedule.page_id.in_(page_ids), Schedule.aired.is_(False), ~_released(), Schedule.air_date >= date.today()))
+            names = {v.translator_id: v.name for v in await _voices_for_sub(s, sub)}
+            chosen = [names.get(tid, f"#{tid}") for tid in sub.voice_filter or []]
+            voice = (", ".join(chosen[:2]) + (f" +{len(chosen) - 2}" if len(chosen) > 2 else "")) if chosen \
+                else t(lang, "voice_any")
+            entries.append(((waiting, airing is None, nxt or date.max, title.lower()), sub, title, airing, nxt, voice, waiting))
+    entries.sort(key=lambda e: e[0])
+
+    pages = -(-len(entries) // MY_PAGE_MAX)
+    size = -(-len(entries) // pages)
+    page = max(0, min(page, pages - 1))
+    lines, rows = [t(lang, "my_head", n=len(entries))], []
+    for _, sub, title, airing, nxt, voice, waiting in entries[page * size:(page + 1) * size]:
+        icon = "🔔" if waiting else "📺"
+        if waiting:
+            detail = t(lang, "my_waiting")
+        else:
+            bits = [f"{airing.last_season}×{airing.last_episode}" if airing else t(lang, "my_nothing_airing")]
+            if nxt:
+                bits.append(t(lang, "my_next", d=fmt_date(lang, nxt)))
+            bits.append(f"🎙 {voice}")
+            detail = " · ".join(bits)
+        lines.append(f"\n{icon} <b>{html.escape(title)}</b>\n{html.escape(detail)}")
+        rows.append([(fit_button(f"{icon} ", title), f"card:{sub.id}:{page}")])
+    if pages > 1:
+        rows.append([("◀", f"my:{page - 1}") if page else ("·", "noop"), (f"{page + 1}/{pages}", "noop"),
+                     ("▶", f"my:{page + 1}") if page < pages - 1 else ("·", "noop")])
+    lines.append("\n" + t(lang, "my_hint"))
     return "\n".join(lines), _kb(rows)
+
+
+@dp.callback_query(F.data.startswith("my:"))
+async def cb_my_page(cb: CallbackQuery) -> None:
+    if not guard.cheap_actions.allow(cb.from_user.id):
+        await cb.answer(t(await _lang(cb.from_user.id), "too_fast"))
+        return
+    text_, kb = await _render_my(cb.from_user.id, int(cb.data.split(":")[1]))
+    await cb.answer()
+    await _edit(cb, text_, kb)
 
 
 @dp.callback_query(F.data.startswith("unsub:"))
