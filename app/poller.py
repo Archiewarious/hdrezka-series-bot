@@ -3,7 +3,8 @@
 Потоки (docs/ARCHITECTURE.md, §4.1):
   1. блок «Обновления» на главной — единственный источник событий: новые серии и озвучки (F13);
   2. суточная сверка состава франшиз с подписчиками: фильмы и спин-оффы, которых в блоке нет;
-  3. недельное перечитывание страниц с подписчиками: расписание, озвучки, статус;
+  3. перечитывание страниц с подписчиками: расписание, озвучки, статус — выходящие дважды в сутки,
+     завершённые («жду продолжения») раз в неделю; заодно подстраховка, если серия прошла мимо блока;
   4. очередь чтения каталога: страницы, которых ещё не читали.
 
 Число запросов к сайту не зависит от числа пользователей.
@@ -29,7 +30,8 @@ ADVISORY_LOCK_KEY = 0x52455A4B          # "REZK" — ровно один пол�
 EVENT_READS = 10                        # чтений страниц ради событий за цикл; не хватило — событие ждёт цикла
 VOICE_REREAD = timedelta(hours=24)      # незнакомая озвучка → перечитать список озвучек страницы, не чаще
 FRANCHISE_REFRESH_HOURS = 24
-PAGE_REFRESH_DAYS = 7
+PAGE_REFRESH_HOURS = 12                 # выходящие страницы с подписчиками: расписание сайта живое
+PAGE_REFRESH_DAYS = 7                   # завершённые, на которых ждут продолжения
 PER_CYCLE_FRANCHISES = 2                # чтобы обход не растягивался: остальное — в следующий цикл
 PER_CYCLE_PAGES = 2
 PER_CYCLE_READS = 8                     # очередь чтения каталога
@@ -233,24 +235,54 @@ class Poller:
 
     async def refresh_pages(self, s) -> int:
         rows = (await s.execute(text("""
-            SELECT DISTINCT p.id FROM pages p
+            SELECT DISTINCT p.page_refreshed_at, p.id FROM pages p
               LEFT JOIN subscriptions sp ON sp.page_id = p.id
               LEFT JOIN subscriptions sf ON sf.franchise_id = p.franchise_id
              WHERE (sp.id IS NOT NULL OR sf.id IS NOT NULL)
                AND (NOT p.is_finished OR sp.id IS NOT NULL)    -- завершённые с «жду продолжения» — раз в неделю
                AND p.url <> ''
                AND coalesce(p.content_type, 'series') = 'series'
-               AND (p.page_refreshed_at IS NULL OR p.page_refreshed_at < now() - make_interval(days => :d))
-             ORDER BY p.id LIMIT :lim"""), {"d": PAGE_REFRESH_DAYS, "lim": PER_CYCLE_PAGES})).all()
+               AND (p.page_refreshed_at IS NULL OR p.page_refreshed_at < now() - CASE WHEN p.is_finished
+                        THEN make_interval(days => :d) ELSE make_interval(hours => :h) END)
+             -- колонка сортировки обязана быть в списке SELECT DISTINCT, иначе Postgres откажется
+             ORDER BY p.page_refreshed_at NULLS FIRST LIMIT :lim"""),
+            {"d": PAGE_REFRESH_DAYS, "h": PAGE_REFRESH_HOURS, "lim": PER_CYCLE_PAGES})).all()
         done = 0
-        for (pid,) in rows:
+        for _, pid in rows:
             page = await s.get(Page, pid)
             try:
-                await self.sync(s, page.hdrezka_id, page.url)
+                res = await self.sync(s, page.hdrezka_id, page.url)
+                await self._catch_missed(s, res)
                 done += 1
             except AccessBlocked as exc:
                 log.warning("Обновление страницы %s: %s", page.hdrezka_id, exc)
         return done
+
+    async def _catch_missed(self, s, res: svc.SyncResult) -> int:
+        """Подстраховка на случай, если серия не попала в блок обновлений: список серий на самой странице
+        новее всего, что бот записал, — значит серия на сайте есть, а события не было. Работает только для
+        страниц с подписчиками (их и перечитываем) и только когда записи уже есть: без них не с чем
+        сравнивать, и первое чтение каталога подняло бы весь сезон."""
+        page = res.page
+        if not res.episodes:
+            return 0
+        top_season = max(res.episodes)
+        top = (top_season, max(res.episodes[top_season]))
+        page_max = await svc.max_recorded_episode(s, page.id)
+        if page_max is None or top <= page_max:
+            return 0
+        eid = await svc.record_episode(s, page, *top)
+        if eid is None:
+            return 0
+        page.last_season, page.last_episode = top
+        page.is_finished, page.last_event_at = False, svc.now()
+        n = await svc.enqueue_episode(s, page, eid)
+        # Список серий на странице — озвучки по умолчанию: подписчикам именно этой озвучки тоже пора.
+        if page.default_translator and await svc.mark_voice_seen(s, eid, page.default_translator):
+            n += await svc.enqueue_voice(s, page, eid, page.default_translator)
+        log.warning("СЕРИЯ МИМО БЛОКА ОБНОВЛЕНИЙ: %s s%se%s → %s уведомлений",
+                    page.title, top[0], top[1], n)
+        return n
 
     # ------------------------------------------------------------------ 4: очередь чтения каталога
 

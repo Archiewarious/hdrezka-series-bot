@@ -326,6 +326,10 @@ STRINGS: dict[str, dict[str, str | tuple]] = {
         "uk": "У найближчі {n} днів за вашими підписками серій не заплановано — або сайт не вказує точних дат (у частини серіалів є лише рік).",
         "en": "No episodes scheduled for your subscriptions in the next {n} days — or the site gives no exact dates (some series only have a year).",
     },
+    "cal_late_head": {"ru": "⏳ <b>Эфир прошёл, на HDREZKA ещё нет</b>",
+                      "uk": "⏳ <b>Ефір минув, на HDREZKA ще немає</b>",
+                      "en": "⏳ <b>Aired on TV, not on HDREZKA yet</b>"},
+    "cal_late_line": {"ru": "эфир {d}", "uk": "ефір {d}", "en": "aired {d}"},
     "cal_head": {"ru": "📅 <b>Ближайшие {n} дней</b>", "uk": "📅 <b>Найближчі {n} днів</b>", "en": "📅 <b>Next {n} days</b>"},
     # --- озвучки
     "sub_not_found": {"ru": "Подписка не найдена.", "uk": "Підписку не знайдено.", "en": "Subscription not found."},
@@ -358,6 +362,7 @@ STRINGS: dict[str, dict[str, str | tuple]] = {
     "my_head": {"ru": "📋 <b>Ваши подписки ({n})</b>", "uk": "📋 <b>Ваші підписки ({n})</b>", "en": "📋 <b>Your subscriptions ({n})</b>"},
     "my_next": {"ru": "след. {d}", "uk": "наст. {d}", "en": "next {d}"},
     "my_waiting": {"ru": "завершён, жду продолжения", "uk": "завершено, чекаю на продовження", "en": "finished, waiting for a sequel"},
+    "my_late": {"ru": "ждём {s}×{e}, эфир {d}", "uk": "чекаємо {s}×{e}, ефір {d}", "en": "waiting for {s}×{e}, aired {d}"},
     "my_nothing_airing": {"ru": "сейчас ничего не выходит", "uk": "зараз нічого не виходить", "en": "nothing airing now"},
     "my_hint": {"ru": "<i>Нажмите на сериал — там озвучка и отписка.</i>",
                 "uk": "<i>Натисніть на серіал — там озвучка й відписка.</i>",

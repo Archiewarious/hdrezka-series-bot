@@ -252,11 +252,11 @@ def test_notification_text_names_the_dub(db):
 
 def test_calendar_sql_runs(db):
     """07.09.2026 календарь падал на «date + unknown»: SQL без базы не проверялся."""
-    from app.bot.main import CAL_DAYS, CALENDAR_SQL
+    from app.bot.main import CAL_DAYS, CAL_LATE_DAYS, CALENDAR_SQL
 
     async def scenario():
         async with session() as s:
-            return (await s.execute(CALENDAR_SQL, {"uid": 1, "days": CAL_DAYS})).all()
+            return (await s.execute(CALENDAR_SQL, {"uid": 1, "days": CAL_DAYS, "back": CAL_LATE_DAYS})).all()
 
     assert db(scenario) == []
 
@@ -264,7 +264,7 @@ def test_calendar_sql_runs(db):
 def test_calendar_hides_episodes_already_out_in_your_dub(db):
     """11.09.2026: календарь показывал «сегодня» и «завтра» серии, которые уже вышли в дубляже и были
     разосланы 10 сентября — расписание сайта отстаёт от загрузок."""
-    from app.bot.main import CAL_DAYS, CALENDAR_SQL
+    from app.bot.main import CAL_DAYS, CAL_LATE_DAYS, CALENDAR_SQL
 
     async def scenario():
         async with session() as s:
@@ -279,9 +279,76 @@ def test_calendar_hides_episodes_already_out_in_your_dub(db):
             for ep, days in ((10, 0), (11, 1), (12, 2)):
                 s.add(Schedule(page_id=page.id, season=1, episode=ep, air_date=TODAY + timedelta(days=days), aired=False))
             await s.commit()
-            return [(r[1], r[2]) for r in (await s.execute(CALENDAR_SQL, {"uid": 9, "days": CAL_DAYS})).all()]
+            return [(r[1], r[2]) for r in
+                    (await s.execute(CALENDAR_SQL, {"uid": 9, "days": CAL_DAYS, "back": CAL_LATE_DAYS})).all()]
 
     assert db(scenario) == [(1, 11), (1, 12)], "1×10 уже в дубляже — не ожидается; 1×11 только в оригинале — ждём"
+
+
+def test_calendar_keeps_episode_that_aired_but_is_not_on_the_site(db):
+    """12.09.2026: «неудачник» 1×12 вышел в эфир 11-го, на HDREZKA его ещё нет — и серия просто пропала
+    из календаря. Теперь такие висят сверху отдельным блоком, а не исчезают."""
+    from app.bot.main import CAL_DAYS, CAL_LATE_DAYS, CALENDAR_SQL, calendar_text
+
+    async def scenario():
+        async with session() as s:
+            s.add(User(id=30))
+            page = await _page(s, 962, "Неудачник", last=(1, 11), rows=[(1, 11)])
+            await svc.subscribe_page(s, 30, page.id)
+            s.add_all([Schedule(page_id=page.id, season=1, episode=12, air_date=TODAY - timedelta(days=1)),
+                       Schedule(page_id=page.id, season=1, episode=13, air_date=TODAY + timedelta(days=6))])
+            await s.commit()
+            return (await s.execute(CALENDAR_SQL, {"uid": 30, "days": CAL_DAYS, "back": CAL_LATE_DAYS})).all()
+
+    rows = db(scenario)
+    assert [(r[1], r[2]) for r in rows] == [(1, 12), (1, 13)]
+    text_ = calendar_text("ru", rows)
+    assert text_.index("Неудачник — 1×12 · эфир") < text_.index("Ближайшие"), "просроченная — сверху"
+    assert "Неудачник — 1×13" in text_
+
+
+def test_episode_that_missed_the_updates_block_is_caught_when_the_page_is_reread(db):
+    """Подстраховка: если серия не попала в блок обновлений, её видно по списку серий на самой странице.
+    Перечитывание страниц с подписчиками (раз в 12 часов) записывает такую серию и уведомляет."""
+    async def scenario():
+        async with session() as s:
+            s.add_all([User(id=31), User(id=32)])
+            page = await _page(s, 963, "Сериал", last=(1, 11), rows=[(1, 11)],
+                               voices=[(56, "Дубляж"), (238, "Оригинал (+субтитры)")])
+            page.page_refreshed_at = svc.now() - timedelta(hours=13)
+            await svc.subscribe_page(s, 31, page.id)                                  # любая озвучка
+            s.add(Subscription(user_id=32, scope="page", page_id=page.id, voice_filter=[56]))
+            await s.commit()
+        site = FakeSite("", {963: title_page(963, "Сериал", 1, 12,
+                                             [(56, "Дубляж", None), (238, "Оригинал (+субтитры)", None)])})
+        async with session() as s:
+            await Poller(site).refresh_pages(s)
+            await s.commit()
+        async with session() as s:                                # второй проход не дублирует
+            await Poller(site).refresh_pages(s)
+            await s.commit()
+        return await _notifications(31), await _notifications(32)
+
+    any_voice, dubbed = db(scenario)
+    assert any_voice == [("episode", 1, 12)]
+    assert dubbed == [("voice:56", 1, 12)], "список серий на странице — озвучки по умолчанию"
+
+
+def test_my_subscriptions_show_episode_that_is_late(db):
+    """В списке подписок у такой серии своя строка: «ждём 1×12, эфир 11 сен» вместо пустоты."""
+    from app.bot.main import _render_my
+
+    async def scenario():
+        async with session() as s:
+            s.add(User(id=33))
+            page = await _page(s, 964, "Неудачник", last=(1, 11), rows=[(1, 11)])
+            await svc.subscribe_page(s, 33, page.id)
+            s.add(Schedule(page_id=page.id, season=1, episode=12, air_date=TODAY - timedelta(days=1)))
+            await s.commit()
+        return await _render_my(33)
+
+    text_, _ = db(scenario)
+    assert "1×11 · ждём 1×12, эфир" in text_
 
 
 class FakeBot:

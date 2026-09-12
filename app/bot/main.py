@@ -140,6 +140,7 @@ def _share_url(lang: str, start_arg: str, title: str) -> str:
 
 
 CAL_DAYS = 14
+CAL_LATE_DAYS = 10      # эфир прошёл, а на HDREZKA серии ещё нет: держим её в календаре столько дней
 
 
 def _remember(items: list[FeedItem]) -> None:
@@ -285,7 +286,9 @@ CALENDAR_SQL = text("""
       JOIN schedule sc ON sc.page_id = p.id
      WHERE sub.user_id = :uid AND NOT sc.aired AND sc.air_date IS NOT NULL
        -- CAST обязателен: asyncpg шлёт параметр без типа, а «date + unknown» неоднозначен
-       AND sc.air_date >= current_date AND sc.air_date < current_date + CAST(:days AS int)
+       -- Прошедшие даты тоже берём: эфир был, а на HDREZKA серии ещё нет — иначе она просто исчезала
+       -- из календаря, и человек не понимал, вышла она или потерялась (11.09.2026, «неудачник» 1×12).
+       AND sc.air_date >= current_date - CAST(:back AS int) AND sc.air_date < current_date + CAST(:days AS int)
        AND coalesce(p.content_type, 'series') = 'series'
        -- Уже вышла в озвучке подписки — не «ожидается». Расписание сайта отстаёт от загрузок: 11.09.2026
        -- календарь показывал «сегодня» серии, вышедшие и разосланные двумя днями раньше.
@@ -306,21 +309,37 @@ async def cmd_calendar(msg: Message) -> None:
         return
     lang = await _lang(msg.from_user.id)
     async with session() as s:
-        rows = (await s.execute(CALENDAR_SQL, {"uid": msg.from_user.id, "days": CAL_DAYS})).all()
+        rows = (await s.execute(CALENDAR_SQL,
+                                {"uid": msg.from_user.id, "days": CAL_DAYS, "back": CAL_LATE_DAYS})).all()
         has_subs = await s.scalar(select(func.count()).select_from(Subscription).where(Subscription.user_id == msg.from_user.id))
     if not has_subs:
         await msg.answer(t(lang, "cal_no_subs"), reply_markup=menu(lang))
         return
+    await msg.answer(calendar_text(lang, rows), reply_markup=menu(lang))
+
+
+def calendar_text(lang: str, rows: list) -> str:
+    """Строки CALENDAR_SQL → текст календаря. Сверху то, что уже вышло в эфир, но на HDREZKA ещё не
+    появилось: 11.09.2026 такая серия («неудачник» 1×12) просто пропадала из календаря на следующий день."""
+    late = [r for r in rows if r[3] < date.today()]
+    soon = [r for r in rows if r[3] >= date.today()]
     if not rows:
-        await msg.answer(t(lang, "cal_empty", n=CAL_DAYS) + t(lang, "cal_note"), reply_markup=menu(lang))
-        return
-    lines, cur = [t(lang, "cal_head", n=CAL_DAYS)], None
-    for title, season, episode, d in rows:
-        if d != cur:
-            cur = d
-            lines.append(f"\n<b>{when(lang, d)}</b>")
-        lines.append(f"  • {title[:36]} — {season}×{episode}")
-    await msg.answer("\n".join(lines) + t(lang, "cal_note"), reply_markup=menu(lang))
+        return t(lang, "cal_empty", n=CAL_DAYS) + t(lang, "cal_note")
+    lines = []
+    if late:
+        lines.append(t(lang, "cal_late_head"))
+        lines += [f"  • {title[:36]} — {season}×{episode} · {t(lang, 'cal_late_line', d=fmt_date(lang, d))}"
+                  for title, season, episode, d in late]
+        lines.append("")
+    if soon:
+        lines.append(t(lang, "cal_head", n=CAL_DAYS))
+        cur = None
+        for title, season, episode, d in soon:
+            if d != cur:
+                cur = d
+                lines.append(f"\n<b>{when(lang, d)}</b>")
+            lines.append(f"  • {title[:36]} — {season}×{episode}")
+    return "\n".join(lines) + t(lang, "cal_note")
 
 
 @dp.message(Command("stats"))
@@ -1098,13 +1117,17 @@ async def _render_my(user_id: int, page: int = 0):
                 title, page_ids = pg.title, [pg.id]
             nxt = None
             if page_ids and not waiting:
-                nxt = await s.scalar(select(func.min(Schedule.air_date)).where(
-                    Schedule.page_id.in_(page_ids), Schedule.aired.is_(False), ~_released(), Schedule.air_date >= date.today()))
+                nxt = (await s.execute(
+                    select(Schedule.air_date, Schedule.season, Schedule.episode)
+                    .where(Schedule.page_id.in_(page_ids), Schedule.aired.is_(False), ~_released(),
+                           Schedule.air_date >= date.today() - timedelta(days=CAL_LATE_DAYS))
+                    .order_by(Schedule.air_date).limit(1))).first()
             names = {v.translator_id: v.name for v in await _voices_for_sub(s, sub)}
             chosen = [names.get(tid, f"#{tid}") for tid in sub.voice_filter or []]
             voice = (", ".join(chosen[:2]) + (f" +{len(chosen) - 2}" if len(chosen) > 2 else "")) if chosen \
                 else t(lang, "voice_any")
-            entries.append(((waiting, airing is None, nxt or date.max, title.lower()), sub, title, airing, nxt, voice, waiting))
+            entries.append(((waiting, airing is None, nxt.air_date if nxt else date.max, title.lower()),
+                            sub, title, airing, nxt, voice, waiting))
     entries.sort(key=lambda e: e[0])
 
     pages = -(-len(entries) // MY_PAGE_MAX)
@@ -1117,8 +1140,10 @@ async def _render_my(user_id: int, page: int = 0):
             detail = t(lang, "my_waiting")
         else:
             bits = [f"{airing.last_season}×{airing.last_episode}" if airing else t(lang, "my_nothing_airing")]
-            if nxt:
-                bits.append(t(lang, "my_next", d=fmt_date(lang, nxt)))
+            if nxt and nxt.air_date < date.today():
+                bits.append(t(lang, "my_late", s=nxt.season, e=nxt.episode, d=fmt_date(lang, nxt.air_date)))
+            elif nxt:
+                bits.append(t(lang, "my_next", d=fmt_date(lang, nxt.air_date)))
             bits.append(f"🎙 {voice}")
             detail = " · ".join(bits)
         lines.append(f"\n{icon} <b>{html.escape(title)}</b>\n{html.escape(detail)}")

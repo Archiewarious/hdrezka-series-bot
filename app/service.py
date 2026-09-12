@@ -120,6 +120,7 @@ class SyncResult:
     franchise: Franchise | None
     franchise_was_known: bool        # франшиза уже была в БД до этого чтения
     new_parts: list[Page]            # части, которых в БД не было
+    episodes: dict[int, list[int]]   # сезон → серии по списку на странице (озвучка по умолчанию)
 
 
 async def sync_page(s: AsyncSession, client: RezkaClient, hdrezka_id: int, url: str) -> SyncResult:
@@ -174,7 +175,7 @@ async def sync_page(s: AsyncSession, client: RezkaClient, hdrezka_id: int, url: 
 
     franchise, was_known, new_parts = await _apply_franchise(s, page, tp)
     await s.flush()
-    return SyncResult(page, franchise, was_known, new_parts)
+    return SyncResult(page, franchise, was_known, new_parts, tp.episodes)
 
 
 FINISHED_AFTER_DAYS = 60
