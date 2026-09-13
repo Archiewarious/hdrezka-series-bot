@@ -4,9 +4,12 @@
 одна загрузка на сериал, ничего не хранится на диске."""
 from __future__ import annotations
 
+import asyncio
+import io
 import logging
 
 import aiohttp
+from PIL import Image, ImageEnhance, ImageFilter, ImageOps
 from aiogram import Bot
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.types import BufferedInputFile, InlineKeyboardMarkup, Message
@@ -17,6 +20,8 @@ from app.config import cfg
 log = logging.getLogger("posters")
 
 CAPTION_MAX_LEN = 1024
+POSTER_SIZE = (1000, 1414)           # один размер на все посты: 1:1,414 — самое частое отношение у HDREZKA
+POSTER_QUALITY = 88
 POSTER_TIMEOUT = 10
 POSTER_MAX_BYTES = 10 * 1024 * 1024  # лимит Telegram на загрузку фото
 
@@ -38,6 +43,34 @@ async def download(url: str) -> bytes | None:
         return None
 
 
+def _to_standard(data: bytes) -> bytes:
+    """Постер к стандартному размеру. У HDREZKA отношение сторон гуляет от 0.63 до 0.75, и лента постов
+    выглядела лесенкой (12.09.2026). Картинка вписывается целиком — не обрезаем, у постеров текст по краям, —
+    а поля закрывает размытая затемнённая копия её же: так это читается как фон, а не как пустые полосы."""
+    with Image.open(io.BytesIO(data)) as src:
+        im = ImageOps.exif_transpose(src).convert("RGB")
+    fitted = ImageOps.contain(im, POSTER_SIZE, Image.LANCZOS)
+    if fitted.size == POSTER_SIZE:
+        canvas = fitted
+    else:
+        small = (POSTER_SIZE[0] // 4, POSTER_SIZE[1] // 4)           # размываем уменьшенную копию — быстрее
+        canvas = ImageOps.fit(im, small, Image.LANCZOS).filter(ImageFilter.GaussianBlur(8))
+        canvas = ImageEnhance.Brightness(canvas).enhance(0.45).resize(POSTER_SIZE, Image.LANCZOS)
+        canvas.paste(fitted, ((POSTER_SIZE[0] - fitted.width) // 2, (POSTER_SIZE[1] - fitted.height) // 2))
+    out = io.BytesIO()
+    canvas.save(out, "JPEG", quality=POSTER_QUALITY, optimize=True, progressive=True)
+    return out.getvalue()
+
+
+async def to_standard(data: bytes) -> bytes:
+    """Не вышло — отправляем оригинал: лучше постер не того размера, чем пост без картинки."""
+    try:
+        return await asyncio.to_thread(_to_standard, data)
+    except Exception as exc:
+        log.warning("Постер не привёлся к стандартному размеру (%s) — отправляю как есть", exc)
+        return data
+
+
 async def send_photo_cached(bot: Bot, s, chat_id: int, page_id: int, poster_url: str | None,
                             poster_file_id: str | None, caption: str,
                             kb: InlineKeyboardMarkup | None) -> Message | None:
@@ -55,6 +88,7 @@ async def send_photo_cached(bot: Bot, s, chat_id: int, page_id: int, poster_url:
     data = await download(poster_url)
     if not data:
         return None
+    data = await to_standard(data)
     try:
         msg = await bot.send_photo(chat_id, BufferedInputFile(data, filename="poster.jpg"),
                                    caption=caption, reply_markup=kb)
