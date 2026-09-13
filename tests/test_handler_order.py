@@ -23,3 +23,11 @@ def test_menu_buttons_registered_before_catch_all():
 def test_every_menu_button_has_a_handler():
     handled = {MENU_RX.search(line).group(1) for line in SRC if MENU_RX.search(line)}
     assert handled == {"btn_find", "btn_my", "btn_new", "btn_cal", "btn_settings", "btn_help"}
+
+
+def test_feedback_handlers_registered_before_catch_all():
+    """Письмо автору и «Ответить» на обращение не должны уйти в поиск."""
+    catch_all = next(i for i, line in enumerate(SRC) if line.strip() == CATCH_ALL)
+    for name in ("async def on_feedback_reply", "async def on_feedback_message"):
+        at = next(i for i, line in enumerate(SRC) if line.startswith(name))
+        assert at < catch_all, f"{name} ниже on_text"

@@ -45,3 +45,4 @@ class UserLimiter:
 
 site_actions = UserLimiter(per_minute=6, per_hour=60)     # поиск, ссылка — каждый = запрос к сайту
 cheap_actions = UserLimiter(per_minute=30, per_hour=600)  # кнопки, /my — только база
+feedback_actions = UserLimiter(per_minute=3, per_hour=15)  # письма автору — чтобы не завалили

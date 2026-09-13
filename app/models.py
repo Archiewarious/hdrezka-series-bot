@@ -34,6 +34,9 @@ class User(Base):
     digest_hour: Mapped[int | None] = mapped_column(SmallInteger)                                    # NULL = сразу
     default_voice_filter: Mapped[list[int] | None] = mapped_column(ARRAY(Integer))                   # для новых подписок
     lang: Mapped[str] = mapped_column(String(2), default="ru", server_default=text("'ru'"))          # ru | uk | en
+    # Обратная связь: выбрал тему — следующее сообщение до feedback_until уходит автору (app/feedback.py)
+    feedback_topic: Mapped[str | None] = mapped_column(String(16))
+    feedback_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 
 class Franchise(Base):
@@ -176,3 +179,27 @@ class Meta(Base):
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
     )
+
+
+class Feedback(Base):
+    """Обращение к автору. Текст не храним — он у автора в Telegram; здесь кто, тема и когда ответили."""
+    __tablename__ = "feedback"
+    __table_args__ = (CheckConstraint("topic IN ('bug', 'idea', 'collab', 'other')", name="ck_feedback_topic"),)
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    topic: Mapped[str] = mapped_column(String(16))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    answered_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class FeedbackLink(Base):
+    """Сообщение Telegram, относящееся к обращению: «Ответить» на него находит адресата.
+    side='admin' — лежит у автора, ответ уходит человеку; 'user' — лежит у человека, уходит автору."""
+    __tablename__ = "feedback_links"
+    __table_args__ = (CheckConstraint("side IN ('admin', 'user')", name="ck_feedback_link_side"),)
+
+    chat_id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    message_id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    feedback_id: Mapped[int] = mapped_column(ForeignKey("feedback.id", ondelete="CASCADE"))
+    side: Mapped[str] = mapped_column(String(8))

@@ -5,7 +5,8 @@ import pytest
 
 from app.i18n import LANGS, STRINGS, detect, fmt_date, plural, t, when
 
-KW = dict(n=5, s=1, e=2, h=8, f=23, t=8, v="x", d="x", name="x", title="x", sxe="1×2", kind="x", tail="x", parts="x")
+KW = dict(n=5, s=1, e=2, h=8, f=23, t=8, v="x", d="x", name="x", title="x", sxe="1×2", kind="x", tail="x", parts="x",
+          topic="x", who="x", ulang="x", subs=1, since="x", reason="x")
 
 
 def test_every_key_has_every_language():

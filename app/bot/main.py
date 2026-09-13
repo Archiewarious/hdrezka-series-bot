@@ -35,6 +35,7 @@ from app.i18n import DETECT_FALLBACK, LANGS, fmt_date, t, when
 from app.models import Episode, Franchise, Page, Schedule, Subscription, User, Voice
 from app.rezka.client import AccessBlocked, RezkaClient
 from app.rezka.parser import FeedItem, parse_feed
+from app import feedback
 from app.sender import fit_button, watch_url
 
 log = logging.getLogger("bot")
@@ -82,6 +83,23 @@ class SkipStaleUpdates(BaseMiddleware):
 
 
 dp.update.outer_middleware(SkipStaleUpdates())
+
+MENU_TEXTS = set().union(*MENU.values())
+
+
+class LeaveFeedbackOnNavigation(BaseMiddleware):
+    """Выбрал тему письма автору, но нажал кнопку меню или команду — передумал: следующий текст снова
+    поиск, а не письмо. Иначе название сериала через пять минут ушло бы автору."""
+
+    async def __call__(self, handler, event: Message, data):
+        if event.from_user and event.text and (event.text.startswith("/") or event.text in MENU_TEXTS):
+            async with session() as s:
+                await feedback.cancel(s, event.from_user.id)
+                await s.commit()
+        return await handler(event, data)
+
+
+dp.message.outer_middleware(LeaveFeedbackOnNavigation())
 
 
 # ----------------------------------------------------------------------------- язык и меню
@@ -233,7 +251,7 @@ async def _suggest_airing(msg: Message, lang: str) -> None:
 @dp.message(F.text.in_(MENU["btn_help"]))
 async def cmd_help(msg: Message) -> None:
     lang = await _lang(msg.from_user.id)
-    await msg.answer(t(lang, "help"), reply_markup=menu(lang))
+    await msg.answer(t(lang, "help"), reply_markup=_kb([[(t(lang, "btn_feedback"), "fb")]]))
 
 
 @dp.message(Command("my"))
@@ -368,6 +386,106 @@ async def cmd_stats(msg: Message) -> None:
         f"Уведомлений: в очереди {pending}, отправлено (7 дн.) {sent}\n"
         f"Последний обход: {last}\n"
         f"Событий в блоке обновлений: {events}")
+
+
+# ----------------------------------------------------------------------------- обратная связь (app/feedback.py)
+
+def _fb_topics(lang: str) -> InlineKeyboardMarkup:
+    return _kb([[(t(lang, "fb_topic_bug"), "fb:bug"), (t(lang, "fb_topic_idea"), "fb:idea")],
+                [(t(lang, "fb_topic_collab"), "fb:collab"), (t(lang, "fb_topic_other"), "fb:other")]])
+
+
+@dp.message(Command("feedback"))
+async def cmd_feedback(msg: Message) -> None:
+    if not guard.cheap_actions.allow(msg.from_user.id):
+        return
+    async with session() as s:
+        lang = await _touch_user(s, msg.from_user)
+        await s.commit()
+    await msg.answer(t(lang, "fb_choose"), reply_markup=_fb_topics(lang))
+
+
+@dp.callback_query(F.data == "fb")
+async def cb_feedback(cb: CallbackQuery) -> None:
+    """Кнопка на экране помощи: сама помощь остаётся, выбор темы — новым сообщением."""
+    lang = await _lang(cb.from_user.id)
+    await cb.answer()
+    if guard.cheap_actions.allow(cb.from_user.id):
+        await cb.message.answer(t(lang, "fb_choose"), reply_markup=_fb_topics(lang))
+
+
+@dp.callback_query(F.data.in_({f"fb:{topic}" for topic in feedback.TOPICS}))
+async def cb_feedback_topic(cb: CallbackQuery) -> None:
+    lang, topic = await _lang(cb.from_user.id), cb.data.split(":")[1]
+    async with session() as s:
+        await feedback.begin(s, cb.from_user.id, topic)
+        await s.commit()
+    await cb.answer()
+    await _edit(cb, f"<b>{t(lang, f'fb_topic_{topic}')}</b>\n\n{t(lang, f'fb_prompt_{topic}')}",
+                _kb([[(t(lang, "fb_cancel"), "fb:cancel")]]))
+
+
+@dp.callback_query(F.data == "fb:cancel")
+async def cb_feedback_cancel(cb: CallbackQuery) -> None:
+    async with session() as s:
+        await feedback.cancel(s, cb.from_user.id)
+        await s.commit()
+    await cb.answer()
+    await _edit(cb, t(await _lang(cb.from_user.id), "fb_cancelled"), _kb([]))
+
+
+async def _feedback_thread(msg: Message) -> dict | bool:
+    """Фильтр: «Ответить» на сообщение обращения — на карточку у автора или на ответ автора у человека."""
+    if not msg.reply_to_message:
+        return False
+    async with session() as s:
+        fb = await feedback.find(s, msg.chat.id, msg.reply_to_message.message_id)
+    return {"fb": fb} if fb else False
+
+
+@dp.message(_feedback_thread)
+async def on_feedback_reply(msg: Message, fb) -> None:
+    if fb.side == "admin":
+        if msg.from_user.id not in cfg.admin_ids:
+            return
+        async with session() as s:
+            note = await feedback.answer(msg.bot, s, fb, msg.chat.id, msg.message_id,
+                                         msg.html_text if msg.text else None)
+            await s.commit()
+        await msg.reply(note)
+        return
+    lang = await _lang(msg.from_user.id)
+    if not guard.feedback_actions.allow(msg.from_user.id):
+        await msg.answer(t(lang, "fb_too_many"), reply_markup=menu(lang))
+        return
+    async with session() as s:
+        ok = await feedback.follow_up(msg.bot, s, fb, msg.from_user, msg.chat.id, msg.message_id)
+        await s.commit()
+    await msg.answer(t(lang, "fb_sent" if ok else "fb_failed"), reply_markup=menu(lang))
+
+
+async def _feedback_pending(msg: Message) -> dict | bool:
+    """Фильтр: человек выбрал тему и ещё не отправил письмо — это сообщение и есть письмо."""
+    async with session() as s:
+        topic = await feedback.pending_topic(s, msg.from_user.id)
+    return {"topic": topic} if topic else False
+
+
+@dp.message(_feedback_pending)
+async def on_feedback_message(msg: Message, topic: str) -> None:
+    lang = await _lang(msg.from_user.id)
+    if not guard.feedback_actions.allow(msg.from_user.id):
+        await msg.answer(t(lang, "fb_too_many"), reply_markup=menu(lang))
+        return
+    fb_id = None
+    try:
+        async with session() as s:
+            fb_id = await feedback.submit(msg.bot, s, msg.from_user, topic, msg.chat.id, msg.message_id)
+            if fb_id:
+                await s.commit()
+    except Exception:
+        log.exception("Обращение от %s не отправилось", msg.from_user.id)
+    await msg.answer(t(lang, "fb_sent" if fb_id else "fb_failed"), reply_markup=menu(lang))
 
 
 # ----------------------------------------------------------------------------- текст: ссылка или поиск
@@ -1529,6 +1647,7 @@ async def main() -> None:
             BotCommand(command="calendar", description=t(lang, "cmd_calendar")),
             BotCommand(command="settings", description=t(lang, "cmd_settings")),
             BotCommand(command="help", description=t(lang, "cmd_help")),
+            BotCommand(command="feedback", description=t(lang, "cmd_feedback")),
         ], language_code=code)
     log.info("Бот запущен")
     try:
