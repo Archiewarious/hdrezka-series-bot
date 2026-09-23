@@ -46,12 +46,52 @@ bot: Bot
 MAX_RESULTS = 5
 SEARCH_TTL = 600
 # Из ссылки берём только путь: хост всегда наш. Иначе бот — открытый прокси через туннель.
-_PATH_RX = re.compile(r"(/[A-Za-z0-9_\-/]*?/(\d+)-[A-Za-z0-9_\-.]*?\.html)")
+_PATH_RX = re.compile(r"(/[A-Za-z0-9_\-/]*?/([0-9]{1,9})-[A-Za-z0-9_\-.]*?\.html)")
 SECTION_KEY = {"series": "sec_series", "animation": "sec_animation", "cartoons": "sec_cartoons", "films": "sec_films"}
 MENU_KEYS = ("btn_find", "btn_my", "btn_new", "btn_cal", "btn_settings", "btn_help")
 # Тексты кнопок меню на всех языках: клавиатура у человека может быть на прежнем языке.
 MENU = {k: {t(lang, k) for lang in LANGS} for k in MENU_KEYS}
 BOT_USERNAME = "HDRezkaSeriesBot"   # уточняется при старте через get_me()
+
+# callback_data присылает клиент, и нестандартный клиент пришлёт что угодно: «pcard:99999999999999»,
+# «vt:1:abc», перевод строки в конце. Каждая кнопка принимается только целиком по своему шаблону;
+# всё остальное уходит в cb_unknown и молча отвечается — без исключений и трейсбеков в логе.
+# ID — только ASCII-цифры и не длиннее 9: больше не влезает в int4 базы.
+ID = r"[0-9]{1,9}"
+_LANG_RX = "|".join(LANGS)
+CB = {
+    "startlang": rf"startlang:(?:{_LANG_RX})",
+    "site": r"site:[0-9a-f]{12}",
+    "sub": rf"(?:sub|wait):{ID}",
+    "subf": rf"subf:{ID}(?::{ID})?",
+    "subf_all": rf"subf_all:{ID}",
+    "sched": rf"sched:[pf]:{ID}",
+    "pcard": rf"pcard:{ID}",
+    "fcard": rf"fcard:{ID}",
+    "voices": rf"voices:{ID}",
+    "vt": rf"vt:{ID}:{ID}",
+    "vany": rf"vany:{ID}",
+    "card": rf"card:{ID}(?::[0-9]{{1,3}})?",
+    "my": r"my:[0-9]{1,3}",
+    "unsub": rf"unsub:{ID}",
+    "unsubq": rf"unsubq:{ID}",
+    "keep": rf"keep:{ID}",
+    "set": r"set:(?:photos|quiet|digest)(?::[01])?|set:tz:-?1|set:(?:quietcfg|voice|lang|back)",
+    "setq": r"setq:(?:off|[ft]:-?1)",
+    "setl": rf"setl:(?:{_LANG_RX})",
+    "setv": rf"setv:(?:any|{ID})",
+    "fb": r"fb",
+    "fb_topic": r"fb:(?:bug|idea|collab|other)",
+    "fb_cancel": r"fb:cancel",
+    "noop": r"noop",
+}
+CB_RX = {k: re.compile(rf"\A(?:{v})\Z") for k, v in CB.items()}
+
+
+def _cb(name: str):
+    """Фильтр: callback_data целиком совпадает с шаблоном CB[name]."""
+    rx = CB_RX[name]
+    return F.data.func(lambda d: d is not None and rx.match(d) is not None)
 
 _cards: dict[int, tuple[FeedItem, float]] = {}
 _search_cache: dict[str, tuple[list[FeedItem], float]] = {}
@@ -83,6 +123,48 @@ class SkipStaleUpdates(BaseMiddleware):
 
 
 dp.update.outer_middleware(SkipStaleUpdates())
+
+
+class FloodGuard(BaseMiddleware):
+    """Общий предел на все апдейты человека (guard.flood): сверх него апдейты молча отбрасываются —
+    без ответа, без запросов в базу и без трейсбеков. Автору не мешаем отвечать на обращения."""
+
+    async def __call__(self, handler, event: Update, data):
+        user = (event.message.from_user if event.message else
+                event.callback_query.from_user if event.callback_query else None)
+        if user and user.id not in cfg.admin_ids and not guard.flood.allow(user.id):
+            if guard.flood_log.allow(user.id):
+                log.warning("Флуд от %s: апдейты сверх предела отбрасываются", user.id)
+            return None
+        return await handler(event, data)
+
+
+dp.update.outer_middleware(FloodGuard())
+
+_bg_tasks: set[asyncio.Task] = set()
+
+
+def _background(coro) -> None:
+    """Фоновая задача со ссылкой на себя: без неё сборщик мусора может снять задачу посреди работы,
+    а её ошибка не попадёт в лог."""
+    task = asyncio.create_task(coro)
+    _bg_tasks.add(task)
+    task.add_done_callback(_background_done)
+
+
+def _background_done(task: asyncio.Task) -> None:
+    _bg_tasks.discard(task)
+    if not task.cancelled() and task.exception() is not None:
+        log.error("Фоновая задача упала", exc_info=task.exception())
+
+
+def _clip(text_: str) -> str:
+    """Сообщение длиннее лимита Telegram не уйдёт вовсе. Режем по границе строки: каждая строка
+    наших сообщений сама закрывает свои теги, поэтому разметка не ломается."""
+    if len(text_) <= guard.TEXT_MAX:
+        return text_
+    cut = text_.rfind("\n", 0, guard.TEXT_MAX - 2)
+    return text_[:cut if cut > 0 else guard.TEXT_MAX - 2] + "\n…"
 
 MENU_TEXTS = set().union(*MENU.values())
 
@@ -184,7 +266,7 @@ async def cmd_start(msg: Message, command: CommandObject) -> None:
         await s.commit()
     arg = (command.args or "").strip()
     # Deep-link «поделиться» (§7.10): p_<hdrezka_id> — карточка страницы, f_<key> — обзор франшизы.
-    if arg[:2] in ("p_", "f_") and arg[2:].isdigit():
+    if re.fullmatch(rf"[pf]_{ID}", arg):
         async with session() as s:
             if arg[0] == "p":
                 page = await svc.page_by_hid(s, int(arg[2:]))
@@ -199,7 +281,7 @@ async def cmd_start(msg: Message, command: CommandObject) -> None:
             await _send_card(msg, msg.from_user.id, target[1])
         else:
             text_, kb = await _render_franchise_overview(msg.from_user.id, target[1], None)
-            await msg.answer(text_, reply_markup=kb, disable_web_page_preview=True)
+            await msg.answer(_clip(text_), reply_markup=kb, disable_web_page_preview=True)
         return
     if is_new:
         # Первый Start: язык — осознанный выбор, а не догадка по клиенту Telegram.
@@ -215,7 +297,7 @@ async def _welcome(msg: Message, lang: str) -> None:
     await _suggest_airing(msg, lang)
 
 
-@dp.callback_query(F.data.startswith("startlang:"))
+@dp.callback_query(_cb("startlang"))
 async def cb_start_lang(cb: CallbackQuery) -> None:
     """Выбор языка на первом экране: подтверждаем в том же сообщении и здороваемся уже на нём."""
     code = cb.data.split(":")[1]
@@ -260,7 +342,7 @@ async def cmd_my(msg: Message) -> None:
     if not guard.cheap_actions.allow(msg.from_user.id):
         return
     text_, kb = await _render_my(msg.from_user.id)
-    await msg.answer(text_, reply_markup=kb, disable_web_page_preview=True)
+    await msg.answer(_clip(text_), reply_markup=kb, disable_web_page_preview=True)
 
 
 @dp.message(F.text.in_(MENU["btn_find"]))
@@ -275,7 +357,7 @@ async def cmd_new(msg: Message) -> None:
     if not guard.cheap_actions.allow(msg.from_user.id):
         return
     text_, kb = await _render_new(msg.from_user.id)
-    await msg.answer(text_, reply_markup=kb, disable_web_page_preview=True)
+    await msg.answer(_clip(text_), reply_markup=kb, disable_web_page_preview=True)
 
 
 @dp.message(Command("settings"))
@@ -333,7 +415,7 @@ async def cmd_calendar(msg: Message) -> None:
     if not has_subs:
         await msg.answer(t(lang, "cal_no_subs"), reply_markup=menu(lang))
         return
-    await msg.answer(calendar_text(lang, rows), reply_markup=menu(lang))
+    await msg.answer(_clip(calendar_text(lang, rows)), reply_markup=menu(lang))
 
 
 def calendar_text(lang: str, rows: list) -> str:
@@ -346,7 +428,7 @@ def calendar_text(lang: str, rows: list) -> str:
     lines = []
     if late:
         lines.append(t(lang, "cal_late_head"))
-        lines += [f"  • {title[:36]} — {season}×{episode} · {t(lang, 'cal_late_line', d=fmt_date(lang, d))}"
+        lines += [f"  • {html.escape(title[:36])} — {season}×{episode} · {t(lang, 'cal_late_line', d=fmt_date(lang, d))}"
                   for title, season, episode, d in late]
         lines.append("")
     if soon:
@@ -356,7 +438,7 @@ def calendar_text(lang: str, rows: list) -> str:
             if d != cur:
                 cur = d
                 lines.append(f"\n<b>{when(lang, d)}</b>")
-            lines.append(f"  • {title[:36]} — {season}×{episode}")
+            lines.append(f"  • {html.escape(title[:36])} — {season}×{episode}")
     return "\n".join(lines) + t(lang, "cal_note")
 
 
@@ -405,7 +487,7 @@ async def cmd_feedback(msg: Message) -> None:
     await msg.answer(t(lang, "fb_choose"), reply_markup=_fb_topics(lang))
 
 
-@dp.callback_query(F.data == "fb")
+@dp.callback_query(_cb("fb"))
 async def cb_feedback(cb: CallbackQuery) -> None:
     """Кнопка на экране помощи: сама помощь остаётся, выбор темы — новым сообщением."""
     lang = await _lang(cb.from_user.id)
@@ -414,7 +496,7 @@ async def cb_feedback(cb: CallbackQuery) -> None:
         await cb.message.answer(t(lang, "fb_choose"), reply_markup=_fb_topics(lang))
 
 
-@dp.callback_query(F.data.in_({f"fb:{topic}" for topic in feedback.TOPICS}))
+@dp.callback_query(_cb("fb_topic"))
 async def cb_feedback_topic(cb: CallbackQuery) -> None:
     lang, topic = await _lang(cb.from_user.id), cb.data.split(":")[1]
     async with session() as s:
@@ -425,7 +507,7 @@ async def cb_feedback_topic(cb: CallbackQuery) -> None:
                 _kb([[(t(lang, "fb_cancel"), "fb:cancel")]]))
 
 
-@dp.callback_query(F.data == "fb:cancel")
+@dp.callback_query(_cb("fb_cancel"))
 async def cb_feedback_cancel(cb: CallbackQuery) -> None:
     async with session() as s:
         await feedback.cancel(s, cb.from_user.id)
@@ -497,7 +579,7 @@ async def on_text(msg: Message) -> None:
     if len(query) < 2:
         await msg.answer(t(lang, "query_short"), reply_markup=menu(lang))
         return
-    link = _PATH_RX.search(msg.text)
+    link = _PATH_RX.search(msg.text[:guard.MAX_LINK_SCAN])
     limiter = guard.site_actions if link else guard.cheap_actions   # локальный поиск сайт не трогает
     if not limiter.allow(msg.from_user.id):
         await msg.answer(t(lang, "too_fast"))
@@ -571,7 +653,7 @@ def _site_token(query: str) -> str:
     return tok
 
 
-@dp.callback_query(F.data.startswith("site:"))
+@dp.callback_query(_cb("site"))
 async def cb_site_search(cb: CallbackQuery) -> None:
     lang = await _lang(cb.from_user.id)
     hit = _site_queries.get(cb.data.split(":", 1)[1])
@@ -660,7 +742,7 @@ async def _handle_link(msg: Message, lang: str, hdrezka_id: int, path: str) -> N
         # Флаг «завершён» знаем наверняка, если он уже стоит или серии выходили недавно.
         recently_active = last_event is not None and (svc.now() - last_event).days < 30
         if not finished and not recently_active:
-            asyncio.create_task(_refine_finished(note, msg.from_user.id, hdrezka_id, page_id, title))
+            _background(_refine_finished(note, msg.from_user.id, hdrezka_id, page_id, title))
         return
 
     url = f"{client.base_url}{path}"
@@ -679,7 +761,7 @@ async def _handle_link(msg: Message, lang: str, hdrezka_id: int, path: str) -> N
         pass
     note = await _send_card(msg, msg.from_user.id, page_id)
     # Флаг «завершён» отдаёт только лента — проверяем в фоне, чтобы не держать человека в ожидании.
-    asyncio.create_task(_refine_finished(note, msg.from_user.id, hdrezka_id, page_id, title))
+    _background(_refine_finished(note, msg.from_user.id, hdrezka_id, page_id, title))
 
 
 async def _refine_finished(note: Message, user_id: int, hdrezka_id: int, page_id: int, title: str) -> None:
@@ -704,6 +786,8 @@ async def _render_page_card(user_id: int, page_id: int, just_created: bool = Fal
     lang = await _lang(user_id)
     async with session() as s:
         page = await s.get(Page, page_id)
+        if page is None:
+            return t(lang, "card_stale"), _kb([])
         sub = await s.scalar(select(Subscription).where(Subscription.user_id == user_id,
                                                         Subscription.page_id == page_id))
         nxt = await s.scalar(select(func.min(Schedule.air_date)).where(
@@ -729,7 +813,7 @@ async def _render_page_card(user_id: int, page_id: int, just_created: bool = Fal
         head = t(lang, "head_subscribed_new" if just_created else "head_in_subs")
     else:
         head = t(lang, "head_in_subs" if state == "franchise_sub" else "head_found")
-    lines = [f"{head} <b>{page.title}</b>" + (f" · {kind}" if kind else "")]
+    lines = [f"{head} <b>{html.escape(page.title)}</b>" + (f" · {kind}" if kind else "")]
     if page.content_type != "film" and page.last_season:
         if page.is_finished:
             lines.append(t(lang, "last_episode_finished", s=page.last_season, e=page.last_episode))
@@ -742,12 +826,12 @@ async def _render_page_card(user_id: int, page_id: int, just_created: bool = Fal
         lines.append(t(lang, "wait_desc"))
         rows.append([(t(lang, "btn_stop_waiting"), f"unsub:{sub.id}")])
     elif state == "subscribed":
-        lines.append(t(lang, "voice_line", v=_voice_label(lang, sub, voices)) + warn)
+        lines.append(t(lang, "voice_line", v=html.escape(_voice_label(lang, sub, voices))) + warn)
         rows.append([(t(lang, "btn_choose_voice"), f"voices:{sub.id}")])
         rows.append([(t(lang, "btn_unsubscribe"), f"unsub:{sub.id}")])
     elif state == "franchise_sub":
         # Раньше здесь не было ни одной кнопки: человек не понимал, подписан он или нет (07.09.2026).
-        lines.append(t(lang, "in_franchise_sub", name=fr.name))
+        lines.append(t(lang, "in_franchise_sub", name=html.escape(fr.name)))
         rows.append([(t(lang, "btn_open_franchise", name=fr.name[:24]), f"fcard:{fr.id}")])
         rows.append([(t(lang, "btn_unfollow_fr"), f"unsubq:{fr_sub}")])
     elif state == "film":
@@ -784,7 +868,7 @@ async def _send_card(target: Message, user_id: int, page_id: int, just_created: 
         if row and row[0]:
             sent = await posters.send_photo_cached(target.bot, s, target.chat.id, page_id, row[0], row[1], text_, kb)
         await s.commit()
-    return sent or await target.answer(text_, reply_markup=kb, disable_web_page_preview=True)
+    return sent or await target.answer(_clip(text_), reply_markup=kb, disable_web_page_preview=True)
 
 
 def _voice_label(lang: str, sub: Subscription | None, voices: list[Voice]) -> str:
@@ -800,7 +884,7 @@ async def _too_many_subs(user_id: int) -> bool:
     return n >= guard.MAX_SUBSCRIPTIONS
 
 
-@dp.callback_query(F.data.regexp(r"^(sub|wait):"))
+@dp.callback_query(_cb("sub"))
 async def cb_subscribe(cb: CallbackQuery) -> None:
     """sub: — подписка на выходящий сезон; wait: — на завершённый, со смыслом «жду продолжения»."""
     lang = await _lang(cb.from_user.id)
@@ -893,15 +977,17 @@ async def _render_franchise_overview(user_id: int, fid: int, origin_page_id: int
             Subscription.user_id == user_id, Subscription.page_id.isnot(None)))).scalars())
     ongoing = [p for p in parts if _part_status(lang, p)[1]]
     rest = [p for p in parts if not _part_status(lang, p)[1]]
-    lines = [t(lang, "fr_head", name=fr.name, parts=t(lang, "parts_n", n=len(parts)))]
+    lines = [t(lang, "fr_head", name=html.escape(fr.name), parts=t(lang, "parts_n", n=len(parts)))]
     if sub:
         lines.append(t(lang, "fr_subscribed"))
     if ongoing:
         lines.append(t(lang, "fr_airing"))
-        lines += [f"  • {p.title[:40]} · {_part_status(lang, p)[0]}" + (" ✓" if p.id in my_pages else "") for p in ongoing]
+        lines += [f"  • {html.escape(p.title[:40])} · {_part_status(lang, p)[0]}" + (" ✓" if p.id in my_pages else "")
+                  for p in ongoing[:15]]
     if rest:
         lines.append(t(lang, "fr_rest"))
-        lines += [f"  • {p.title[:40]} · {p.year or ''} · {_part_status(lang, p)[0]}" for p in rest[:12]]
+        lines += [f"  • {html.escape(p.title[:40])} · {html.escape(p.year or '')} · {_part_status(lang, p)[0]}"
+                  for p in rest[:12]]
         if len(rest) > 12:
             lines.append(t(lang, "fr_more", n=len(rest) - 12))
     lines.append(t(lang, "fr_explain"))
@@ -945,7 +1031,7 @@ async def _prefetch_parts(m: Message, user_id: int, fid: int, origin: int | None
         await _edit_message(m, text_, kb)
 
 
-@dp.callback_query(F.data.startswith("subf:"))
+@dp.callback_query(_cb("subf"))
 async def cb_franchise_overview(cb: CallbackQuery) -> None:
     """«Вся франшиза» сначала показывает состав, подписка — отдельным нажатием."""
     if not guard.cheap_actions.allow(cb.from_user.id):
@@ -957,10 +1043,10 @@ async def cb_franchise_overview(cb: CallbackQuery) -> None:
     text_, kb = await _render_franchise_overview(cb.from_user.id, fid, origin)
     await cb.answer()
     await _edit(cb, text_, kb)
-    asyncio.create_task(_prefetch_parts(cb.message, cb.from_user.id, fid, origin))
+    _background(_prefetch_parts(cb.message, cb.from_user.id, fid, origin))
 
 
-@dp.callback_query(F.data.startswith("subf_all:"))
+@dp.callback_query(_cb("subf_all"))
 async def cb_subscribe_franchise(cb: CallbackQuery) -> None:
     lang = await _lang(cb.from_user.id)
     if not guard.cheap_actions.allow(cb.from_user.id):
@@ -986,6 +1072,8 @@ async def _render_franchise_card(user_id: int, fid: int, created: bool = True):
     lang = await _lang(user_id)
     async with session() as s:
         fr = await s.get(Franchise, fid)
+        if fr is None:
+            return t(lang, "fr_not_found"), _kb([])
         sub = await s.scalar(select(Subscription).where(Subscription.user_id == user_id,
                                                         Subscription.franchise_id == fid))
         parts = (await s.execute(select(Page).where(Page.franchise_id == fid)
@@ -994,16 +1082,16 @@ async def _render_franchise_card(user_id: int, fid: int, created: bool = True):
                                   .where(Page.franchise_id == fid))).scalars().all()
     ongoing = [p for p in parts if not p.is_finished and p.last_episode and p.content_type != "film"]
     head = t(lang, "fc_head_new" if (sub and created) else ("fc_head_in_subs" if sub else "fc_head"))
-    lines = [f"{head} <b>{fr.name}</b> ({t(lang, 'parts_n', n=len(parts))})"]
+    lines = [f"{head} <b>{html.escape(fr.name)}</b> ({t(lang, 'parts_n', n=len(parts))})"]
     if ongoing:
         lines.append(t(lang, "fc_airing"))
-        lines += [f"  • {p.title[:44]} — {p.last_season}×{p.last_episode}" for p in ongoing[:5]]
+        lines += [f"  • {html.escape(p.title[:44])} — {p.last_season}×{p.last_episode}" for p in ongoing[:5]]
     lines.append(t(lang, "fc_desc"))
     uniq = list({v.translator_id: v for v in voices}.values())
     warn = await _voice_warning(lang, sub)
     rows = []
     if sub:
-        lines.append(t(lang, "voice_line", v=_voice_label(lang, sub, uniq)) + warn)
+        lines.append(t(lang, "voice_line", v=html.escape(_voice_label(lang, sub, uniq))) + warn)
         rows.append([(t(lang, "btn_choose_voice"), f"voices:{sub.id}")])
         rows.append([(t(lang, "btn_unsubscribe"), f"unsub:{sub.id}")])
     else:
@@ -1033,7 +1121,7 @@ def _fmt_sched(lang: str, rows, with_title: bool) -> list[str]:
     out = []
     for _pid, title, season, episode, d, aired in rows:
         mark = "✓" if aired or d < date.today() else "•"
-        who = f"<b>{title[:30]}</b> " if with_title else ""
+        who = f"<b>{html.escape(title[:30])}</b> " if with_title else ""
         out.append(f"{mark} {who}{season}×{episode} — {when(lang, d)}")
     return out
 
@@ -1043,12 +1131,12 @@ async def _render_schedule(user_id: int, kind: str, obj_id: int):
     async with session() as s:
         if kind == "p":
             page = await s.get(Page, obj_id)
-            head = f"📅 <b>{page.title}</b>" if page else "📅"
+            head = f"📅 <b>{html.escape(page.title)}</b>" if page else "📅"
             rows = (await s.execute(text(SCHED_TEMPLATE.format(where="p.id = :id")), {"id": obj_id})).all()
             back = (t(lang, "btn_to_series"), f"pcard:{obj_id}")
         else:
             fr = await s.get(Franchise, obj_id)
-            head = t(lang, "sched_fr_head", name=fr.name) if fr else "📅"
+            head = t(lang, "sched_fr_head", name=html.escape(fr.name)) if fr else "📅"
             rows = (await s.execute(text(SCHED_TEMPLATE.format(where="p.franchise_id = :id")), {"id": obj_id})).all()
             back = (t(lang, "btn_to_franchise"), f"fcard:{obj_id}")
     lines = _fmt_sched(lang, rows, with_title=(kind == "f"))
@@ -1056,7 +1144,7 @@ async def _render_schedule(user_id: int, kind: str, obj_id: int):
     return f"{head}\n\n{body}{t(lang, 'cal_note')}", _kb([[back]])
 
 
-@dp.callback_query(F.data.startswith("sched:"))
+@dp.callback_query(_cb("sched"))
 async def cb_schedule(cb: CallbackQuery) -> None:
     if not guard.cheap_actions.allow(cb.from_user.id):
         await cb.answer(t(await _lang(cb.from_user.id), "too_fast"))
@@ -1067,14 +1155,14 @@ async def cb_schedule(cb: CallbackQuery) -> None:
     await _edit(cb, text_, kb)
 
 
-@dp.callback_query(F.data.startswith("pcard:"))
+@dp.callback_query(_cb("pcard"))
 async def cb_page_card(cb: CallbackQuery) -> None:
     text_, kb = await _render_page_card(cb.from_user.id, int(cb.data.split(":")[1]))
     await cb.answer()
     await _edit(cb, text_, kb)
 
 
-@dp.callback_query(F.data.startswith("fcard:"))
+@dp.callback_query(_cb("fcard"))
 async def cb_franchise_card(cb: CallbackQuery) -> None:
     text_, kb = await _render_franchise_card(cb.from_user.id, int(cb.data.split(":")[1]), created=False)
     await cb.answer()
@@ -1146,7 +1234,7 @@ async def _render_voices(user_id: int, sub_id: int):
     return hint, _kb(rows)
 
 
-@dp.callback_query(F.data.startswith("voices:"))
+@dp.callback_query(_cb("voices"))
 async def cb_voices(cb: CallbackQuery) -> None:
     if not guard.cheap_actions.allow(cb.from_user.id):
         await cb.answer(t(await _lang(cb.from_user.id), "too_fast"))
@@ -1156,7 +1244,7 @@ async def cb_voices(cb: CallbackQuery) -> None:
     await _edit(cb, text_, kb)
 
 
-@dp.callback_query(F.data.startswith("vt:"))
+@dp.callback_query(_cb("vt"))
 async def cb_voice_toggle(cb: CallbackQuery) -> None:
     if not guard.cheap_actions.allow(cb.from_user.id):
         await cb.answer(t(await _lang(cb.from_user.id), "too_fast"))
@@ -1164,15 +1252,28 @@ async def cb_voice_toggle(cb: CallbackQuery) -> None:
     _, sub_id, tid = cb.data.split(":")
     if sub := await _own_sub(cb.from_user.id, int(sub_id)):
         async with session() as s:
-            cur = set(sub.voice_filter or []) ^ {int(tid)}
-            await svc.set_voice_filter(s, cb.from_user.id, sub.id, sorted(cur) or None)
+            known = {v.translator_id for v in await _voices_for_sub(s, sub)}
+            cur = toggle_voice(sub.voice_filter, int(tid), known)
+            await svc.set_voice_filter(s, cb.from_user.id, sub.id, cur)
             await s.commit()
     text_, kb = await _render_voices(cb.from_user.id, int(sub_id))
     await cb.answer()
     await _edit(cb, text_, kb)
 
 
-@dp.callback_query(F.data.startswith("vany:"))
+def toggle_voice(current: list[int] | None, tid: int, known: set[int]) -> list[int] | None:
+    """Выбор озвучки кнопкой. Добавить можно только озвучку, которая есть у тайтла, и не больше
+    guard.MAX_VOICES; снять — любую выбранную. callback_data приходит от клиента: без проверки в фильтр
+    попадёт любое число, и массив в базе растёт без предела."""
+    chosen = set(current or [])
+    if tid in chosen:
+        chosen.discard(tid)
+    elif tid in known and len(chosen) < guard.MAX_VOICES:
+        chosen.add(tid)
+    return sorted(chosen) or None
+
+
+@dp.callback_query(_cb("vany"))
 async def cb_voice_any(cb: CallbackQuery) -> None:
     sub_id = int(cb.data.split(":")[1])
     async with session() as s:
@@ -1183,7 +1284,7 @@ async def cb_voice_any(cb: CallbackQuery) -> None:
     await _edit(cb, text_, kb)
 
 
-@dp.callback_query(F.data.startswith("card:"))
+@dp.callback_query(_cb("card"))
 async def cb_card(cb: CallbackQuery) -> None:
     """Карточка подписки: из «Мои подписки» (card:<id>:<страница>) или после выбора озвучки (card:<id>).
     Внизу — возврат к списку на ту же страницу."""
@@ -1273,7 +1374,7 @@ async def _render_my(user_id: int, page: int = 0):
     return "\n".join(lines), _kb(rows)
 
 
-@dp.callback_query(F.data.startswith("my:"))
+@dp.callback_query(_cb("my"))
 async def cb_my_page(cb: CallbackQuery) -> None:
     if not guard.cheap_actions.allow(cb.from_user.id):
         await cb.answer(t(await _lang(cb.from_user.id), "too_fast"))
@@ -1283,7 +1384,7 @@ async def cb_my_page(cb: CallbackQuery) -> None:
     await _edit(cb, text_, kb)
 
 
-@dp.callback_query(F.data.startswith("unsub:"))
+@dp.callback_query(_cb("unsub"))
 async def cb_unsubscribe(cb: CallbackQuery) -> None:
     lang = await _lang(cb.from_user.id)
     if not guard.cheap_actions.allow(cb.from_user.id):
@@ -1297,7 +1398,7 @@ async def cb_unsubscribe(cb: CallbackQuery) -> None:
     await _edit(cb, text_, kb)
 
 
-@dp.callback_query(F.data.startswith("unsubq:"))
+@dp.callback_query(_cb("unsubq"))
 async def cb_unsubscribe_ask(cb: CallbackQuery) -> None:
     """«🔕 Не следить» в уведомлении: сначала подтверждение — заменяем последний ряд кнопок."""
     lang = await _lang(cb.from_user.id)
@@ -1310,7 +1411,7 @@ async def cb_unsubscribe_ask(cb: CallbackQuery) -> None:
     await cb.answer()
 
 
-@dp.callback_query(F.data.startswith("keep:"))
+@dp.callback_query(_cb("keep"))
 async def cb_keep(cb: CallbackQuery) -> None:
     lang = await _lang(cb.from_user.id)
     if not guard.cheap_actions.allow(cb.from_user.id):
@@ -1406,7 +1507,8 @@ async def _render_settings(user_id: int):
     quiet_on = u.quiet_from is not None and u.quiet_to is not None
     quiet = f"{u.quiet_from:02d}:00–{u.quiet_to:02d}:00" if quiet_on else t(lang, "off")
     delivery = t(lang, "delivery_digest", h=u.digest_hour) if u.digest_hour is not None else t(lang, "delivery_now")
-    voice = ", ".join(names.get(t_, f"#{t_}") for t_ in u.default_voice_filter) if u.default_voice_filter else t(lang, "voice_any")
+    voice = html.escape(", ".join(names.get(t_, f"#{t_}") for t_ in u.default_voice_filter)) \
+        if u.default_voice_filter else t(lang, "voice_any")
     text_ = (t(lang, "set_head") + "\n\n"
              + t(lang, "set_photos", v=t(lang, "on" if u.photos else "off")) + "\n"
              + t(lang, "set_quiet", v=quiet) + (t(lang, "set_quiet_note") if quiet_on else "") + "\n"
@@ -1467,7 +1569,7 @@ async def _render_lang(user_id: int):
     return t(lang, "lang_head"), _kb(rows)
 
 
-@dp.callback_query(F.data.startswith("set:"))
+@dp.callback_query(_cb("set"))
 async def cb_settings(cb: CallbackQuery) -> None:
     if not guard.cheap_actions.allow(cb.from_user.id):
         await cb.answer(t(await _lang(cb.from_user.id), "too_fast"))
@@ -1504,7 +1606,7 @@ async def cb_settings(cb: CallbackQuery) -> None:
     await _edit(cb, text_, kb)
 
 
-@dp.callback_query(F.data.startswith("setq:"))
+@dp.callback_query(_cb("setq"))
 async def cb_quiet(cb: CallbackQuery) -> None:
     if not guard.cheap_actions.allow(cb.from_user.id):
         await cb.answer(t(await _lang(cb.from_user.id), "too_fast"))
@@ -1534,7 +1636,7 @@ async def cb_quiet(cb: CallbackQuery) -> None:
     await _edit(cb, text_, kb)
 
 
-@dp.callback_query(F.data.startswith("setl:"))
+@dp.callback_query(_cb("setl"))
 async def cb_lang(cb: CallbackQuery) -> None:
     if not guard.cheap_actions.allow(cb.from_user.id):
         await cb.answer(t(await _lang(cb.from_user.id), "too_fast"))
@@ -1557,7 +1659,7 @@ async def cb_lang(cb: CallbackQuery) -> None:
         await cb.message.answer(t(code, "lang_switched"), reply_markup=menu(code))
 
 
-@dp.callback_query(F.data.startswith("setv:"))
+@dp.callback_query(_cb("setv"))
 async def cb_default_voice(cb: CallbackQuery) -> None:
     if not guard.cheap_actions.allow(cb.from_user.id):
         await cb.answer(t(await _lang(cb.from_user.id), "too_fast"))
@@ -1569,14 +1671,17 @@ async def cb_default_voice(cb: CallbackQuery) -> None:
         if val == "any":
             u.default_voice_filter = None
         else:
-            u.default_voice_filter = sorted(set(u.default_voice_filter or []) ^ {int(val)}) or None
+            tid = int(val)
+            known = {tid} if await s.scalar(text("SELECT 1 FROM voices WHERE translator_id = :t LIMIT 1"),
+                                             {"t": tid}) else set()
+            u.default_voice_filter = toggle_voice(u.default_voice_filter, tid, known)
         await s.commit()
     text_, kb = await _render_default_voice(cb.from_user.id)
     await cb.answer()
     await _edit(cb, text_, kb)
 
 
-@dp.callback_query(F.data == "noop")
+@dp.callback_query(_cb("noop"))
 async def cb_noop(cb: CallbackQuery) -> None:
     await cb.answer()
 
@@ -1593,6 +1698,7 @@ async def _edit(cb: CallbackQuery, text_: str, kb: InlineKeyboardMarkup) -> None
 async def _edit_message(m: Message, text_: str, kb: InlineKeyboardMarkup) -> None:
     """Нажатие всегда меняет сообщение (§7.11). Карточка с постером — это фото: правим подпись;
     длинный текст в подпись не влезает — тогда новым сообщением."""
+    text_ = _clip(text_)
     try:
         if m.photo:
             if len(text_) > posters.CAPTION_MAX_LEN:

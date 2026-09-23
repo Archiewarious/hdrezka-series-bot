@@ -327,16 +327,12 @@ class Poller:
 
     async def run(self) -> None:
         await init_db()
-        # Один поллер на базу: второй экземпляр (например, при обновлении) ждёт, а не дублирует.
-        lock_conn = await engine.connect()
-        while not await lock_conn.scalar(text("SELECT pg_try_advisory_lock(:k)"), {"k": ADVISORY_LOCK_KEY}):
-            log.warning("Другой поллер держит лок — жду 30 с")
-            await asyncio.sleep(30)
-
+        lock_conn = await acquire_lock()
         log.info("Поллер запущен: интервал=%sс", cfg.poll_interval)
         failures = 0
         try:
             while True:
+                await check_lock(lock_conn)          # вне try ниже: потеря лока завершает процесс
                 try:
                     await self.cycle()
                     failures = 0
@@ -353,6 +349,26 @@ class Poller:
         finally:
             await self.client.close()
             await lock_conn.close()
+
+
+async def acquire_lock():
+    """Один поллер на базу: второй экземпляр (например, при обновлении) ждёт, а не дублирует.
+    Соединение с локом — в autocommit: иначе оно висит «idle in transaction» вечно, и Postgres обрывает
+    его по idle_in_transaction_session_timeout (app/db.py) — лок молча пропадает (23.09.2026)."""
+    conn = await (await engine.connect()).execution_options(isolation_level="AUTOCOMMIT")
+    while not await conn.scalar(text("SELECT pg_try_advisory_lock(:k)"), {"k": ADVISORY_LOCK_KEY}):
+        log.warning("Другой поллер держит лок — жду 30 с")
+        await asyncio.sleep(30)
+    return conn
+
+
+async def check_lock(conn) -> None:
+    """Лок всё ещё наш. Соединение оборвалось (перезапуск базы, таймаут) — исключение: процесс выходит,
+    Docker его перезапускает, и лок берётся заново. Иначе второй поллер мог бы работать параллельно."""
+    held = await conn.scalar(text("SELECT count(*) FROM pg_locks WHERE locktype = 'advisory' AND granted"
+                                  " AND pid = pg_backend_pid()"))
+    if not held:
+        raise RuntimeError("Лок поллера потерян")
 
 
 def main() -> None:

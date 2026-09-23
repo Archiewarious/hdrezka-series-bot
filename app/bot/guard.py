@@ -9,7 +9,11 @@ from collections import defaultdict, deque
 
 MAX_QUERY_LEN = 100
 MAX_SUBSCRIPTIONS = 100
+MAX_VOICES = 30              # озвучек в одном фильтре: больше не бывает у самых популярных тайтлов
+MAX_LINK_SCAN = 512          # ссылку ищем в начале сообщения: ссылка HDREZKA короче, а регулярка на 4096
+                             # символах из одних «/» занимала 220 мс — всё это время бот стоит для всех
 SITE_TIMEOUT = 25            # сек ожидания ответа сайта, дальше — «попробуйте позже»
+TEXT_MAX = 4000              # лимит Telegram 4096 считается после разбора разметки и в UTF-16: запас
 
 _CONTROL_RX = re.compile(r"[\x00-\x08\x0b-\x1f\x7f​-‏ -‮]")
 _SPACES_RX = re.compile(r"\s+")
@@ -46,3 +50,7 @@ class UserLimiter:
 site_actions = UserLimiter(per_minute=6, per_hour=60)     # поиск, ссылка — каждый = запрос к сайту
 cheap_actions = UserLimiter(per_minute=30, per_hour=600)  # кнопки, /my — только база
 feedback_actions = UserLimiter(per_minute=3, per_hour=15)  # письма автору — чтобы не завалили
+# Общий предел на все апдейты человека — поверх пределов отдельных действий: нестандартный клиент или
+# скрипт не должен загрузить бота, базу и общий лимит Telegram на исходящие (~30 сообщений/с на бота).
+flood = UserLimiter(per_minute=40, per_hour=1000)
+flood_log = UserLimiter(per_minute=1, per_hour=10)          # строка в лог о флуде — не чаще раза в минуту

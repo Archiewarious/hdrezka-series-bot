@@ -20,6 +20,16 @@ class Base(DeclarativeBase):
 
 class User(Base):
     __tablename__ = "users"
+    # Границы значений — в самой базе (миграция d0e1f2a3b4c5): последний рубеж за проверками бота.
+    __table_args__ = (
+        CheckConstraint("tz_offset BETWEEN -12 AND 14", name="ck_users_tz"),
+        CheckConstraint("(quiet_from IS NULL OR quiet_from BETWEEN 0 AND 23)"
+                        " AND (quiet_to IS NULL OR quiet_to BETWEEN 0 AND 23)", name="ck_users_quiet"),
+        CheckConstraint("digest_hour IS NULL OR digest_hour BETWEEN 0 AND 23", name="ck_users_digest"),
+        CheckConstraint("lang IN ('ru', 'uk', 'en')", name="ck_users_lang"),
+        CheckConstraint("default_voice_filter IS NULL OR cardinality(default_voice_filter) <= 30",
+                        name="ck_users_voices"),
+    )
 
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True)  # telegram user id
     username: Mapped[str | None] = mapped_column(String(64))
@@ -132,6 +142,7 @@ class Subscription(Base):
             "(scope = 'franchise' AND franchise_id IS NOT NULL AND page_id IS NULL)",
             name="ck_subscription_scope",
         ),
+        CheckConstraint("voice_filter IS NULL OR cardinality(voice_filter) <= 30", name="ck_subscription_voices"),
         Index("subs_user_page", "user_id", "page_id", unique=True,
               postgresql_where=text("page_id IS NOT NULL")),
         Index("subs_user_franchise", "user_id", "franchise_id", unique=True,
