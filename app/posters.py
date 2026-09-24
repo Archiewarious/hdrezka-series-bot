@@ -8,6 +8,7 @@ import asyncio
 import io
 import ipaddress
 import logging
+import re
 from urllib.parse import urlsplit
 
 import aiohttp
@@ -28,6 +29,9 @@ POSTER_TIMEOUT = 10
 POSTER_MAX_BYTES = 10 * 1024 * 1024  # лимит Telegram на загрузку фото
 POSTER_MAX_PIXELS = 40_000_000       # постеры HDREZKA до ~6 Мп; больше — «бомба», распаковка съест память
 Image.MAX_IMAGE_PIXELS = POSTER_MAX_PIXELS
+POSTER_FORMATS = ["JPEG", "PNG", "WEBP"]   # Pillow открывает только их: у редких форматов свои уязвимости разбора
+# Ошибки самого file_id: только они сбрасывают кэш. Прочие (чат, подпись, кнопки) к картинке не относятся.
+_FILE_ID_ERROR_RX = re.compile(r"(?i)file[ _]?(id|identifier|reference)|wrong remote file|wrong type of the web page")
 
 
 class PosterRejected(Exception):
@@ -47,7 +51,9 @@ def safe_url(url: str | None) -> bool:
         ipaddress.ip_address(u.hostname)
         return False
     except ValueError:
-        return True
+        pass
+    # Только разрешённые хосты CDN (POSTER_HOSTS, 24.09.2026): поддомены тоже.
+    return any(u.hostname == h or u.hostname.endswith("." + h) for h in cfg.poster_hosts)
 
 
 async def download(url: str) -> bytes | None:
@@ -82,7 +88,7 @@ def _to_standard(data: bytes) -> bytes:
     выглядела лесенкой (12.09.2026). Картинка вписывается целиком — не обрезаем, у постеров текст по краям, —
     а поля закрывает размытая затемнённая копия её же: так это читается как фон, а не как пустые полосы."""
     try:
-        src = Image.open(io.BytesIO(data))
+        src = Image.open(io.BytesIO(data), formats=POSTER_FORMATS)
     except Image.DecompressionBombError as exc:          # больше 2×POSTER_MAX_PIXELS — Pillow сам
         raise PosterRejected(str(exc)) from exc
     with src:
@@ -126,6 +132,8 @@ async def send_photo_cached(bot: Bot, s, chat_id: int, page_id: int, poster_url:
         try:
             return await bot.send_photo(chat_id, poster_file_id, caption=caption, reply_markup=kb)
         except TelegramBadRequest as exc:
+            if not _FILE_ID_ERROR_RX.search(exc.message or ""):
+                raise                       # ошибка не про картинку: кэш верный, отказ разберёт вызывающий
             log.warning("Постер страницы %s: file_id не принят (%s) — загружу заново", page_id, exc.message)
             await s.execute(text("UPDATE pages SET poster_file_id = NULL WHERE id = :p"), {"p": page_id})
     if not poster_url:

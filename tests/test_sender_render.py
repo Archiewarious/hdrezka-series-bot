@@ -1,5 +1,6 @@
 """Уведомление — пост (решение 11.09.2026): название, сезон и серия, озвучка, одна кнопка на сайт."""
-from app.sender import BUTTON_MAX_LEN, TG_MAX_LEN, Rendered, _digest, _single_keyboard, fit_button, retry_delay, watch_url
+from app.sender import (BUTTON_MAX_LEN, TG_MAX_LEN, Rendered, _digest, _single_keyboard, digest_parts, fit_button,
+                        retry_delay, watch_url)
 
 
 def _r(kind, title, page_id=1, line=None, url="https://x/a.html#t:1-s:1-e:1"):
@@ -37,10 +38,21 @@ def test_digest_one_button_per_series():
 
 
 def test_digest_never_cuts_html():
+    """24.09.2026: раньше дайджест обрезался на 4000 символах («…»), а все события помечались отправленными.
+    Теперь он делится на сообщения по границе событий: каждое влезает, теги целы, ни одно событие не теряется."""
     items = [_r("episode", f"Сериал {i}", page_id=i, line="🎬 <b>" + "x" * 300 + "</b>") for i in range(30)]
-    body, kb = _digest(items)
-    assert len(body) <= TG_MAX_LEN and body.count("<b>") == body.count("</b>") and body.endswith("…")
-    assert len(kb.inline_keyboard) == 10
+    parts = digest_parts([(n, r) for n, r in enumerate(items)])
+    assert sum(len(p) for p in parts) == 30 and len(parts) > 1
+    for part in parts:
+        body, kb = _digest([r for _, r in part])
+        assert len(body) <= TG_MAX_LEN and body.count("<b>") == body.count("</b>") and not body.endswith("…")
+        assert len(kb.inline_keyboard) <= 10
+
+
+def test_digest_splits_by_series_count():
+    """Кнопок — не больше 10 на сообщение: одиннадцатый сериал уходит следующим сообщением."""
+    items = [(i, _r("episode", f"Сериал {i}", page_id=i)) for i in range(11)]
+    assert [len(p) for p in digest_parts(items)] == [10, 1]
 
 
 def test_retry_delay_grows_and_never_gives_up():

@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import asyncio
+import functools
 import hashlib
 import html
 import logging
@@ -81,11 +82,23 @@ CB = {
     "setl": rf"setl:(?:{_LANG_RX})",
     "setv": rf"setv:(?:any|{ID})",
     "fb": r"fb",
-    "fb_topic": r"fb:(?:bug|idea|collab|other)",
+    "fb_topic": rf"fb:(?:{'|'.join(feedback.TOPICS)})",
     "fb_cancel": r"fb:cancel",
     "noop": r"noop",
 }
 CB_RX = {k: re.compile(rf"\A(?:{v})\Z") for k, v in CB.items()}
+
+
+def limited(handler):
+    """Предел дешёвых действий (guard.cheap_actions) для кнопки: сверх — тост «слишком часто», обработчик не
+    вызывается. Раньше одни и те же три строки стояли в 14 обработчиках (24.09.2026)."""
+    @functools.wraps(handler)
+    async def wrapper(cb: CallbackQuery, *args, **kwargs):
+        if not guard.cheap_actions.allow(cb.from_user.id):
+            await cb.answer(t(await _lang(cb.from_user.id), "too_fast"))
+            return None
+        return await handler(cb, *args, **kwargs)
+    return wrapper
 
 
 def _cb(name: str):
@@ -186,6 +199,14 @@ dp.message.outer_middleware(LeaveFeedbackOnNavigation())
 
 # ----------------------------------------------------------------------------- язык и меню
 
+async def _today(user_id: int) -> date:
+    """Сегодняшняя дата у человека — по его поясу, а не по дате сервера (UTC): «сегодня» и «завтра» в календаре
+    и расписании сдвигались на день для всех, у кого полночь наступает раньше или позже (24.09.2026)."""
+    async with session() as s:
+        tz = await s.scalar(select(User.tz_offset).where(User.id == user_id))
+    return (datetime.now(timezone.utc) + timedelta(hours=3 if tz is None else tz)).date()
+
+
 async def _lang(user_id: int) -> str:
     """Язык интерфейса из users.lang; кэш на процесс (одна реплика бота, фаза B — Redis)."""
     lang = _langs.get(user_id)
@@ -226,17 +247,26 @@ def _section_label(lang: str, section: str | None, default: str = "") -> str:
     return t(lang, key) if key else default
 
 
+class Url(str):
+    """Адрес кнопки-ссылки. Раньше _kb решал по префиксу https://: адрес без схемы (путь из базы) молча становился
+    callback_data, а пустой — кнопкой-пустышкой (24.09.2026). Теперь ссылка помечена явно."""
+
+
 def _kb(rows: list[list[tuple[str, str]]]) -> InlineKeyboardMarkup:
-    """(текст, callback_data) или (текст, https-ссылка)."""
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text=t_, url=d) if d.startswith("https://") else InlineKeyboardButton(text=t_, callback_data=d)
-         for t_, d in row] for row in rows])
+    """(текст, callback_data) или (текст, Url(адрес)). Ссылка без адреса не показывается; пустые ряды — тоже."""
+    out = []
+    for row in rows:
+        buttons = [InlineKeyboardButton(text=t_, url=str(d)) if isinstance(d, Url) else InlineKeyboardButton(text=t_, callback_data=d)
+                   for t_, d in row if not (isinstance(d, Url) and not d)]
+        if buttons:
+            out.append(buttons)
+    return InlineKeyboardMarkup(inline_keyboard=out)
 
 
 def _share_url(lang: str, start_arg: str, title: str) -> str:
     """§7.10: кнопка открывает диалог «поделиться» с deep-link на карточку — друг подписывается в одно нажатие."""
     link = f"https://t.me/{BOT_USERNAME}?start={start_arg}"
-    return "https://t.me/share/url?" + urlencode({"url": link, "text": t(lang, "share_text", title=title[:60])})
+    return Url("https://t.me/share/url?" + urlencode({"url": link, "text": t(lang, "share_text", title=title[:60])}))
 
 
 CAL_DAYS = 14
@@ -398,7 +428,8 @@ CALENDAR_SQL = text("""
        -- CAST обязателен: asyncpg шлёт параметр без типа, а «date + unknown» неоднозначен
        -- Прошедшие даты тоже берём: эфир был, а на HDREZKA серии ещё нет — иначе она просто исчезала
        -- из календаря, и человек не понимал, вышла она или потерялась (11.09.2026, «неудачник» 1×12).
-       AND sc.air_date >= current_date - CAST(:back AS int) AND sc.air_date < current_date + CAST(:days AS int)
+       AND sc.air_date >= CAST(:today AS date) - CAST(:back AS int)
+       AND sc.air_date < CAST(:today AS date) + CAST(:days AS int)
        AND coalesce(p.content_type, 'series') = 'series'
        -- Уже вышла в озвучке подписки — не «ожидается». Расписание сайта отстаёт от загрузок: 11.09.2026
        -- календарь показывал «сегодня» серии, вышедшие и разосланные двумя днями раньше.
@@ -419,20 +450,22 @@ async def cmd_calendar(msg: Message) -> None:
         return
     lang = await _lang(msg.from_user.id)
     async with session() as s:
-        rows = (await s.execute(CALENDAR_SQL,
-                                {"uid": msg.from_user.id, "days": CAL_DAYS, "back": CAL_LATE_DAYS})).all()
+        today = await _today(msg.from_user.id)
+        rows = (await s.execute(CALENDAR_SQL, {"uid": msg.from_user.id, "days": CAL_DAYS, "back": CAL_LATE_DAYS,
+                                               "today": today})).all()
         has_subs = await s.scalar(select(func.count()).select_from(Subscription).where(Subscription.user_id == msg.from_user.id))
     if not has_subs:
         await msg.answer(t(lang, "cal_no_subs"), reply_markup=menu(lang))
         return
-    await msg.answer(_clip(calendar_text(lang, rows)), reply_markup=menu(lang))
+    await msg.answer(_clip(calendar_text(lang, rows, today)), reply_markup=menu(lang))
 
 
-def calendar_text(lang: str, rows: list) -> str:
+def calendar_text(lang: str, rows: list, today: date | None = None) -> str:
     """Строки CALENDAR_SQL → текст календаря. Сверху то, что уже вышло в эфир, но на HDREZKA ещё не
     появилось: 11.09.2026 такая серия («неудачник» 1×12) просто пропадала из календаря на следующий день."""
-    late = [r for r in rows if r[3] < date.today()]
-    soon = [r for r in rows if r[3] >= date.today()]
+    today = today or date.today()
+    late = [r for r in rows if r[3] < today]
+    soon = [r for r in rows if r[3] >= today]
     if not rows:
         return t(lang, "cal_empty", n=CAL_DAYS) + t(lang, "cal_note")
     lines = []
@@ -447,7 +480,7 @@ def calendar_text(lang: str, rows: list) -> str:
         for title, season, episode, d in soon:
             if d != cur:
                 cur = d
-                lines.append(f"\n<b>{when(lang, d)}</b>")
+                lines.append(f"\n<b>{when(lang, d, today)}</b>")
             lines.append(f"  • {html.escape(title[:36])} — {season}×{episode}")
     return "\n".join(lines) + t(lang, "cal_note")
 
@@ -493,8 +526,9 @@ async def cmd_stats(msg: Message) -> None:
 # ----------------------------------------------------------------------------- обратная связь (app/feedback.py)
 
 def _fb_topics(lang: str) -> InlineKeyboardMarkup:
-    return _kb([[(t(lang, "fb_topic_bug"), "fb:bug"), (t(lang, "fb_topic_idea"), "fb:idea")],
-                [(t(lang, "fb_topic_collab"), "fb:collab"), (t(lang, "fb_topic_other"), "fb:other")]])
+    """Темы — из feedback.TOPICS, по две в ряд: список тем живёт в одном месте."""
+    buttons = [(t(lang, f"fb_topic_{topic}"), f"fb:{topic}") for topic in feedback.TOPICS]
+    return _kb([buttons[i:i + 2] for i in range(0, len(buttons), 2)])
 
 
 @dp.message(Command("feedback"))
@@ -815,7 +849,7 @@ async def _refine_finished(note: Message, user_id: int, hdrezka_id: int, page_id
 # ----------------------------------------------------------------------------- карточка страницы
 
 async def _render_page_card(user_id: int, page_id: int, just_created: bool = False):
-    lang = await _lang(user_id)
+    lang, today = await _lang(user_id), await _today(user_id)
     async with session() as s:
         page = await s.get(Page, page_id)
         if page is None:
@@ -823,7 +857,7 @@ async def _render_page_card(user_id: int, page_id: int, just_created: bool = Fal
         sub = await s.scalar(select(Subscription).where(Subscription.user_id == user_id,
                                                         Subscription.page_id == page_id))
         nxt = await s.scalar(select(func.min(Schedule.air_date)).where(
-            Schedule.page_id == page_id, Schedule.aired.is_(False), ~_released(), Schedule.air_date >= date.today()))
+            Schedule.page_id == page_id, Schedule.aired.is_(False), ~_released(), Schedule.air_date >= today))
         voices = (await s.execute(select(Voice).where(Voice.page_id == page_id))).scalars().all()
         fr = await s.get(Franchise, page.franchise_id) if page.franchise_id else None
         parts = (await s.scalar(select(func.count()).select_from(Page).where(Page.franchise_id == page.franchise_id))
@@ -883,10 +917,10 @@ async def _render_page_card(user_id: int, page_id: int, just_created: bool = Fal
         label = (t(lang, "btn_fr_parts_n", n=parts) if state == "follow"
                  else t(lang, "btn_whole_franchise", name=fr.name[:24], n=parts))
         rows.append([(label, f"subf:{fr.id}:{page.id}")])
-    site = [(t(lang, "btn_open_site"), svc.public_url(page.url))] if page.url else []   # нет адреса — нет кнопки
+    site = [(t(lang, "btn_open_site"), Url(svc.public_url(page.url)))]                  # нет адреса — нет кнопки (_kb)
     if page.content_type != "film":
         rows.append([(t(lang, "btn_schedule"), f"sched:p:{page.id}")] + site)
-    elif site:
+    else:
         rows.append(site)
     rows.append([(t(lang, "btn_share"), _share_url(lang, f"p_{page.hdrezka_id}", page.title))])
     return "\n".join(lines) + t(lang, "hint"), _kb(rows)
@@ -918,12 +952,10 @@ async def _too_many_subs(user_id: int) -> bool:
 
 
 @dp.callback_query(_cb("sub"))
+@limited
 async def cb_subscribe(cb: CallbackQuery) -> None:
     """sub: — подписка на выходящий сезон; wait: — на завершённый, со смыслом «жду продолжения»."""
     lang = await _lang(cb.from_user.id)
-    if not guard.cheap_actions.allow(cb.from_user.id):
-        await cb.answer(t(lang, "too_fast"), show_alert=False)
-        return
     hdrezka_id = int(cb.data.split(":")[1])
     if await _too_many_subs(cb.from_user.id):
         await cb.answer(t(lang, "max_subs", n=guard.MAX_SUBSCRIPTIONS), show_alert=True)
@@ -942,6 +974,17 @@ async def cb_subscribe(cb: CallbackQuery) -> None:
         if page.content_type == "film" or (page.is_finished and not waiting):
             await s.commit()
             await cb.answer(t(lang, "cannot_sub"), show_alert=True)
+            return
+        # Франшиза уже отслеживается целиком — подписка на её сезон ничего не добавит: вторая строка в «Моих
+        # подписках» и путаница, какая озвучка где (24.09.2026). Говорим об этом и показываем карточку франшизы.
+        followed = page.franchise_id and await s.scalar(select(Subscription.id).where(
+            Subscription.user_id == cb.from_user.id, Subscription.franchise_id == page.franchise_id))
+        if followed:
+            fid = page.franchise_id
+            await s.commit()
+            await cb.answer(t(lang, "already_franchise"))
+            text_, kb = await _render_franchise_card(cb.from_user.id, fid, created=False)
+            await cb.message.answer(_clip(text_), reply_markup=kb)
             return
         created = await svc.subscribe_page(s, cb.from_user.id, page.id)
         await s.commit()
@@ -1065,11 +1108,9 @@ async def _prefetch_parts(m: Message, user_id: int, fid: int, origin: int | None
 
 
 @dp.callback_query(_cb("subf"))
+@limited
 async def cb_franchise_overview(cb: CallbackQuery) -> None:
     """«Вся франшиза» сначала показывает состав, подписка — отдельным нажатием."""
-    if not guard.cheap_actions.allow(cb.from_user.id):
-        await cb.answer(t(await _lang(cb.from_user.id), "too_fast"))
-        return
     parts = cb.data.split(":")
     fid = int(parts[1])
     origin = int(parts[2]) if len(parts) > 2 else None
@@ -1080,11 +1121,9 @@ async def cb_franchise_overview(cb: CallbackQuery) -> None:
 
 
 @dp.callback_query(_cb("subf_all"))
+@limited
 async def cb_subscribe_franchise(cb: CallbackQuery) -> None:
     lang = await _lang(cb.from_user.id)
-    if not guard.cheap_actions.allow(cb.from_user.id):
-        await cb.answer(t(lang, "too_fast"))
-        return
     fid = int(cb.data.split(":")[1])
     if await _too_many_subs(cb.from_user.id):
         await cb.answer(t(lang, "max_subs", n=guard.MAX_SUBSCRIPTIONS), show_alert=True)
@@ -1113,7 +1152,7 @@ async def _render_franchise_card(user_id: int, fid: int, created: bool = True):
                                  .order_by(Page.year.desc().nulls_last(), Page.id.desc()))).scalars().all()
         voices = (await s.execute(select(Voice).join(Page, Page.id == Voice.page_id)
                                   .where(Page.franchise_id == fid))).scalars().all()
-    ongoing = [p for p in parts if not p.is_finished and p.last_episode and p.content_type != "film"]
+    ongoing = [p for p in parts if svc.is_airing(p)]
     head = t(lang, "fc_head_new" if (sub and created) else ("fc_head_in_subs" if sub else "fc_head"))
     lines = [f"{head} <b>{html.escape(fr.name)}</b> ({t(lang, 'parts_n', n=len(parts))})"]
     if ongoing:
@@ -1144,44 +1183,44 @@ SCHED_TEMPLATE = """
                                 WHERE e.page_id = p.id AND e.season = sc.season AND e.episode = sc.episode) AS aired
       FROM schedule sc JOIN pages p ON p.id = sc.page_id
      WHERE {where} AND coalesce(p.content_type, 'series') = 'series'
-       AND sc.air_date IS NOT NULL AND sc.air_date >= current_date - 7
+       AND sc.air_date IS NOT NULL AND sc.air_date >= CAST(:today AS date) - 7
      ORDER BY sc.air_date, p.title, sc.season, sc.episode
      LIMIT 40
 """
 
 
-def _fmt_sched(lang: str, rows, with_title: bool) -> list[str]:
+def _fmt_sched(lang: str, rows, with_title: bool, today: date | None = None) -> list[str]:
+    today = today or date.today()
     out = []
     for _pid, title, season, episode, d, aired in rows:
-        mark = "✓" if aired or d < date.today() else "•"
+        mark = "✓" if aired or d < today else "•"
         who = f"<b>{html.escape(title[:30])}</b> " if with_title else ""
-        out.append(f"{mark} {who}{season}×{episode} — {when(lang, d)}")
+        out.append(f"{mark} {who}{season}×{episode} — {when(lang, d, today)}")
     return out
 
 
 async def _render_schedule(user_id: int, kind: str, obj_id: int):
-    lang = await _lang(user_id)
+    lang, today = await _lang(user_id), await _today(user_id)
     async with session() as s:
         if kind == "p":
             page = await s.get(Page, obj_id)
             head = f"📅 <b>{html.escape(page.title)}</b>" if page else "📅"
-            rows = (await s.execute(text(SCHED_TEMPLATE.format(where="p.id = :id")), {"id": obj_id})).all()
+            rows = (await s.execute(text(SCHED_TEMPLATE.format(where="p.id = :id")), {"id": obj_id, "today": today})).all()
             back = (t(lang, "btn_to_series"), f"pcard:{obj_id}")
         else:
             fr = await s.get(Franchise, obj_id)
             head = t(lang, "sched_fr_head", name=html.escape(fr.name)) if fr else "📅"
-            rows = (await s.execute(text(SCHED_TEMPLATE.format(where="p.franchise_id = :id")), {"id": obj_id})).all()
+            rows = (await s.execute(text(SCHED_TEMPLATE.format(where="p.franchise_id = :id")),
+                                    {"id": obj_id, "today": today})).all()
             back = (t(lang, "btn_to_franchise"), f"fcard:{obj_id}")
-    lines = _fmt_sched(lang, rows, with_title=(kind == "f"))
+    lines = _fmt_sched(lang, rows, with_title=(kind == "f"), today=today)
     body = "\n".join(lines) if lines else t(lang, "sched_empty")
     return f"{head}\n\n{body}{t(lang, 'cal_note')}", _kb([[back]])
 
 
 @dp.callback_query(_cb("sched"))
+@limited
 async def cb_schedule(cb: CallbackQuery) -> None:
-    if not guard.cheap_actions.allow(cb.from_user.id):
-        await cb.answer(t(await _lang(cb.from_user.id), "too_fast"))
-        return
     _, kind, obj_id = cb.data.split(":")
     text_, kb = await _render_schedule(cb.from_user.id, kind, int(obj_id))
     await cb.answer()
@@ -1220,9 +1259,7 @@ async def _airing_voice_ids(s, sub: Subscription) -> set[int]:
     у подписки на франшизу список озвучек собирается со всех частей, и у старых сезонов бывают
     студии, которые новый не озвучивают (живой случай 07.09.2026: AniLibria у ТВ-1 и ТВ-2,
     но не у выходящего ТВ-3 — человек выбрал её и не получил бы ничего)."""
-    q = (select(Voice.translator_id).join(Page, Page.id == Voice.page_id)
-         .where(Page.is_finished.is_(False), Page.last_episode.isnot(None),
-                func.coalesce(Page.content_type, "series") != "film"))
+    q = select(Voice.translator_id).join(Page, Page.id == Voice.page_id).where(svc.airing_clause())
     q = q.where(Page.id == sub.page_id) if sub.page_id else q.where(Page.franchise_id == sub.franchise_id)
     return set((await s.execute(q)).scalars())
 
@@ -1268,20 +1305,16 @@ async def _render_voices(user_id: int, sub_id: int):
 
 
 @dp.callback_query(_cb("voices"))
+@limited
 async def cb_voices(cb: CallbackQuery) -> None:
-    if not guard.cheap_actions.allow(cb.from_user.id):
-        await cb.answer(t(await _lang(cb.from_user.id), "too_fast"))
-        return
     text_, kb = await _render_voices(cb.from_user.id, int(cb.data.split(":")[1]))
     await cb.answer()
     await _edit(cb, text_, kb)
 
 
 @dp.callback_query(_cb("vt"))
+@limited
 async def cb_voice_toggle(cb: CallbackQuery) -> None:
-    if not guard.cheap_actions.allow(cb.from_user.id):
-        await cb.answer(t(await _lang(cb.from_user.id), "too_fast"))
-        return
     _, sub_id, tid = cb.data.split(":")
     if sub := await _own_sub(cb.from_user.id, int(sub_id)):
         async with session() as s:
@@ -1348,7 +1381,7 @@ async def _render_my(user_id: int, page: int = 0):
     по широкой кнопке на сериал, она ведёт в карточку, где озвучка и отписка. Узкие кнопки «🎙 …» и «❌» не
     вмещали названий, а слово «франшиза» зрителю не нужно. Сверху то, что выйдет раньше. Страниц — сколько нужно
     по 15, записи делятся между ними поровну: одинокая запись на последней странице выглядела бы потерянной."""
-    lang = await _lang(user_id)
+    lang, today = await _lang(user_id), await _today(user_id)
     entries = []
     async with session() as s:
         subs = (await s.execute(select(Subscription).where(Subscription.user_id == user_id))).scalars().all()
@@ -1358,15 +1391,14 @@ async def _render_my(user_id: int, page: int = 0):
             if sub.scope == "franchise":
                 fr = await s.get(Franchise, sub.franchise_id)
                 parts = (await s.execute(
-                    select(Page).where(Page.franchise_id == sub.franchise_id, Page.is_finished.is_(False),
-                                       Page.last_episode.isnot(None), func.coalesce(Page.content_type, "series") != "film")
+                    select(Page).where(Page.franchise_id == sub.franchise_id, svc.airing_clause())
                     .order_by(Page.year.desc().nulls_last(), Page.id.desc()))).scalars().all()
                 title, airing, waiting, page_ids = fr.name, (parts[0] if parts else None), False, [x.id for x in parts]
                 gone = False
             else:
                 pg = await s.get(Page, sub.page_id)
                 waiting = pg.is_finished and pg.content_type != "film"
-                airing = pg if (not pg.is_finished and pg.last_episode) else None
+                airing = pg if svc.is_airing(pg) else None
                 title, page_ids = pg.title, [pg.id]
                 gone = pg.gone_at is not None
             nxt = None
@@ -1374,7 +1406,7 @@ async def _render_my(user_id: int, page: int = 0):
                 nxt = (await s.execute(
                     select(Schedule.air_date, Schedule.season, Schedule.episode)
                     .where(Schedule.page_id.in_(page_ids), Schedule.aired.is_(False), ~_released(),
-                           Schedule.air_date >= date.today() - timedelta(days=CAL_LATE_DAYS))
+                           Schedule.air_date >= today - timedelta(days=CAL_LATE_DAYS))
                     .order_by(Schedule.air_date).limit(1))).first()
             names = {v.translator_id: v.name for v in await _voices_for_sub(s, sub)}
             chosen = [names.get(tid, f"#{tid}") for tid in sub.voice_filter or []]
@@ -1397,7 +1429,7 @@ async def _render_my(user_id: int, page: int = 0):
             detail = t(lang, "my_waiting")
         else:
             bits = [f"{airing.last_season}×{airing.last_episode}" if airing else t(lang, "my_nothing_airing")]
-            if nxt and nxt.air_date < date.today():
+            if nxt and nxt.air_date < today:
                 bits.append(t(lang, "my_late", s=nxt.season, e=nxt.episode, d=fmt_date(lang, nxt.air_date)))
             elif nxt:
                 bits.append(t(lang, "my_next", d=fmt_date(lang, nxt.air_date)))
@@ -1413,21 +1445,17 @@ async def _render_my(user_id: int, page: int = 0):
 
 
 @dp.callback_query(_cb("my"))
+@limited
 async def cb_my_page(cb: CallbackQuery) -> None:
-    if not guard.cheap_actions.allow(cb.from_user.id):
-        await cb.answer(t(await _lang(cb.from_user.id), "too_fast"))
-        return
     text_, kb = await _render_my(cb.from_user.id, int(cb.data.split(":")[1]))
     await cb.answer()
     await _edit(cb, text_, kb)
 
 
 @dp.callback_query(_cb("unsub"))
+@limited
 async def cb_unsubscribe(cb: CallbackQuery) -> None:
     lang = await _lang(cb.from_user.id)
-    if not guard.cheap_actions.allow(cb.from_user.id):
-        await cb.answer(t(lang, "too_fast"))
-        return
     async with session() as s:
         ok = await svc.unsubscribe(s, cb.from_user.id, int(cb.data.split(":")[1]))
         await s.commit()
@@ -1437,12 +1465,10 @@ async def cb_unsubscribe(cb: CallbackQuery) -> None:
 
 
 @dp.callback_query(_cb("unsubq"))
+@limited
 async def cb_unsubscribe_ask(cb: CallbackQuery) -> None:
     """«🔕 Не следить» в уведомлении: сначала подтверждение — заменяем последний ряд кнопок."""
     lang = await _lang(cb.from_user.id)
-    if not guard.cheap_actions.allow(cb.from_user.id):
-        await cb.answer(t(lang, "too_fast"))
-        return
     sub_id = int(cb.data.split(":")[1])
     await _swap_row(cb, [InlineKeyboardButton(text=t(lang, "btn_unsub_yes"), callback_data=f"unsub:{sub_id}"),
                               InlineKeyboardButton(text=t(lang, "btn_keep"), callback_data=f"keep:{sub_id}")])
@@ -1450,11 +1476,9 @@ async def cb_unsubscribe_ask(cb: CallbackQuery) -> None:
 
 
 @dp.callback_query(_cb("keep"))
+@limited
 async def cb_keep(cb: CallbackQuery) -> None:
     lang = await _lang(cb.from_user.id)
-    if not guard.cheap_actions.allow(cb.from_user.id):
-        await cb.answer(t(lang, "too_fast"))
-        return
     sub_id = int(cb.data.split(":")[1])
     sub = await _own_sub(cb.from_user.id, sub_id)
     label = t(lang, "btn_unfollow_fr" if sub and sub.scope == "franchise" else "btn_unfollow")
@@ -1507,12 +1531,13 @@ async def _render_new(user_id: int):
     if not rows and not parts:
         return t(lang, "new_empty"), _kb([])
     tz = timedelta(hours=u.tz_offset if u else 3)
+    today = (datetime.now(timezone.utc) + tz).date()
     lines, cur, buttons = [t(lang, "new_head")], None, []
     for _eid, title, url, default_tid, season, episode, seen, voices, first_tid in rows:
         day = (seen + tz).date()
         if day != cur:
             cur = day
-            lines.append(f"\n<b>{when(lang, day)}</b>")
+            lines.append(f"\n<b>{when(lang, day, today)}</b>")
         lines.append(f"  • {html.escape(title[:36])} — {season}×{episode}" + (f" · {html.escape(voices)}" if voices else ""))
         if len(buttons) < 10:
             buttons.append([InlineKeyboardButton(text=fit_button("▶ ", title, f" {season}×{episode}"),
@@ -1608,10 +1633,8 @@ async def _render_lang(user_id: int):
 
 
 @dp.callback_query(_cb("set"))
+@limited
 async def cb_settings(cb: CallbackQuery) -> None:
-    if not guard.cheap_actions.allow(cb.from_user.id):
-        await cb.answer(t(await _lang(cb.from_user.id), "too_fast"))
-        return
     parts = cb.data.split(":")
     what = parts[1]
     async with session() as s:
@@ -1645,10 +1668,8 @@ async def cb_settings(cb: CallbackQuery) -> None:
 
 
 @dp.callback_query(_cb("setq"))
+@limited
 async def cb_quiet(cb: CallbackQuery) -> None:
-    if not guard.cheap_actions.allow(cb.from_user.id):
-        await cb.answer(t(await _lang(cb.from_user.id), "too_fast"))
-        return
     parts = cb.data.split(":")
     async with session() as s:
         await _touch_user(s, cb.from_user)
@@ -1675,10 +1696,8 @@ async def cb_quiet(cb: CallbackQuery) -> None:
 
 
 @dp.callback_query(_cb("setl"))
+@limited
 async def cb_lang(cb: CallbackQuery) -> None:
-    if not guard.cheap_actions.allow(cb.from_user.id):
-        await cb.answer(t(await _lang(cb.from_user.id), "too_fast"))
-        return
     code = cb.data.split(":")[1]
     if code not in LANGS:
         await cb.answer()
@@ -1698,10 +1717,8 @@ async def cb_lang(cb: CallbackQuery) -> None:
 
 
 @dp.callback_query(_cb("setv"))
+@limited
 async def cb_default_voice(cb: CallbackQuery) -> None:
-    if not guard.cheap_actions.allow(cb.from_user.id):
-        await cb.answer(t(await _lang(cb.from_user.id), "too_fast"))
-        return
     val = cb.data.split(":")[1]
     async with session() as s:
         await _touch_user(s, cb.from_user)

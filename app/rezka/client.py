@@ -244,11 +244,6 @@ class RezkaClient:
     async def get(self, path: str, *, retries: int = 2) -> str:
         return await self.request("GET", path, retries=retries)
 
-    async def feed(self, section: str, page: int = 1) -> str:
-        """Лента обновлений раздела: сериалы, аниме и т.д."""
-        suffix = "" if page == 1 else f"page/{page}/"
-        return await self.get(f"/{section}/{suffix}?filter=last")
-
     async def home(self) -> str:
         """Главная: блок «Обновления» — неделя вышедших серий по дням, с озвучкой (F13)."""
         return await self.get("/")

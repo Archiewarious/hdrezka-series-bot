@@ -20,8 +20,9 @@ User=<USER>
 
 # Разрешаем контейнерам compose-сети достучаться до туннеля.
 # Префикс "+" — выполнить от root, несмотря на User=.
-# Проверка через -C делает правило идемпотентным при рестарте.
-ExecStartPre=+/bin/sh -c '/usr/sbin/iptables -C INPUT -s <COMPOSE_NET> -d <COMPOSE_GW> -p tcp --dport 1080 -j ACCEPT 2>/dev/null || /usr/sbin/iptables -I INPUT 7 -s <COMPOSE_NET> -d <COMPOSE_GW> -p tcp --dport 1080 -j ACCEPT'
+# Проверка через -C делает правило идемпотентным при рестарте. -I без номера — в начало цепочки: номер
+# позиции зависел от чужих правил хоста и ломался при их изменении (24.09.2026).
+ExecStartPre=+/bin/sh -c '/usr/sbin/iptables -C INPUT -s <COMPOSE_NET> -d <COMPOSE_GW> -p tcp --dport 1080 -j ACCEPT 2>/dev/null || /usr/sbin/iptables -I INPUT -s <COMPOSE_NET> -d <COMPOSE_GW> -p tcp --dport 1080 -j ACCEPT'
 
 # Слушаем только на внутренних адресах. На 0.0.0.0 вешать нельзя: получится открытый прокси.
 ExecStart=/usr/bin/ssh -N \

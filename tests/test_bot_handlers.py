@@ -273,3 +273,51 @@ def test_cannot_unsubscribe_someone_else(db, site):
 
     toasts, left = db(scenario)
     assert toasts == [main.t("ru", "toast_no_sub")] and left == [61]
+
+
+# ----------------------------------------------------------------------------- шаг 9 аудита (24.09.2026)
+
+def test_season_inside_a_followed_franchise_is_not_subscribed_twice(db, site):
+    from app.models import Franchise
+
+    async def scenario():
+        async with session() as s:
+            s.add(User(id=64))
+            fr = Franchise(key_hdrezka_id=6400, name="Сага")
+            s.add(fr)
+            await s.flush()
+            await _page(s, 6400, "Сага [ТВ-2]", last=(2, 3), franchise_id=fr.id)
+            await svc.subscribe_franchise(s, 64, fr.id)
+            await s.commit()
+        cb = FakeCallback(64, "sub:6400")
+        await main.cb_subscribe(cb)
+        async with session() as s:
+            scopes = (await s.execute(select(Subscription.scope))).scalars().all()
+        return cb.toasts, scopes, cb.message.answers
+
+    toasts, scopes, answers = db(scenario)
+    assert toasts == [main.t("ru", "already_franchise")] and scopes == ["franchise"]
+    assert "Сага" in answers[0][0], "показана карточка франшизы"
+
+
+def test_today_is_the_persons_date_not_the_servers(db):
+    async def scenario():
+        async with session() as s:
+            s.add_all([User(id=65, tz_offset=14), User(id=66, tz_offset=-12)])
+            await s.commit()
+        return await main._today(65), await main._today(66)
+
+    east, west = db(scenario)
+    now = datetime.now(timezone.utc)
+    assert east == (now + timedelta(hours=14)).date() and west == (now - timedelta(hours=12)).date()
+    rows = [("Сериал", 1, 2, east)]
+    assert main.t("ru", "today") in main.calendar_text("ru", rows, today=east)
+    assert main.t("ru", "tomorrow") in main.calendar_text("ru", rows, today=east - timedelta(days=1))
+
+
+def test_link_button_without_address_is_not_shown():
+    kb = main._kb([[("Сайт", main.Url("")), ("Расписание", "sched:p:1")], [("Пусто", main.Url(""))]])
+    assert [[b.text for b in row] for row in kb.inline_keyboard] == [["Расписание"]]
+    kb = main._kb([[("Сайт", main.Url("https://rezka.test/a/1-x.html"))], [("Кнопка", "/a/1-x.html")]])
+    assert kb.inline_keyboard[0][0].url == "https://rezka.test/a/1-x.html"
+    assert kb.inline_keyboard[1][0].callback_data == "/a/1-x.html", "строка без Url — кнопка, а не ссылка"

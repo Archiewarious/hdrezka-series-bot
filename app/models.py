@@ -203,7 +203,7 @@ class Notification(Base):
 
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
     user_id: Mapped[int] = mapped_column(BigInteger)
-    kind: Mapped[str] = mapped_column(String(16))                  # episode | voice | new_part
+    kind: Mapped[str] = mapped_column(String(16))                  # episode | voice:<translator_id> | new_part
     ref_id: Mapped[int] = mapped_column(BigInteger)                # episodes.id / episodes.id / pages.id
     status: Mapped[str] = mapped_column(String(16), default="pending", server_default=text("'pending'"))
     attempts: Mapped[int] = mapped_column(Integer, default=0, server_default=text("0"))

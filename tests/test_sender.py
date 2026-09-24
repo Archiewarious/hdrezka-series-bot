@@ -170,3 +170,52 @@ def test_new_part_is_rendered_with_public_link(db):
         return r.watch_url
 
     assert db(scenario) == svc.public_url("/films/x/3700-f.html")
+
+
+def test_long_daily_digest_goes_out_in_parts_and_nothing_is_lost(db):
+    """24.09.2026: текст дайджеста обрезался на 4000 символах, а все события помечались отправленными."""
+    async def scenario():
+        async with session() as s:
+            s.add(User(id=38, quiet_from=None, quiet_to=None, digest_hour=20))
+            for n in range(40):
+                page = await _page(s, 3800 + n, f"Очень длинное название сериала номер {n} " + "ъ" * 60, last=(1, 1),
+                                   rows=[(1, 1)])
+                eid = await s.scalar(select(Episode.id).where(Episode.page_id == page.id))
+                await s.execute(text("INSERT INTO notifications (user_id, kind, ref_id) VALUES (38, 'episode', :e)"),
+                                {"e": eid})
+            await s.commit()
+        bot = FakeBot()
+        await sender.send_batch(bot, sender.RateLimiter(1000))
+        async with session() as s:
+            statuses = (await s.execute(text("SELECT status, count(*) FROM notifications GROUP BY 1"))).all()
+        return bot.sent, statuses
+
+    sent, statuses = db(scenario)
+    assert len(sent) > 1 and all(len(body) <= sender.TG_MAX_LEN for _, body, _ in sent)
+    assert sum(body.count("Очень длинное название") for _, body, _ in sent) == 40, "все 40 событий в тексте"
+    assert [tuple(r) for r in statuses] == [("sent", 40)]
+
+
+def test_poster_cache_survives_errors_that_are_not_about_the_picture(db, monkeypatch):
+    """Кэш постера сбрасывался при любом отказе Telegram — и картинка грузилась заново без причины."""
+    class ChatGoneBot(PhotoBot):
+        async def send_photo(self, chat_id, photo, caption=None, reply_markup=None, **kw):
+            raise TelegramBadRequest(method=None, message="chat not found")
+
+    async def scenario():
+        pid = await _post_with_poster(39, 3900, "GOOD-ID")
+        await sender.send_batch(ChatGoneBot(), sender.RateLimiter(1000))
+        async with session() as s:
+            file_id = await s.scalar(text("SELECT poster_file_id FROM pages WHERE id = :p"), {"p": pid})
+        return file_id, (await _rows())[0][0]
+
+    assert db(scenario) == ("GOOD-ID", "failed")
+
+
+def test_poster_only_from_allowed_hosts_and_formats():
+    assert posters.safe_url("https://static.hdrezka.ac/i/x.jpg")
+    assert not posters.safe_url("https://evil.example/x.jpg"), "чужой хост — не качаем"
+    buf = io.BytesIO()
+    Image.new("RGB", (10, 10)).save(buf, "GIF")
+    with pytest.raises(Exception):
+        posters._to_standard(buf.getvalue())

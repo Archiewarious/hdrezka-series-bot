@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from urllib.parse import urlsplit
 
-from sqlalchemy import case, delete, func, or_, select, text, tuple_
+from sqlalchemy import and_, case, delete, func, or_, select, text, tuple_
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -78,6 +78,29 @@ def public_url(path: str) -> str:
     if not path or path.startswith("http"):
         return path
     return cfg.public_url + path
+
+
+# ----------------------------------------------------------------------------- «часть сейчас выходит»
+
+# Одно определение (24.09.2026): раньше условие было переписано семь раз, и копии разошлись — где-то без проверки
+# на фильм. Не завершена, серии уже были (объявленные без серий не предлагаем), не фильм.
+AIRING_SQL_TEMPLATE = ("(NOT {p}.is_finished AND {p}.last_episode IS NOT NULL"
+                       " AND coalesce({p}.content_type, 'series') <> 'film')")
+
+
+def airing_sql(alias: str = "p") -> str:
+    return AIRING_SQL_TEMPLATE.format(p=alias)
+
+
+def airing_clause():
+    """То же для запросов SQLAlchemy."""
+    return and_(Page.is_finished.is_(False), Page.last_episode.isnot(None),
+                func.coalesce(Page.content_type, "series") != "film")
+
+
+def is_airing(p: Page) -> bool:
+    """То же для загруженной страницы."""
+    return not p.is_finished and p.last_episode is not None and p.content_type != "film"
 
 
 # ----------------------------------------------------------------------------- pages
@@ -629,10 +652,8 @@ async def search_catalog(s: AsyncSession, query: str, limit: int = 30) -> list[P
 
 async def franchise_stats(s: AsyncSession, ids: list[int]) -> dict[int, tuple[str, int, int]]:
     """franchise_id → (имя, всего частей, из них выходят)."""
-    rows = await s.execute(text("""
-        SELECT f.id, f.name, count(p.id),
-               count(*) FILTER (WHERE NOT p.is_finished AND coalesce(p.content_type, 'series') <> 'film'
-                                  AND p.last_episode IS NOT NULL)
+    rows = await s.execute(text(f"""
+        SELECT f.id, f.name, count(p.id), count(*) FILTER (WHERE {airing_sql()})
           FROM franchises f JOIN pages p ON p.franchise_id = f.id
          WHERE f.id = ANY(CAST(:ids AS int[])) GROUP BY f.id, f.name"""), {"ids": ids})
     return {fid: (name, parts, ongoing) for fid, name, parts, ongoing in rows}
@@ -673,11 +694,9 @@ async def _default_voices(s: AsyncSession, user_id: int, page_id: int | None = N
     wanted = await s.scalar(text("SELECT default_voice_filter FROM users WHERE id = :u"), {"u": user_id})
     if not wanted:
         return None
-    have = set((await s.execute(text("""
+    have = set((await s.execute(text(f"""
         SELECT DISTINCT v.translator_id FROM voices v JOIN pages p ON p.id = v.page_id
-         WHERE p.id = :page_id
-            OR (p.franchise_id = :franchise_id AND NOT p.is_finished AND p.last_episode IS NOT NULL
-                AND coalesce(p.content_type, 'series') <> 'film')"""),
+         WHERE p.id = :page_id OR (p.franchise_id = :franchise_id AND {airing_sql()})"""),
         {"page_id": page_id or -1, "franchise_id": franchise_id or -1})).scalars())
     return pick_voices(wanted, have)
 

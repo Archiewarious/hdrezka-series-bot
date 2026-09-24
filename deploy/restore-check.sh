@@ -2,8 +2,11 @@
 # Проверка бэкапа: восстановить дамп в отдельную базу rezka_restore_check, показать число строк, удалить базу.
 # Использование: deploy/restore-check.sh [/var/backups/rezka/rezka-YYYYMMDD-HHMM.dump]  (по умолчанию — свежайший)
 set -euo pipefail
-PROJECT=/home/alex/HDREZKA
-file=${1:-$(ls -1t /var/backups/rezka/rezka-*.dump | head -1)}
+PROJECT=$(cd "$(dirname "$0")/.." && pwd)
+LOCAL_DIR=/var/backups/rezka
+# shellcheck source=backup.env.example
+[ -f "$PROJECT/deploy/backup.env" ] && source "$PROJECT/deploy/backup.env"
+file=${1:-$(ls -1t "${LOCAL_DIR:-/var/backups/rezka}"/rezka-*.dump | head -1)}
 db=rezka_restore_check
 cd "$PROJECT"
 PSQL=(sudo -n docker compose exec -T postgres psql -U rezka -d postgres -qAt)

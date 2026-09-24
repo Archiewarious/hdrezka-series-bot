@@ -187,23 +187,36 @@ def _single_keyboard(r: Rendered, lang: str = "ru") -> InlineKeyboardMarkup:
 
 
 def _digest(items: list[Rendered], lang: str = "ru") -> tuple[str, InlineKeyboardMarkup]:
-    """Несколько событий одним сообщением. Текст режется только между событиями — обрезка посреди HTML-тега
-    ломает разметку, и Telegram отклоняет сообщение. Кнопка — одна на сериал: две озвучки одной серии или
-    две серии подряд ведут к последнему событию."""
+    """Несколько событий одним сообщением. Кнопка — одна на сериал: две озвучки одной серии или две серии
+    подряд ведут к последнему событию. Размер части следит digest_parts: сюда приходит то, что влезает."""
     head = t(lang, "digest_episodes" if any(r.kind != "new_part" for r in items) else "digest_parts")
-    parts, size = [head], len(head)
-    for r in items:
-        if size + len(r.line) + 2 > TG_MAX_LEN - 3:
-            parts.append("…")
-            break
-        parts.append(r.line)
-        size += len(r.line) + 2
     buttons: dict[int, tuple[str, str]] = {}
     for r in items:
         buttons[r.page_id] = (r.title, r.watch_url)
-    rows = [[InlineKeyboardButton(text=fit_button("▶ ", title), url=url)]
-            for title, url in list(buttons.values())[:DIGEST_MAX_BUTTONS]]
-    return "\n\n".join(parts), InlineKeyboardMarkup(inline_keyboard=rows)
+    rows = [[InlineKeyboardButton(text=fit_button("▶ ", title), url=url)] for title, url in buttons.values()]
+    return "\n\n".join([head] + [r.line for r in items]), InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def digest_parts(pairs: list, lang: str = "ru") -> list[list]:
+    """Дайджест — несколькими сообщениями, если не влезает в одно (24.09.2026): раньше текст обрезался на 4000
+    символах, а все события помечались отправленными. Граница — между событиями: не больше TG_MAX_LEN текста
+    и DIGEST_MAX_BUTTONS сериалов (кнопок) в сообщении."""
+    head = len(t(lang, "digest_episodes"))
+    out: list[list] = []
+    cur, size, pages = [], head, set()
+    for pair in pairs:
+        r = pair[1]
+        grows = len(r.line) + 2
+        new_page = r.page_id not in pages
+        if cur and (size + grows > TG_MAX_LEN or (new_page and len(pages) >= DIGEST_MAX_BUTTONS)):
+            out.append(cur)
+            cur, size, pages = [], head, set()
+        cur.append(pair)
+        size += grows
+        pages.add(r.page_id)
+    if cur:
+        out.append(cur)
+    return out
 
 
 async def _deliver(bot: Bot, s, user_id: int, items: list[Rendered], photos: bool, lang: str) -> int:
@@ -280,7 +293,7 @@ async def _send_user(bot: Bot, limiter: RateLimiter, user_id: int, items: list, 
         if dead:
             await _mark(s, dead, "failed", "nothing to render")
         pairs = [(nid, r) for nid, r in pairs if r is not None]
-        messages = [pairs] if digest and len(pairs) > 1 else [[pair] for pair in pairs]
+        messages = digest_parts(pairs, lang) if digest and len(pairs) > 1 else [[pair] for pair in pairs]
 
         sent = 0
         for n, message in enumerate(messages):

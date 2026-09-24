@@ -273,7 +273,7 @@ def test_calendar_sql_runs(db):
 
     async def scenario():
         async with session() as s:
-            return (await s.execute(CALENDAR_SQL, {"uid": 1, "days": CAL_DAYS, "back": CAL_LATE_DAYS})).all()
+            return (await s.execute(CALENDAR_SQL, {"uid": 1, "days": CAL_DAYS, "back": CAL_LATE_DAYS, "today": TODAY})).all()
 
     assert db(scenario) == []
 
@@ -297,7 +297,7 @@ def test_calendar_hides_episodes_already_out_in_your_dub(db):
                 s.add(Schedule(page_id=page.id, season=1, episode=ep, air_date=TODAY + timedelta(days=days), aired=False))
             await s.commit()
             return [(r[1], r[2]) for r in
-                    (await s.execute(CALENDAR_SQL, {"uid": 9, "days": CAL_DAYS, "back": CAL_LATE_DAYS})).all()]
+                    (await s.execute(CALENDAR_SQL, {"uid": 9, "days": CAL_DAYS, "back": CAL_LATE_DAYS, "today": TODAY})).all()]
 
     assert db(scenario) == [(1, 11), (1, 12)], "1×10 уже в дубляже — не ожидается; 1×11 только в оригинале — ждём"
 
@@ -315,7 +315,7 @@ def test_calendar_keeps_episode_that_aired_but_is_not_on_the_site(db):
             s.add_all([Schedule(page_id=page.id, season=1, episode=12, air_date=TODAY - timedelta(days=1)),
                        Schedule(page_id=page.id, season=1, episode=13, air_date=TODAY + timedelta(days=6))])
             await s.commit()
-            return (await s.execute(CALENDAR_SQL, {"uid": 30, "days": CAL_DAYS, "back": CAL_LATE_DAYS})).all()
+            return (await s.execute(CALENDAR_SQL, {"uid": 30, "days": CAL_DAYS, "back": CAL_LATE_DAYS, "today": TODAY})).all()
 
     rows = db(scenario)
     assert [(r[1], r[2]) for r in rows] == [(1, 12), (1, 13)]
