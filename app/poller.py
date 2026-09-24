@@ -2,6 +2,7 @@
 
 Потоки (docs/ARCHITECTURE.md, §4.1):
   1. блок «Обновления» на главной — единственный источник событий: новые серии и озвучки (F13);
+     сразу за ним — уведомления о новых частях франшиз из их состава (franchise_members);
   2. суточная сверка состава франшиз с подписчиками: фильмы и спин-оффы, которых в блоке нет;
   3. перечитывание страниц с подписчиками: расписание, озвучки, статус — выходящие дважды в сутки,
      завершённые («жду продолжения») раз в неделю; заодно подстраховка, если серия прошла мимо блока;
@@ -20,7 +21,7 @@ from sqlalchemy import select, text
 from app import service as svc
 from app.config import cfg
 from app.db import engine, init_db, session
-from app.models import Franchise, Page
+from app.models import Episode, Franchise, Page
 from app.rezka.client import AccessBlocked, RezkaClient
 from app.rezka.parser import UpdateItem, match_voice, parse_updates
 
@@ -35,6 +36,7 @@ PAGE_REFRESH_DAYS = 7                   # завершённые, на кото�
 PER_CYCLE_FRANCHISES = 2                # чтобы обход не растягивался: остальное — в следующий цикл
 PER_CYCLE_PAGES = 2
 PER_CYCLE_READS = 8                     # очередь чтения каталога
+PER_CYCLE_ANNOUNCE = 5                  # новых частей франшиз за цикл
 READ_GIVE_UP_AFTER = 3                  # страница не читается N раз подряд → идём дальше без неё
 
 
@@ -48,28 +50,13 @@ class Poller:
         self.client = client or RezkaClient()
         self._read_failures: dict[int, int] = {}
         self._cycle_new_parts = 0               # уведомлений new_part за цикл — для строки лога
-        self._reads_left = 0
+        self._reads_left = EVENT_READS          # на цикл: блок обновлений, новые части; сбрасывает cycle()
 
     # ------------------------------------------------------------------ чтение страниц
 
     async def sync(self, s, hdrezka_id: int, url: str) -> svc.SyncResult:
-        """Читает страницу. Если франшиза уже была известна, о недавних частях, которых в базе не было,
-        сообщает подписчикам: так приходят фильмы и спин-оффы — в блоке обновлений только серии."""
+        """Читает страницу. Новые части франшизы сервис дописывает в состав, уведомляет announce_new_parts."""
         res = await svc.sync_page(s, self.client, hdrezka_id, url)
-        if res.franchise and res.franchise_was_known and res.new_parts:
-            has_subs = await s.scalar(text("""
-                SELECT 1 FROM subscriptions sub LEFT JOIN pages p ON p.id = sub.page_id
-                 WHERE sub.franchise_id = :f OR p.franchise_id = :f LIMIT 1"""), {"f": res.franchise.id})
-            for part in res.new_parts:
-                if not (has_subs and part.url and svc.is_recent_part(part)):
-                    continue
-                try:
-                    await svc.sync_page(s, self.client, part.hdrezka_id, part.url)   # тип части — для текста
-                except AccessBlocked as exc:
-                    log.warning("Не прочитал новую часть %s: %s", part.hdrezka_id, exc)
-                n = await svc.enqueue_new_part(s, res.franchise.id, part)
-                self._cycle_new_parts += n
-                log.info("НОВАЯ ЧАСТЬ франшизы «%s»: %s → %s подписчикам", res.franchise.name, part.title, n)
         if res.franchise:
             await self._adopt_waiting(s, res.franchise)
         return res
@@ -83,21 +70,26 @@ class Poller:
             return
         parts = (await s.execute(select(Page).where(Page.franchise_id == fr.id))).scalars().all()
         by_id = {p.id: p for p in parts}
+        by_user: dict[int, list[tuple[Page, list[int] | None]]] = {}
+        for user_id, page_id, voices in waiting:
+            if page_id in by_id:
+                by_user.setdefault(user_id, []).append((by_id[page_id], voices))
         moved = queued = 0
-        for user_id, page_id in waiting:
-            waited = by_id.get(page_id)
-            if waited is None:
-                continue
-            for part in svc.continuation_parts(parts, waited):
-                if part.page_refreshed_at is None and part.url:      # тип и статус части — со страницы
-                    try:
-                        await svc.sync_page(s, self.client, part.hdrezka_id, part.url)
-                    except AccessBlocked as exc:
-                        log.warning("Не прочитал часть %s для ждущего продолжения: %s", part.hdrezka_id, exc)
-            await svc.subscribe_franchise(s, user_id, fr.id)          # удаляет и подписку на страницу
+        for user_id, waited_list in by_user.items():
+            for waited, _ in waited_list:
+                for part in svc.continuation_parts(parts, waited):
+                    if part.page_refreshed_at is None and part.url:      # тип и статус части — со страницы
+                        try:
+                            await svc.sync_page(s, self.client, part.hdrezka_id, part.url)
+                        except AccessBlocked as exc:
+                            log.warning("Не прочитал часть %s для ждущего продолжения: %s", part.hdrezka_id, exc)
+            # Выбранная озвучка переходит в подписку на франшизу; несколько ждавших — объединение (24.09.2026).
+            voices = svc.merge_voice_filters(*(v for _, v in waited_list))
+            await svc.subscribe_franchise(s, user_id, fr.id, voices=voices)   # удаляет и подписки на страницы
             moved += 1
-            for part in svc.continuation_parts(parts, waited):
-                queued += await svc.enqueue_new_part(s, fr.id, part, user_id=user_id)
+            for waited, _ in waited_list:
+                for part in svc.continuation_parts(parts, waited):
+                    queued += await svc.enqueue_new_part(s, fr.id, part, user_id=user_id)
         self._cycle_new_parts += queued
         log.info("ПРОДОЛЖЕНИЕ: франшиза «%s» — переведено подписок %s, уведомлений %s", fr.name, moved, queued)
 
@@ -139,7 +131,6 @@ class Poller:
         await svc.meta_set(s, "updates_ok_at", svc.now().isoformat())
         await svc.meta_set(s, "updates_events", str(len(items)))
         fresh_from = svc.now().date() - timedelta(days=1)          # «Сегодня» и «Вчера»
-        self._reads_left = EVENT_READS
         new_eps = queued = deferred = failed = 0
         for item in reversed(items):                                # от старых к новым
             fresh = item.day is not None and item.day >= fresh_from
@@ -204,6 +195,40 @@ class Poller:
             if n:
                 log.info("ОЗВУЧКА: %s s%se%s в «%s» → %s уведомлений", page.title, item.season, item.episode, item.voice, n)
         return new_eps, queued
+
+    # ------------------------------------------------------------------ 1б: новые части франшиз
+
+    async def announce_new_parts(self, s) -> int:
+        """Новые части франшиз — фильмы, спин-оффы, сезоны. В состав (franchise_members, pending) их дописывает
+        любое чтение страницы, бота или поллера; уведомляет только поллер, здесь. Старые части — молча
+        (skipped). Сериал, у которого уже есть серии, — только подписчикам других частей: подписчики
+        франшизы знают о нём по уведомлениям о сериях. Дубли отсекает uq_notification."""
+        rows = (await s.execute(text("""
+            SELECT m.franchise_id, m.hdrezka_id FROM franchise_members m
+              JOIN pages p ON p.hdrezka_id = m.hdrezka_id
+             WHERE m.announce = 'pending' AND p.url <> ''   -- анонс без страницы ждёт, пока она появится
+             ORDER BY m.seen_at, m.hdrezka_id LIMIT :lim"""), {"lim": PER_CYCLE_ANNOUNCE})).all()
+        queued = 0
+        for fid, hid in rows:
+            page = await svc.page_by_hid(s, hid)
+            if page.content_type is None:                 # тип части — для текста и решения, кому писать
+                if self._reads_left <= 0:
+                    continue                              # лимит чтений цикла — дочитаем в следующем
+                self._reads_left -= 1
+                try:
+                    await self.sync(s, page.hdrezka_id, page.url)
+                except AccessBlocked as exc:
+                    log.warning("Не прочитал новую часть %s: %s — сообщу без типа", hid, exc)
+            status = "skipped"
+            if svc.is_recent_part(page):
+                has_episodes = await s.scalar(select(Episode.id).where(Episode.page_id == page.id).limit(1)) is not None
+                n = await svc.enqueue_new_part(s, fid, page, only_page_subscribers=has_episodes)
+                queued += n
+                status = "sent"
+                log.info("НОВАЯ ЧАСТЬ франшизы %s: %s → %s уведомлений", fid, page.title, n)
+            await s.execute(text("UPDATE franchise_members SET announce = :st WHERE franchise_id = :f AND hdrezka_id = :h"),
+                            {"st": status, "f": fid, "h": hid})
+        return queued
 
     # ------------------------------------------------------------------ 2: франшизы
 
@@ -311,9 +336,12 @@ class Poller:
     async def cycle(self) -> None:
         async with session() as s:
             self._cycle_new_parts = 0
+            self._reads_left = EVENT_READS
             new_eps, queued = await self.process_updates(s)
             # События и уведомления фиксируем сразу: ниже сверки и чтение страниц ходят на сайт минуты,
             # и откат не должен забирать с собой вышедшие серии.
+            await s.commit()
+            queued += await self.announce_new_parts(s)
             await s.commit()
             fr = await self.refresh_franchises(s)
             pg = await self.refresh_pages(s)

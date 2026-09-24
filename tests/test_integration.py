@@ -11,8 +11,9 @@ from sqlalchemy import select, text
 
 from app import service as svc
 from app.db import session
-from app.models import Episode, Franchise, Page, Schedule, Subscription, User, Voice
+from app.models import Episode, Franchise, FranchiseMember, Page, Schedule, Subscription, User, Voice
 from app.poller import Poller
+from app.rezka.parser import FeedItem
 
 TODAY = date.today()
 _MONTHS = ["января", "февраля", "марта", "апреля", "мая", "июня", "июля", "августа",
@@ -40,14 +41,24 @@ def title_page(hid: int, title: str, season: int, last_ep: int, voices: list, fr
                  + (f'<img title="{f}" alt="{f}" src="f.png">' if f else "") + "</li>" for t, n, f in voices)
     eps = "".join(f'<li class="b-simple_episode__item" data-season_id="{season}" data-episode_id="{e}"></li>'
                   for e in range(1, last_ep + 1))
+    return (f'<div class="b-post__title"><h1>{title}</h1></div>'
+            f"<script>initCDNSeriesEvents({hid}, {voices[0][0]}, {season}, {last_ep}, false)</script>"
+            f"<ul>{tr}</ul><ul>{eps}</ul>{_parts_html(title, franchise)}")
+
+
+def film_page(hid: int, title: str, franchise: list = ()) -> str:
+    """Страница фильма: initCDNMoviesEvents, без списка серий."""
+    return (f'<div class="b-post__title"><h1>{title}</h1></div>'
+            f"<script>initCDNMoviesEvents({hid}, 1, false)</script>{_parts_html(title, franchise)}")
+
+
+def _parts_html(title: str, franchise) -> str:
     parts = "".join(f'<div class="b-post__partcontent_item" data-url="https://rezka.test/series/y/{h}-p.html">'
                     f'<div class="title">{t}</div><div class="year">{y} год</div></div>' for h, t, y in franchise)
     if franchise:
         parts += (f'<div class="b-post__partcontent_item current"><div class="title">{title}</div>'
                   f'<div class="year">{TODAY.year} год</div></div>')
-    return (f'<div class="b-post__title"><h1>{title}</h1></div>'
-            f"<script>initCDNSeriesEvents({hid}, {voices[0][0]}, {season}, {last_ep}, false)</script>"
-            f"<ul>{tr}</ul><ul>{eps}</ul>{parts}")
+    return parts
 
 
 class FakeSite:
@@ -544,3 +555,192 @@ def test_health_sees_that_events_stopped(db):
 
     before, after = db(scenario)
     assert len(before) == 3 and after == []
+
+
+# ----------------------------------------------------------------------------- шаг 1 аудита (24.09.2026)
+
+async def _new_parts_to(user_id: int) -> list[int]:
+    async with session() as s:
+        return sorted((await s.execute(text("""
+            SELECT p.hdrezka_id FROM notifications n JOIN pages p ON p.id = n.ref_id
+             WHERE n.user_id = :u AND n.kind = 'new_part'"""), {"u": user_id})).scalars())
+
+
+async def _known_franchise(s, key: int, name: str = "Сага") -> Franchise:
+    """Франшиза, с которой бот уже знаком: её состав записан (franchise_members)."""
+    fr = Franchise(key_hdrezka_id=key, name=name, refreshed_at=svc.now() - timedelta(days=2))
+    s.add(fr)
+    await s.flush()
+    s.add(FranchiseMember(franchise_id=fr.id, hdrezka_id=key))
+    return fr
+
+
+def _search_card(hid: int, title: str, info: str = "") -> FeedItem:
+    return FeedItem(hid, title, f"https://rezka.test/films/x/{hid}-f.html", "films", info, None, None, False)
+
+
+def test_new_film_seen_first_in_search_is_announced(db):
+    """A. Фильм сначала попал в базу карточкой поиска — раньше о нём не уведомлял никто: новой считалась
+    только страница, которой не было в базе."""
+    async def scenario():
+        async with session() as s:
+            s.add(User(id=50))
+            fr = await _known_franchise(s, 500)
+            series = await _page(s, 500, "Сага", last=(1, 5), rows=[(1, 5)], franchise_id=fr.id)
+            series.page_refreshed_at = svc.now() - timedelta(days=2)
+            await svc.subscribe_franchise(s, 50, fr.id)
+            await svc.upsert_page_from_feed(s, _search_card(600, "Сага: фильм"))
+            await s.commit()
+        site = FakeSite(block({}), {
+            500: title_page(500, "Сага", 1, 5, [(56, "Дубляж", None)], [(600, "Сага: фильм", TODAY.year)]),
+            600: film_page(600, "Сага: фильм", [(500, "Сага", TODAY.year - 1)])})
+        poller = Poller(site)
+        for _ in range(3):
+            await poller.cycle()
+        return await _new_parts_to(50)
+
+    assert db(scenario) == [600]
+
+
+def test_new_film_seen_first_by_the_bot_link_is_announced(db):
+    """A2. Фильм попал в базу, когда бот читал страницу сериала по ссылке: бот не рассылает, поллер сообщает."""
+    async def scenario():
+        async with session() as s:
+            s.add(User(id=51))
+            fr = await _known_franchise(s, 510)
+            await _page(s, 510, "Сага", last=(1, 5), rows=[(1, 5)], franchise_id=fr.id)
+            await svc.subscribe_franchise(s, 51, fr.id)
+            await s.commit()
+        site = FakeSite(block({}), {
+            510: title_page(510, "Сага", 1, 5, [(56, "Дубляж", None)], [(610, "Сага: фильм", TODAY.year)]),
+            610: film_page(610, "Сага: фильм", [(510, "Сага", TODAY.year - 1)])})
+        async with session() as s:                                    # как бот по ссылке
+            await svc.sync_page(s, site, 510, "https://rezka.test/series/y/510-p.html")
+            await s.commit()
+        by_bot = await _new_parts_to(51)
+        poller = Poller(site)
+        for _ in range(2):
+            await poller.cycle()
+        return by_bot, await _new_parts_to(51), site.reads
+
+    by_bot, after, reads = db(scenario)
+    assert by_bot == [], "бот сам ничего не рассылает"
+    assert after == [610] and reads.count(610) == 1, "поллер дочитал тип и сообщил один раз"
+
+
+def test_old_season_from_search_is_not_a_new_part(db):
+    """Старый сезон был в блоке частей при знакомстве с франшизой и позже пришёл из поиска — не новость."""
+    async def scenario():
+        async with session() as s:
+            s.add(User(id=52))
+            page = await _page(s, 720, "Сага [ТВ-2]", last=(2, 3), rows=[(2, 3)], read=False)
+            await svc.subscribe_page(s, 52, page.id)
+            await s.commit()
+        site = FakeSite(block({}), {
+            720: title_page(720, "Сага [ТВ-2]", 2, 3, [(56, "Дубляж", None)], [(650, "Сага [ТВ-1]", 2015)]),
+            650: title_page(650, "Сага [ТВ-1]", 1, 12, [(56, "Дубляж", None)], [(720, "Сага [ТВ-2]", TODAY.year)])})
+        poller = Poller(site)
+        await poller.cycle()                                          # знакомство: состав — baseline
+        async with session() as s:
+            await svc.upsert_page_from_feed(s, _search_card(650, "Сага [ТВ-1]", "Завершен (все серии)"))
+            await s.commit()
+        for _ in range(2):
+            await poller.cycle()
+        async with session() as s:
+            statuses = sorted((await s.execute(text("SELECT announce FROM franchise_members"))).scalars())
+        return await _new_parts_to(52), statuses
+
+    notes, statuses = db(scenario)
+    assert notes == [] and statuses == ["baseline", "baseline"]
+
+
+def test_waiting_subscription_keeps_its_dub_on_the_franchise(db):
+    """D. «Жду продолжения» с фильтром [111]: при переводе на франшизу фильтр сохраняется, а не заменяется
+    озвучкой по умолчанию — иначе пришли бы серии во всех озвучках."""
+    async def scenario():
+        async with session() as s:
+            s.add(User(id=11))
+            fr = Franchise(key_hdrezka_id=220, name="Сага")
+            s.add(fr)
+            await s.flush()
+            old = await _page(s, 220, "Сага [ТВ-1]", last=(1, 12), rows=[(1, 12)], franchise_id=fr.id, finished=True,
+                              voices=[(111, "Студия")])
+            s.add(Subscription(user_id=11, scope="page", page_id=old.id, voice_filter=[111]))
+            await s.commit()
+        voices = [(56, "Дубляж", None), (111, "Студия", None)]
+        site = FakeSite(block({TODAY: [(320, "Сага [ТВ-2]", "series", 2, 1, "Дубляж"),
+                                       (320, "Сага [ТВ-2]", "series", 2, 1, "Студия")]}),
+                        {320: title_page(320, "Сага [ТВ-2]", 2, 1, voices, [(220, "Сага [ТВ-1]", 2020)])})
+        await _run(site)
+        async with session() as s:
+            subs = (await s.execute(select(Subscription.scope, Subscription.voice_filter)
+                                    .where(Subscription.user_id == 11))).all()
+        return subs, await _notifications(11)
+
+    subs, notes = db(scenario)
+    assert subs == [("franchise", [111])]
+    assert notes == [("new_part", None, None), ("voice:111", 2, 1)], "только своя озвучка, без episode"
+
+
+def test_search_card_does_not_erase_film_type(db):
+    """E. Карточка поиска без подписи стирала content_type у прочитанного фильма — и фильм предлагал «Следить»."""
+    async def scenario():
+        async with session() as s:
+            film = await _page(s, 900, "Фильм")
+            film.content_type = "film"
+            await s.commit()
+            page = await svc.upsert_page_from_feed(s, _search_card(900, "Фильм"))
+            await s.commit()
+            return page.content_type, svc.card_state(page, False, False, False)
+
+    assert db(scenario) == ("film", "film")
+
+
+def test_merged_franchises_keep_both_subscribers(db):
+    """F. Страница второй франшизы начала показывать в блоке части первой: франшизы сливаются, и подписчики
+    обеих получают серии. Раньше подписка на вторую оставалась на опустевшей франшизе."""
+    async def scenario():
+        async with session() as s:
+            s.add_all([User(id=8), User(id=9)])
+            fa = await _known_franchise(s, 1100, "Первая")
+            fb = await _known_franchise(s, 1200, "Вторая")
+            await _page(s, 1100, "Первая", last=(1, 3), rows=[(1, 3)], franchise_id=fa.id)
+            await _page(s, 1200, "Вторая", last=(1, 5), rows=[(1, 5)], franchise_id=fb.id)
+            await svc.subscribe_franchise(s, 8, fa.id)
+            s.add(Subscription(user_id=9, scope="franchise", franchise_id=fb.id, voice_filter=[56]))
+            await s.commit()
+        page_1200 = title_page(1200, "Вторая", 1, 5, [(56, "Дубляж", None)], [(1100, "Первая", TODAY.year)])
+        async with session() as s:
+            await svc.sync_page(s, FakeSite("", {1200: page_1200}), 1200, "https://rezka.test/series/y/1200-p.html")
+            await s.commit()
+        await _run(FakeSite(block({TODAY: [(1200, "Вторая", "series", 1, 6, "Дубляж")]})))
+        async with session() as s:
+            franchises = (await s.execute(select(Franchise.id, Franchise.key_hdrezka_id))).all()
+            subs = sorted((await s.execute(select(Subscription.user_id, Subscription.franchise_id))).all())
+        return franchises, subs, await _notifications(8), await _notifications(9)
+
+    franchises, subs, n8, n9 = db(scenario)
+    assert len(franchises) == 1 and franchises[0][1] == 1100, "осталась одна франшиза с минимальным ключом"
+    assert subs == [(8, franchises[0][0]), (9, franchises[0][0])], "обе подписки на неё"
+    assert n8 == [("episode", 1, 6)] and n9 == [("voice:56", 1, 6)]
+
+
+def test_merge_joins_voice_filters_of_one_person(db):
+    """Подписан на обе сливаемые франшизы — одна подписка с объединённым фильтром."""
+    async def scenario():
+        async with session() as s:
+            s.add(User(id=12))
+            fa = await _known_franchise(s, 1300)
+            fb = await _known_franchise(s, 1400)
+            await _page(s, 1300, "Первая", last=(1, 3), franchise_id=fa.id)
+            await _page(s, 1400, "Вторая", last=(1, 5), franchise_id=fb.id)
+            s.add_all([Subscription(user_id=12, scope="franchise", franchise_id=fa.id, voice_filter=[56]),
+                       Subscription(user_id=12, scope="franchise", franchise_id=fb.id, voice_filter=[7])])
+            await s.commit()
+        page = title_page(1400, "Вторая", 1, 5, [(56, "Дубляж", None)], [(1300, "Первая", TODAY.year)])
+        async with session() as s:
+            await svc.sync_page(s, FakeSite("", {1400: page}), 1400, "https://rezka.test/series/y/1400-p.html")
+            await s.commit()
+            return (await s.execute(select(Subscription.scope, Subscription.voice_filter))).all()
+
+    assert db(scenario) == [("franchise", [7, 56])]

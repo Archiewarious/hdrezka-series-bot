@@ -61,6 +61,23 @@ class Franchise(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
+class FranchiseMember(Base):
+    """Состав франшизы таким, каким его показывал блок частей сайта (24.09.2026). Новую часть поллер узнаёт
+    по нему, а не по появлению страницы в базе: бот заносит страницы раньше (поиск, ссылка), и о новом
+    фильме тогда не узнавал никто. announce: baseline — было в составе при знакомстве с франшизой;
+    pending — появилось позже и ждёт уведомления; sent — уведомление поставлено; skipped — старая часть."""
+    __tablename__ = "franchise_members"
+    __table_args__ = (
+        CheckConstraint("announce IN ('baseline', 'pending', 'sent', 'skipped')", name="ck_franchise_member_announce"),
+        Index("franchise_members_pending", "seen_at", postgresql_where=text("announce = 'pending'")),
+    )
+
+    franchise_id: Mapped[int] = mapped_column(ForeignKey("franchises.id", ondelete="CASCADE"), primary_key=True)
+    hdrezka_id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    announce: Mapped[str] = mapped_column(String(8), server_default=text("'baseline'"))
+
+
 class Page(Base):
     """Страница сайта: у сериала — всё шоу, у аниме часто — один сезон, у фильма — фильм."""
     __tablename__ = "pages"
