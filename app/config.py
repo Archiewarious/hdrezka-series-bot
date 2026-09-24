@@ -19,6 +19,10 @@ class Config:
     database_url: str = os.getenv(
         "DATABASE_URL", "postgresql+asyncpg://rezka:rezka@postgres:5432/rezka"
     )
+    # Пул соединений на процесс (24.09.2026): у Postgres 100 соединений на всех, раньше каждый процесс брал до 30.
+    # Бот — 10 + 10 (ответы людям параллельны), поллер и отправщик — 3 + 2 (docker-compose.yml).
+    db_pool_size: int = int(os.getenv("DB_POOL_SIZE", "10"))
+    db_max_overflow: int = int(os.getenv("DB_MAX_OVERFLOW", "10"))
 
     # --- Доступ к сайту ---
     # Зеркала перебираются по порядку при 403/таймауте.

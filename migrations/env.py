@@ -15,16 +15,24 @@ if config.config_file_name is not None:
 config.set_main_option("sqlalchemy.url", cfg.database_url)
 target_metadata = Base.metadata
 
+# Индексы поиска созданы сырым SQL (миграция c3d8e1f2a4b5): выражение norm_title() с gin_trgm_ops в модели не
+# описать, и автогенерация считала бы их лишними и удаляла (24.09.2026).
+SQL_ONLY_INDEXES = {"pages_title_trgm", "pages_orig_trgm"}
+
+
+def include_object(obj, name, type_, reflected, compare_to):
+    return not (type_ == "index" and name in SQL_ONLY_INDEXES)
+
 
 def run_migrations_offline() -> None:
-    context.configure(url=cfg.database_url, target_metadata=target_metadata,
+    context.configure(url=cfg.database_url, target_metadata=target_metadata, include_object=include_object,
                       literal_binds=True, dialect_opts={"paramstyle": "named"})
     with context.begin_transaction():
         context.run_migrations()
 
 
 def _run(connection) -> None:
-    context.configure(connection=connection, target_metadata=target_metadata)
+    context.configure(connection=connection, target_metadata=target_metadata, include_object=include_object)
     with context.begin_transaction():
         context.run_migrations()
 

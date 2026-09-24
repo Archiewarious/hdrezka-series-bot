@@ -79,10 +79,18 @@ async def check(s, at: datetime | None = None, part: str = "all") -> list[str]:
 
 
 async def _main(part: str) -> int:
-    from app.db import engine, session
-    async with session() as s:
-        problems = await check(s, part=part)
-    await engine.dispose()
+    """Healthcheck контейнера — отдельный короткий процесс раз в 5 минут: пул ему не нужен (NullPool), одно
+    соединение открывается и закрывается."""
+    from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
+    from sqlalchemy.pool import NullPool
+
+    from app.db import CONNECT_ARGS
+    engine = create_async_engine(cfg.database_url, poolclass=NullPool, connect_args=CONNECT_ARGS)
+    try:
+        async with AsyncSession(engine) as s:
+            problems = await check(s, part=part)
+    finally:
+        await engine.dispose()
     for p in problems:
         print(p)
     return 1 if problems else 0

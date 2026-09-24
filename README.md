@@ -107,6 +107,15 @@ deploy/restore-check.sh                             # проверить све�
 (7 последних) и копирует на сервер-выход по SSH (`~/rezka-backups`, 30 последних). Адрес сервера и ключ —
 `deploy/backup.env` (образец `backup.env.example`, в git не попадает). Восстановление: `pg_restore -U rezka -d rezka --no-owner < файл.dump`.
 
+Обновление прода — `deploy/update.sh`: свежий бэкап, затем `docker compose up -d --build`.
+
+**Правило для новых CHECK в миграциях (24.09.2026).** Ограничение сначала добавляется `NOT VALID` (сразу, без
+чтения таблицы), затем данные проверяются в самой миграции — нарушители считаются и, если есть, миграция падает
+с понятным сообщением или исправляет их явно, — и только потом `VALIDATE CONSTRAINT`. Иначе `ADD CONSTRAINT`
+на живых данных падает посреди деплоя, и bot, poller, sender не стартуют. Индексы — `CREATE INDEX CONCURRENTLY`
+в `op.get_context().autocommit_block()`. `alembic check` должен проходить: индексы, созданные сырым SQL,
+перечислены в `migrations/env.py` (`SQL_ONLY_INDEXES`).
+
 Схема БД — Alembic (`migrations/`). Изменили `app/models.py` →
 `docker compose run --rm -v $PWD/migrations:/srv/migrations migrate alembic revision --autogenerate -m "…"`,
 применится при следующем `docker compose up`.

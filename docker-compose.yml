@@ -58,6 +58,7 @@ services:
   poller:
     <<: *app
     command: python -m app.poller
+    environment: {DB_POOL_SIZE: "3", DB_MAX_OVERFLOW: "2"}   # поллер ходит в базу по одной единице
     stop_grace_period: 120s  # по SIGTERM поллер доделывает текущую страницу и выходит (app/lifecycle.py)
     # Здоровье — не «цикл завершился», а «события идут» (app/health.py): видно в `docker compose ps`.
     healthcheck:
@@ -74,6 +75,7 @@ services:
   sender:
     <<: *app
     command: python -m app.sender
+    environment: {DB_POOL_SIZE: "3", DB_MAX_OVERFLOW: "2"}
     stop_grace_period: 30s   # по SIGTERM досылает текущее сообщение, остальное взятое — сразу в очередь
     # Здоровье доставки: уведомления не залёживаются, не зависают в повторах и не падают (app/health.py).
     healthcheck:

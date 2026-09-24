@@ -245,3 +245,21 @@ def test_poller_finishes_the_current_page_and_stops(db):
         return done, len(site.reads), fresh
 
     assert db(scenario) == (1, 1, 1)
+
+
+def test_healthcheck_process_runs_on_its_own_engine(db):
+    """Healthcheck контейнера — отдельный процесс раз в 5 минут: своё соединение без пула (NullPool)."""
+    from app import health
+
+    async def scenario():
+        from app import service as svc
+        async with session() as s:
+            for key in ("last_poll_ok", "updates_ok_at"):
+                await svc.meta_set(s, key, svc.now().isoformat())
+            await s.execute(text("INSERT INTO users (id) VALUES (1)"))
+            await s.execute(text("INSERT INTO pages (hdrezka_id, title, url) VALUES (1, 'x', '/x/1-a.html')"))
+            await s.execute(text("INSERT INTO episodes (page_id, season, episode) VALUES (1, 1, 1)"))
+            await s.commit()
+
+    db(scenario)
+    assert asyncio.run(health._main("all")) == 0

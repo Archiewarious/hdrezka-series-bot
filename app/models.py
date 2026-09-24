@@ -174,6 +174,8 @@ class Subscription(Base):
               postgresql_where=text("franchise_id IS NOT NULL")),
         Index("subs_by_page", "page_id"),
         Index("subs_by_franchise", "franchise_id"),
+        # «Мои подписки», календарь, «Новое» ищут по человеку; частичные уникальные индексы выше этого не дают.
+        Index("subs_by_user", "user_id"),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
@@ -193,6 +195,10 @@ class Notification(Base):
     __table_args__ = (
         UniqueConstraint("user_id", "kind", "ref_id", name="uq_notification"),
         Index("notifications_queue", "next_attempt_at", "id", postgresql_where=text("status = 'pending'")),
+        # Возврат зависших «отправляется» (RECOVER_SQL) и очистка отправленного — без чтения всей таблицы.
+        Index("notifications_sending", "next_attempt_at", postgresql_where=text("status = 'sending'")),
+        Index("notifications_done", func.coalesce(text("sent_at"), text("created_at")),
+              postgresql_where=text("status IN ('sent', 'failed')")),
     )
 
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
@@ -221,10 +227,13 @@ class Meta(Base):
 class Feedback(Base):
     """Обращение к автору. Текст не храним — он у автора в Telegram; здесь кто, тема и когда ответили."""
     __tablename__ = "feedback"
-    __table_args__ = (CheckConstraint("topic IN ('bug', 'idea', 'collab', 'other')", name="ck_feedback_topic"),)
+    __table_args__ = (
+        CheckConstraint("topic IN ('bug', 'idea', 'collab', 'other')", name="ck_feedback_topic"),
+        Index("feedback_user", "user_id"),     # имя из миграции c9d0e1f2a3b4; index=True дал бы ix_feedback_user_id
+    )
 
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
-    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"))
     topic: Mapped[str] = mapped_column(String(16))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     answered_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
@@ -234,7 +243,10 @@ class FeedbackLink(Base):
     """Сообщение Telegram, относящееся к обращению: «Ответить» на него находит адресата.
     side='admin' — лежит у автора, ответ уходит человеку; 'user' — лежит у человека, уходит автору."""
     __tablename__ = "feedback_links"
-    __table_args__ = (CheckConstraint("side IN ('admin', 'user')", name="ck_feedback_link_side"),)
+    __table_args__ = (
+        CheckConstraint("side IN ('admin', 'user')", name="ck_feedback_link_side"),
+        Index("feedback_links_by_feedback", "feedback_id"),   # каскадное удаление обращения — без чтения всей таблицы
+    )
 
     chat_id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
     message_id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
