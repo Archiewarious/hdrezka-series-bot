@@ -10,6 +10,5 @@ deploy/backup.env
 .pytest_cache
 .ruff_cache
 *.dump
-*.dump.age
 docs
 tools
