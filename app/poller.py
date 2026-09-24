@@ -132,9 +132,6 @@ class Poller:
 
     # ------------------------------------------------------------------ 1: блок обновлений
 
-    def _abs(self, url: str) -> str:
-        return url if url.startswith("http") else f"{self.client.base_url}{url}"
-
     async def process_updates(self, s) -> tuple[int, int]:
         """Блок «Обновления» на главной — единственный источник событий (F13). Курсора нет: блок хранит
         неделю по дням, каждое событие сверяется с базой, и повторный разбор ничего не дублирует.
@@ -174,7 +171,7 @@ class Poller:
         """Одно событие блока → (новых серий, уведомлений)."""
         page = await svc.page_by_hid(s, item.hdrezka_id)
         if page is None:
-            page = await svc.upsert_page_from_update(s, item, self._abs(item.url))
+            page = await svc.upsert_page_from_update(s, item, item.url)
         eid = await svc.find_episode(s, page.id, item.season, item.episode)
         page_max = await svc.max_recorded_episode(s, page.id)
         kind = svc.classify_update(eid is not None, page_max, item.season, item.episode, fresh)

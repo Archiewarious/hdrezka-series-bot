@@ -28,11 +28,15 @@ class Config:
     # SOCKS5 через SSH-туннель на сервер с незабаненным IP.
     proxy: str | None = os.getenv("HDREZKA_PROXY") or None
     impersonate: str = os.getenv("HDREZKA_IMPERSONATE", "chrome")
-    user_agent: str = os.getenv(
-        "HDREZKA_UA",
-        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-        "(KHTML, like Gecko) Chrome/124.0 Safari/537.36",
-    )
+    # Пусто — User-Agent ставит curl_cffi, согласованный с impersonate: свой UA рядом с чужим TLS-отпечатком
+    # выдаёт скрипт (24.09.2026). Задан явно — применяется.
+    user_agent: str = os.getenv("HDREZKA_UA", "")
+    # Домен для кнопок «Смотреть»: в базе адреса страниц хранятся путями (24.09.2026). По умолчанию —
+    # первое зеркало из HDREZKA_BASE_URLS.
+    public_url: str = field(default_factory=lambda: (
+        os.getenv("HDREZKA_PUBLIC_URL") or _list("HDREZKA_BASE_URLS", "https://rezka-ua.tv")[0]).rstrip("/"))
+    # Anubis: выше этой сложности не решаем — сложность 7 это ~4 мин, 8 — час, 9 — 15 ч счёта в потоке.
+    max_pow_difficulty: int = int(os.getenv("MAX_POW_DIFFICULTY", "6"))
 
     # --- Вежливость к сайту ---
     request_delay: float = float(os.getenv("REQUEST_DELAY", "4.0"))   # сек между запросами

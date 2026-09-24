@@ -40,21 +40,42 @@ class PageGone(Exception):
     иначе одна пропавшая страница стоила трёх запросов и выглядела как потеря доступа (24.09.2026)."""
 
 
-def _solve_pow(random_data: str, difficulty: int) -> tuple[str, int]:
-    """Anubis PoW: ищем nonce, при котором sha256(randomData + nonce)
-    начинается с `difficulty` нулей. При difficulty 2 это ~256 хешей."""
+def _solve_pow(random_data: str, difficulty: int, max_attempts: int | None = None) -> tuple[str, int] | None:
+    """Anubis PoW: ищем nonce, при котором sha256(randomData + nonce) начинается с `difficulty` нулей.
+    При difficulty 2 это ~256 хешей. Поток нельзя отменить, поэтому у перебора жёсткий предел:
+    8 × 16^difficulty попыток при ожидаемых 16^difficulty (24.09.2026). Не нашли — None."""
     prefix = "0" * difficulty
-    nonce = 0
-    while True:
+    limit = max_attempts if max_attempts is not None else 8 * 16 ** difficulty
+    for nonce in range(limit):
         digest = hashlib.sha256(f"{random_data}{nonce}".encode()).hexdigest()
         if digest.startswith(prefix):
             return digest, nonce
-        nonce += 1
+    return None
+
+
+def _parse_challenge(html: str) -> dict | None:
+    """Задача Anubis со страницы: id, randomData до 256 символов, сложность — целое. Иначе None."""
+    m = _CHALLENGE_RX.search(html)
+    if not m:
+        return None
+    try:
+        challenge = json.loads(m.group(1))["challenge"]
+        difficulty = int(challenge.get("difficulty", 4))
+    except (ValueError, KeyError, TypeError, AttributeError):
+        return None
+    cid, data = challenge.get("id"), challenge.get("randomData")
+    if not cid or not isinstance(data, str) or len(data) > 256 or difficulty < 0:
+        return None
+    return {"id": str(cid), "randomData": data, "difficulty": difficulty}
+
+
+RETRY_AFTER_MAX = 120      # 429: ждём сколько просят, но не дольше двух минут
 
 
 class RezkaClient:
     def __init__(self) -> None:
         self._session: requests.AsyncSession | None = None
+        self._cookies: list = []           # cookie старой сессии, в т. ч. пропуск Anubis на 30 дней
         self._base_idx = 0
         self._last_request = 0.0
         self._lock = asyncio.Lock()
@@ -67,22 +88,38 @@ class RezkaClient:
         self._base_idx = (self._base_idx + 1) % len(cfg.base_urls)
         log.warning("Переключаюсь на зеркало %s", self.base_url)
 
+    def _make_session(self) -> requests.AsyncSession:
+        """Новая HTTP-сессия. Отдельным методом — тесты подменяют его и в сеть не ходят."""
+        proxies = {"http": cfg.proxy, "https": cfg.proxy} if cfg.proxy else None
+        headers = {
+            "Accept-Language": "ru-RU,ru;q=0.9,en;q=0.8",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        }
+        if cfg.user_agent:
+            headers["User-Agent"] = cfg.user_agent
+        return requests.AsyncSession(impersonate=cfg.impersonate, proxies=proxies,
+                                     timeout=cfg.request_timeout, headers=headers)
+
     async def _ensure_session(self) -> requests.AsyncSession:
         if self._session is None:
-            proxies = (
-                {"http": cfg.proxy, "https": cfg.proxy} if cfg.proxy else None
-            )
-            self._session = requests.AsyncSession(
-                impersonate=cfg.impersonate,
-                proxies=proxies,
-                timeout=cfg.request_timeout,
-                headers={
-                    "User-Agent": cfg.user_agent,
-                    "Accept-Language": "ru-RU,ru;q=0.9,en;q=0.8",
-                    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-                },
-            )
+            self._session = self._make_session()
+            for cookie in self._cookies:           # пропуск Anubis переживает пересоздание сессии
+                self._session.cookies.jar.set_cookie(cookie)
         return self._session
+
+    async def _reset_session(self) -> None:
+        """Сеть/туннель отвалились: старую сессию закрываем (раньше она просто бросалась), cookie переносим."""
+        old, self._session = self._session, None
+        if old is None:
+            return
+        try:
+            self._cookies = list(old.cookies.jar)
+        except Exception:
+            pass
+        try:
+            await old.close()
+        except Exception as exc:
+            log.debug("Старая сессия не закрылась: %s", exc)
 
     async def _throttle(self) -> None:
         """Не быстрее одного запроса в REQUEST_DELAY секунд, с джиттером.
@@ -94,25 +131,26 @@ class RezkaClient:
         self._last_request = time.monotonic()
 
     async def _solve_challenge(self, html: str, target: str) -> bool:
-        """Проходит проверку Anubis. Возвращает True, если получилось."""
-        m = _CHALLENGE_RX.search(html)
-        if not m:
+        """Проходит проверку Anubis. True — получилось. Сложность выше MAX_POW_DIFFICULTY — AccessBlocked сразу:
+        перебор в потоке нельзя отменить, а блокировка клиента держится всё это время."""
+        challenge = _parse_challenge(html)
+        if challenge is None:
+            log.error("Anubis: не разобрал задачу")
             return False
-        try:
-            challenge = json.loads(m.group(1))["challenge"]
-        except (ValueError, KeyError):
-            log.error("Anubis: не разобрал челлендж")
-            return False
-
-        difficulty = int(challenge.get("difficulty", 4))
+        difficulty = challenge["difficulty"]
+        if difficulty > cfg.max_pow_difficulty:
+            log.error("Anubis: сложность %s выше предела %s — не решаю", difficulty, cfg.max_pow_difficulty)
+            raise AccessBlocked(f"Anubis: сложность {difficulty} выше предела {cfg.max_pow_difficulty}")
         log.info("Anubis: решаю PoW, difficulty=%s", difficulty)
 
         started = time.monotonic()
         # PoW считаем в потоке: при высокой difficulty он бы заблокировал event loop.
-        digest, nonce = await asyncio.to_thread(
-            _solve_pow, challenge["randomData"], difficulty
-        )
+        solved = await asyncio.to_thread(_solve_pow, challenge["randomData"], difficulty)
         elapsed_ms = int((time.monotonic() - started) * 1000)
+        if solved is None:
+            log.error("Anubis: решение не найдено за предел попыток (difficulty=%s)", difficulty)
+            return False
+        digest, nonce = solved
 
         s = await self._ensure_session()
         resp = await s.get(
@@ -151,7 +189,7 @@ class RezkaClient:
                 except Exception as exc:  # сеть/туннель отвалился
                     last_error = f"{type(exc).__name__}: {exc}"
                     log.warning("Запрос упал (%s), попытка %s", last_error, attempt + 1)
-                    self._session = None
+                    await self._reset_session()
                     continue
 
                 if resp.status_code == 403:
@@ -164,18 +202,39 @@ class RezkaClient:
                 if resp.status_code in (404, 410):
                     raise PageGone(f"{url}: HTTP {resp.status_code}")
 
+                if resp.status_code == 429:
+                    pause = _retry_after(resp)
+                    last_error = f"HTTP 429, пауза {pause} с"
+                    log.warning("429 от %s: жду %s с", self.base_url, pause)
+                    await asyncio.sleep(pause)
+                    continue
+
+                if resp.status_code >= 500:
+                    pause = min(5 * 2 ** attempt, 60)       # сайт лежит — не долбим, пауза растёт
+                    last_error = f"HTTP {resp.status_code}"
+                    log.warning("%s от %s: жду %s с", resp.status_code, self.base_url, pause)
+                    await asyncio.sleep(pause)
+                    continue
+
                 if resp.status_code != 200:
                     last_error = f"HTTP {resp.status_code}"
                     continue
 
                 if _CHALLENGE_RX.search(resp.text):
-                    if await self._solve_challenge(resp.text, url):
-                        await self._throttle()
-                        resp = await s.request(method, url, data=data, headers=headers,
-                                               allow_redirects=True)
-                        if resp.status_code == 200 and not _CHALLENGE_RX.search(resp.text):
-                            return resp.text
-                    last_error = "не смог пройти проверку Anubis"
+                    try:
+                        if await self._solve_challenge(resp.text, url):
+                            await self._throttle()
+                            resp = await s.request(method, url, data=data, headers=headers,
+                                                   allow_redirects=True)
+                            if resp.status_code == 200 and not _CHALLENGE_RX.search(resp.text):
+                                return resp.text
+                        last_error = "не смог пройти проверку Anubis"
+                    except AccessBlocked:
+                        raise
+                    except Exception as exc:     # сеть или формат ответа — внутри цикла повторов, не наружу
+                        last_error = f"Anubis: {type(exc).__name__}: {exc}"
+                        log.warning("Проверка Anubis упала (%s), попытка %s", last_error, attempt + 1)
+                        await self._reset_session()
                     continue
 
                 return resp.text
@@ -208,3 +267,11 @@ class RezkaClient:
         if self._session is not None:
             await self._session.close()
             self._session = None
+
+
+def _retry_after(resp) -> int:
+    """Retry-After в секундах, не больше RETRY_AFTER_MAX; нет или не число — 30 с."""
+    try:
+        return max(1, min(int(resp.headers.get("Retry-After", "30")), RETRY_AFTER_MAX))
+    except (TypeError, ValueError, AttributeError):
+        return 30

@@ -57,7 +57,8 @@ async def download(url: str) -> bytes | None:
     try:
         async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=POSTER_TIMEOUT)) as http:
             # Без редиректов: иначе проверка адреса выше обходится перенаправлением на внутренний адрес.
-            async with http.get(url, headers={"User-Agent": cfg.user_agent}, allow_redirects=False) as resp:
+            headers = {"User-Agent": cfg.user_agent} if cfg.user_agent else None   # пусто — UA aiohttp
+            async with http.get(url, headers=headers, allow_redirects=False) as resp:
                 if resp.status != 200 or not resp.content_type.startswith("image/"):
                     log.warning("Постер %s: HTTP %s, %s", url, resp.status, resp.content_type)
                     return None

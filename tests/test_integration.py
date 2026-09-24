@@ -902,3 +902,52 @@ def test_refresh_query_does_not_multiply_subscriptions(db):
     plan, old = db(scenario)
     assert max(rows(old[0]["Plan"])) >= 90_000, "сценарий воспроизводит перемножение в старом запросе"
     assert max(rows(plan[0]["Plan"])) < 1000, "без перемножения подписок"
+
+
+# ----------------------------------------------------------------------------- шаг 3 аудита (24.09.2026)
+
+def test_every_write_stores_a_path(db):
+    """pages.url хранился с доменом зеркала — запасные зеркала на страницы тайтлов не действовали."""
+    async def scenario():
+        async with session() as s:
+            await svc.upsert_page_from_feed(s, FeedItem(9001, "Из поиска", "https://mirror-a.test/series/x/9001-a.html",
+                                                        "series", "1 сезон, 2 серия", 1, 2, False))
+            await s.commit()
+        franchise_page = title_page(9002, "Сага", 1, 2, [(56, "Дубляж", None)], [(9003, "Сага: фильм", TODAY.year)])
+        async with session() as s:                                    # как бот по ссылке и поллер
+            await svc.sync_page(s, FakeSite("", {9002: franchise_page}), 9002, "https://mirror-b.test/series/y/9002-p.html")
+            await s.commit()
+        await _run(FakeSite(block({TODAY: [(9004, "Из блока", "series", 1, 1, "Дубляж")]}),
+                            {9004: title_page(9004, "Из блока", 1, 1, [(56, "Дубляж", None)])}))
+        async with session() as s:
+            return dict((await s.execute(text("SELECT hdrezka_id, url FROM pages"))).all())
+
+    urls = db(scenario)
+    assert urls == {9001: "/series/x/9001-a.html", 9002: "/series/y/9002-p.html",
+                    9003: "/series/y/9003-p.html", 9004: "/series/x/9004-t.html"}
+
+
+def test_buttons_are_built_from_the_public_url(db, monkeypatch):
+    import dataclasses
+    from app.bot.main import _render_page_card
+    from app.config import cfg
+    from app.sender import _render, watch_url
+
+    monkeypatch.setattr(svc, "cfg", dataclasses.replace(cfg, public_url="https://public.test"))
+
+    async def scenario():
+        async with session() as s:
+            s.add(User(id=90))
+            page = await _page(s, 9100, "Сериал", last=(1, 3), rows=[(1, 3)], voices=[(56, "Дубляж")])
+            page.url = "/series/x/9100-a.html"
+            await s.commit()
+            eid = await s.scalar(select(Episode.id).where(Episode.page_id == page.id))
+            post = await _render(s, 90, "voice:56", eid, "ru")
+        _, kb = await _render_page_card(90, page.id)
+        site = [b.url for row in kb.inline_keyboard for b in row if b.url and "public.test" in b.url]
+        return post.watch_url, site
+
+    post, site = db(scenario)
+    assert watch_url("/a/1-x.html", 5, 1, 2) == "https://public.test/a/1-x.html#t:5-s:1-e:2"
+    assert post == "https://public.test/series/x/9100-a.html#t:56-s:1-e:3"
+    assert site == ["https://public.test/series/x/9100-a.html"], "«На сайте» в карточке — от публичного домена"

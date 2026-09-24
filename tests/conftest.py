@@ -23,6 +23,19 @@ if TEST_DB:
     os.environ["DATABASE_URL"] = TEST_DB     # до импорта app: движок создаётся из этой переменной
 
 
+@pytest.fixture(autouse=True)
+def no_network(monkeypatch):
+    """Тесты не ходят ни на сайт, ни в Telegram: настоящий HTTP-запрос — ошибка теста (24.09.2026: тест сброса
+    сессии незаметно создал настоящую сессию и сходил на сайт)."""
+    from curl_cffi import requests as curl_requests
+    import aiohttp
+
+    async def forbidden(*args, **kwargs):
+        raise RuntimeError("сеть в тестах запрещена: подмените сессию")
+    monkeypatch.setattr(curl_requests.AsyncSession, "request", forbidden)
+    monkeypatch.setattr(aiohttp.ClientSession, "_request", forbidden)
+
+
 @pytest.fixture(scope="session")
 def html():
     def load(name: str) -> str:

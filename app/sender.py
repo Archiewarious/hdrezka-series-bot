@@ -34,6 +34,7 @@ from app import posters
 from app.config import cfg
 from app.db import init_db, session
 from app.i18n import t
+from app.service import public_url
 
 log = logging.getLogger("sender")
 
@@ -113,8 +114,9 @@ def retry_delay(attempts: int) -> int:
     return min(60 * 2 ** max(attempts - 1, 0), RETRY_MAX)
 
 
-def watch_url(url: str, translator: int | None, season: int, episode: int) -> str:
-    """F18: хвост #t:-s:-e: открывает в плеере нужную озвучку и серию."""
+def watch_url(path: str, translator: int | None, season: int, episode: int) -> str:
+    """F18: хвост #t:-s:-e: открывает в плеере нужную озвучку и серию. Домен — HDREZKA_PUBLIC_URL."""
+    url = public_url(path)
     return f"{url}#t:{translator}-s:{season}-e:{episode}" if translator is not None else url
 
 
@@ -169,7 +171,7 @@ async def _render(s, user_id: int, kind: str, ref_id: int, lang: str = "ru") -> 
             kind=kind, page_id=page_id, title=title,
             text=f"{head}\n\n{name}" + (f"\n🎞 {tail}" if tail else ""),
             line=f"{head}\n{name}" + (f" · {tail}" if tail else ""),
-            watch_url=url, poster_url=poster_url, poster_file_id=file_id,
+            watch_url=public_url(url), poster_url=poster_url, poster_file_id=file_id,
         )
     return None
 

@@ -755,7 +755,7 @@ async def _handle_link(msg: Message, lang: str, hdrezka_id: int, path: str) -> N
             _background(_refine_finished(note, msg.from_user.id, hdrezka_id, page_id, title))
         return
 
-    url = f"{client.base_url}{path}"
+    url = path                     # путь: домен подставит клиент — текущее зеркало (24.09.2026)
     note = await msg.answer(t(lang, "reading_page"))
     try:
         async with session() as s:
@@ -864,10 +864,11 @@ async def _render_page_card(user_id: int, page_id: int, just_created: bool = Fal
         label = (t(lang, "btn_fr_parts_n", n=parts) if state == "follow"
                  else t(lang, "btn_whole_franchise", name=fr.name[:24], n=parts))
         rows.append([(label, f"subf:{fr.id}:{page.id}")])
+    site = [(t(lang, "btn_open_site"), svc.public_url(page.url))] if page.url else []   # нет адреса — нет кнопки
     if page.content_type != "film":
-        rows.append([(t(lang, "btn_schedule"), f"sched:p:{page.id}"), (t(lang, "btn_open_site"), page.url)])
-    else:
-        rows.append([(t(lang, "btn_open_site"), page.url)])
+        rows.append([(t(lang, "btn_schedule"), f"sched:p:{page.id}")] + site)
+    elif site:
+        rows.append(site)
     rows.append([(t(lang, "btn_share"), _share_url(lang, f"p_{page.hdrezka_id}", page.title))])
     return "\n".join(lines) + t(lang, "hint"), _kb(rows)
 

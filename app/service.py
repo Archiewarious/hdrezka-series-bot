@@ -9,6 +9,7 @@ import logging
 import re
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
+from urllib.parse import urlsplit
 
 from sqlalchemy import case, delete, func, or_, select, text, tuple_
 from sqlalchemy.dialects.postgresql import insert as pg_insert
@@ -18,6 +19,7 @@ from app.models import (
     Episode, EpisodeVoice, Franchise, FranchiseMember, Meta, Page, Schedule,
     Subscription, User, Voice,
 )
+from app.config import cfg
 from app.i18n import detect
 from app.rezka.client import RezkaClient
 from app.rezka.parser import FeedItem, ScheduleRow, TitlePage, UpdateItem, franchise_name, parse_title_page
@@ -59,6 +61,25 @@ async def reschedule_pending(s: AsyncSession, user_id: int) -> int:
     return r.rowcount or 0
 
 
+# ----------------------------------------------------------------------------- адреса страниц
+
+def to_path(url: str | None) -> str:
+    """Адрес страницы → путь от корня зеркала (/animation/…/88552-….html). Домен не храним: с абсолютным
+    адресом запасные зеркала не работали для страниц тайтлов — клиент не менял чужой домен (24.09.2026).
+    Все места записи pages.url проходят через эту функцию."""
+    if not url:
+        return ""
+    path = urlsplit(url).path
+    return path if path.startswith("/") else "/" + path
+
+
+def public_url(path: str) -> str:
+    """Путь → ссылка для кнопок «Смотреть» и «На сайте»: домен из HDREZKA_PUBLIC_URL."""
+    if not path or path.startswith("http"):
+        return path
+    return cfg.public_url + path
+
+
 # ----------------------------------------------------------------------------- pages
 
 async def page_by_hid(s: AsyncSession, hdrezka_id: int) -> Page | None:
@@ -87,7 +108,7 @@ async def pages_to_read(s: AsyncSession, limit: int) -> list[Page]:
 
 async def upsert_page_from_feed(s: AsyncSession, item: FeedItem) -> Page:
     """Карточка ленты/поиска знает мало, но это дёшево и всегда свежо."""
-    values = dict(hdrezka_id=item.hdrezka_id, title=item.title, url=item.url,
+    values = dict(hdrezka_id=item.hdrezka_id, title=item.title, url=to_path(item.url),
                   section=item.section, is_finished=item.is_finished,
                   meta_line=item.meta_line, year=year_from_meta(item.meta_line))
     if item.has_episode:
@@ -139,6 +160,7 @@ async def apply_title_page(s: AsyncSession, hdrezka_id: int, url: str, tp: Title
     if tp.hdrezka_id and tp.hdrezka_id != hdrezka_id:
         log.warning("Страница %s отдала id %s (редирект на другое зеркало/слаг?)", hdrezka_id, tp.hdrezka_id)
 
+    url = to_path(url)
     page = await page_by_hid(s, hdrezka_id)
     if page is None:
         page = Page(hdrezka_id=hdrezka_id, title=tp.title or url, url=url)
@@ -292,14 +314,14 @@ async def _apply_franchise(s: AsyncSession, page: Page, tp: TitlePage) -> Franch
             continue
         existing = await page_by_hid(s, part.hdrezka_id)
         if existing is None:
-            s.add(Page(hdrezka_id=part.hdrezka_id, title=part.title, url=part.url or "",
+            s.add(Page(hdrezka_id=part.hdrezka_id, title=part.title, url=to_path(part.url),
                        year=part.year, franchise_id=fr.id))
         else:
             existing.franchise_id = fr.id
             if part.year and not existing.year:
                 existing.year = part.year
             if part.url and not existing.url:     # у анонса страницы ещё не было — появилась
-                existing.url = part.url
+                existing.url = to_path(part.url)
     page.franchise_id = fr.id
     await s.flush()
 
@@ -468,7 +490,7 @@ async def upsert_page_from_update(s: AsyncSession, item: UpdateItem, url: str) -
     (тип, франшиза, озвучки, постер) дочитает очередь чтения — page_refreshed_at пуст."""
     page = await page_by_hid(s, item.hdrezka_id)
     if page is None:
-        page = Page(hdrezka_id=item.hdrezka_id, title=item.title, url=url, section=item.section)
+        page = Page(hdrezka_id=item.hdrezka_id, title=item.title, url=to_path(url), section=item.section)
         s.add(page)
         await s.flush()
     return page
