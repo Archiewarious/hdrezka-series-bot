@@ -33,7 +33,7 @@ from app.config import cfg
 from app.db import init_db, session
 from app.i18n import DETECT_FALLBACK, LANGS, fmt_date, t, when
 from app.models import Episode, Franchise, Page, Schedule, Subscription, User, Voice
-from app.rezka.client import AccessBlocked, RezkaClient
+from app.rezka.client import AccessBlocked, PageGone, RezkaClient
 from app.rezka.parser import FeedItem, parse_feed
 from app import feedback
 from app.sender import fit_button, watch_url
@@ -458,7 +458,15 @@ async def cmd_stats(msg: Message) -> None:
         sent = await s.scalar(text("SELECT count(*) FROM notifications WHERE status = 'sent'"))
         langs = (await s.execute(text("SELECT lang, count(*) FROM users GROUP BY lang ORDER BY 2 DESC"))).all()
         last = await svc.meta_get(s, "last_poll_ok")
+        refresh_ok = await svc.meta_get(s, "refresh_ok_at")
+        refresh_failed = await svc.meta_get(s, "refresh_failed") or "0"
         events = await svc.meta_get(s, "updates_events")
+        # Только страницы, которые кому-то важны: у каталога неудачных страниц много, и это не сигнал.
+        failing, gone = (await s.execute(text("""
+            SELECT count(*) FILTER (WHERE p.read_failures > 0 AND p.gone_at IS NULL), count(*) FILTER (WHERE p.gone_at IS NOT NULL)
+              FROM pages p
+             WHERE EXISTS (SELECT 1 FROM subscriptions sub
+                            WHERE sub.page_id = p.id OR sub.franchise_id = p.franchise_id)"""))).one()
         problems = await health.check(s)
     await msg.answer(
         "".join(f"⚠️ {p}\n" for p in problems)
@@ -467,6 +475,8 @@ async def cmd_stats(msg: Message) -> None:
         f"Страниц в базе: {pages} (не прочитано {unread}), франшиз: {frs}\n"
         f"Уведомлений: в очереди {pending}, отправлено (7 дн.) {sent}\n"
         f"Последний обход: {last}\n"
+        f"Обновление страниц: {refresh_ok}, ошибок в последнем: {refresh_failed}\n"
+        f"Страницы с подписчиками: не читается {failing}, пропали с сайта {gone}\n"
         f"Событий в блоке обновлений: {events}")
 
 
@@ -752,6 +762,9 @@ async def _handle_link(msg: Message, lang: str, hdrezka_id: int, path: str) -> N
             res = await _site(svc.sync_page(s, client, hdrezka_id, url))
             await s.commit()
             page_id, title = res.page.id, res.page.title
+    except PageGone:
+        await note.edit_text(t(lang, "link_gone"))
+        return
     except (AccessBlocked, asyncio.TimeoutError):
         await note.edit_text(t(lang, "busy"))
         return
@@ -939,7 +952,7 @@ async def cb_subscribe(cb: CallbackQuery) -> None:
             async with session() as s:
                 await _site(svc.sync_page(s, client, hid, url))
                 await s.commit()
-        except (AccessBlocked, asyncio.TimeoutError):
+        except (AccessBlocked, PageGone, asyncio.TimeoutError):
             log.warning("Не прочитал страницу %s после подписки", hid)
 
     if send_new:
@@ -1024,6 +1037,8 @@ async def _prefetch_parts(m: Message, user_id: int, fid: int, origin: int | None
                 await _site(svc.sync_page(s, client, hid, url))
                 await s.commit()
             done += 1
+        except PageGone:
+            continue
         except (AccessBlocked, asyncio.TimeoutError):
             break
     if done:
@@ -1329,11 +1344,13 @@ async def _render_my(user_id: int, page: int = 0):
                                        Page.last_episode.isnot(None), func.coalesce(Page.content_type, "series") != "film")
                     .order_by(Page.year.desc().nulls_last(), Page.id.desc()))).scalars().all()
                 title, airing, waiting, page_ids = fr.name, (parts[0] if parts else None), False, [x.id for x in parts]
+                gone = False
             else:
                 pg = await s.get(Page, sub.page_id)
                 waiting = pg.is_finished and pg.content_type != "film"
                 airing = pg if (not pg.is_finished and pg.last_episode) else None
                 title, page_ids = pg.title, [pg.id]
+                gone = pg.gone_at is not None
             nxt = None
             if page_ids and not waiting:
                 nxt = (await s.execute(
@@ -1346,16 +1363,19 @@ async def _render_my(user_id: int, page: int = 0):
             voice = (", ".join(chosen[:2]) + (f" +{len(chosen) - 2}" if len(chosen) > 2 else "")) if chosen \
                 else t(lang, "voice_any")
             entries.append(((waiting, airing is None, nxt.air_date if nxt else date.max, title.lower()),
-                            sub, title, airing, nxt, voice, waiting))
+                            sub, title, airing, nxt, voice, waiting, gone))
     entries.sort(key=lambda e: e[0])
 
     pages = -(-len(entries) // MY_PAGE_MAX)
     size = -(-len(entries) // pages)
     page = max(0, min(page, pages - 1))
     lines, rows = [t(lang, "my_head", n=len(entries))], []
-    for _, sub, title, airing, nxt, voice, waiting in entries[page * size:(page + 1) * size]:
+    for _, sub, title, airing, nxt, voice, waiting, gone in entries[page * size:(page + 1) * size]:
         icon = "🔔" if waiting else "📺"
-        if waiting:
+        if gone:
+            # Страница пропала с сайта (404): сообщений не шлём, только пометка здесь (решение владельца 3).
+            detail = t(lang, "my_gone")
+        elif waiting:
             detail = t(lang, "my_waiting")
         else:
             bits = [f"{airing.last_season}×{airing.last_episode}" if airing else t(lang, "my_nothing_airing")]

@@ -13,6 +13,7 @@ from app import service as svc
 from app.db import session
 from app.models import Episode, Franchise, FranchiseMember, Page, Schedule, Subscription, User, Voice
 from app.poller import Poller
+from app.rezka.client import PageGone
 from app.rezka.parser import FeedItem
 
 TODAY = date.today()
@@ -71,9 +72,13 @@ class FakeSite:
         return self._home
 
     async def title_page(self, url: str) -> str:
+        """Значение-исключение (PageGone, AccessBlocked…) — страница отвечает этой ошибкой."""
         hid = int(re.search(r"/(\d+)-", url).group(1))
         self.reads.append(hid)
-        return self._pages[hid]
+        page = self._pages[hid]
+        if isinstance(page, BaseException):
+            raise page
+        return page
 
     async def close(self) -> None:
         pass
@@ -332,12 +337,8 @@ def test_episode_that_missed_the_updates_block_is_caught_when_the_page_is_reread
             await s.commit()
         site = FakeSite("", {963: title_page(963, "Сериал", 1, 12,
                                              [(56, "Дубляж", None), (238, "Оригинал (+субтитры)", None)])})
-        async with session() as s:
-            await Poller(site).refresh_pages(s)
-            await s.commit()
-        async with session() as s:                                # второй проход не дублирует
-            await Poller(site).refresh_pages(s)
-            await s.commit()
+        await Poller(site).refresh_pages()
+        await Poller(site).refresh_pages()                        # второй проход не дублирует
         return await _notifications(31), await _notifications(32)
 
     any_voice, dubbed = db(scenario)
@@ -744,3 +745,160 @@ def test_merge_joins_voice_filters_of_one_person(db):
             return (await s.execute(select(Subscription.scope, Subscription.voice_filter))).all()
 
     assert db(scenario) == [("franchise", [7, 56])]
+
+
+# ----------------------------------------------------------------------------- шаг 2 аудита (24.09.2026)
+
+def _ago(**kw):
+    return svc.now() - timedelta(**kw)
+
+
+def test_gone_pages_do_not_block_the_refresh_queue(db):
+    """Две пропавшие страницы (404) стояли первыми в очереди обновления и после неудачи снова оказывались
+    первыми: живая страница не обновлялась никогда. Теперь 713 читается в первом же цикле, а 711 и 712
+    во втором не запрашиваются — у них время следующей попытки через сутки."""
+    async def scenario():
+        async with session() as s:
+            s.add(User(id=71))
+            for hid, age in ((711, dict(days=2)), (712, dict(days=2)), (713, dict(hours=13))):
+                page = await _page(s, hid, f"Сериал {hid}", last=(1, 3), rows=[(1, 3)])
+                page.page_refreshed_at = _ago(**age)
+                await svc.subscribe_page(s, 71, page.id)
+            await s.commit()
+        site = FakeSite("", {711: PageGone("404"), 712: PageGone("404"),
+                             713: title_page(713, "Сериал 713", 1, 3, [(56, "Дубляж", None)])})
+        first = await Poller(site).refresh_pages()
+        reads_first = list(site.reads)
+        await Poller(site).refresh_pages()
+        async with session() as s:
+            gone = (await s.execute(text("SELECT hdrezka_id FROM pages WHERE gone_at IS NOT NULL "
+                                         "AND next_read_at > now() + interval '23 hours' ORDER BY 1"))).scalars().all()
+        return first, reads_first, site.reads, gone
+
+    first, reads_first, reads, gone = db(scenario)
+    assert first == 1 and 713 in reads_first, "живая страница прочитана в первом цикле"
+    assert reads == reads_first, "во втором цикле пропавшие не запрашиваются"
+    assert gone == [711, 712]
+
+
+def test_franchise_is_checked_by_another_part_when_anchor_is_gone(db):
+    async def scenario():
+        async with session() as s:
+            s.add(User(id=72))
+            fr = await _known_franchise(s, 741)
+            await _page(s, 741, "Сага [ТВ-1]", last=(1, 3), franchise_id=fr.id)
+            await _page(s, 742, "Сага [ТВ-2]", last=(2, 3), franchise_id=fr.id)   # якорь: выходящий, id больше
+            await svc.subscribe_franchise(s, 72, fr.id)
+            await s.commit()
+        parts = [(741, "Сага [ТВ-1]", 2020), (742, "Сага [ТВ-2]", TODAY.year)]
+        site = FakeSite("", {742: PageGone("404"),
+                             741: title_page(741, "Сага [ТВ-1]", 1, 3, [(56, "Дубляж", None)], parts[1:])})
+        poller = Poller(site)
+        first = await poller.refresh_franchises()
+        second = await poller.refresh_franchises()
+        async with session() as s:
+            fr_row = (await s.execute(text("SELECT refreshed_at > now() - interval '1 minute', refresh_failures "
+                                           "FROM franchises"))).one()
+        return first, second, site.reads, tuple(fr_row)
+
+    first, second, reads, fr_row = db(scenario)
+    assert (first, second) == (0, 1) and reads == [742, 741], "после пропажи якоря — сверка по другой части"
+    assert fr_row == (True, 0)
+
+
+def test_error_on_one_page_does_not_roll_back_the_others(db):
+    """Вторая часть цикла шла одной транзакцией: ошибка одной страницы откатывала уже прочитанные."""
+    async def scenario():
+        async with session() as s:
+            ok = await _page(s, 752, "Живая", read=False)
+            bad = await _page(s, 751, "Кривая", read=False)
+            ok.created_at, bad.created_at = svc.now(), _ago(hours=1)   # живая раньше в очереди: ошибка — после неё
+            await s.commit()
+        site = FakeSite(block({}), {751: RuntimeError("вёрстка"), 752: title_page(752, "Живая", 1, 2, [(56, "Дубляж", None)])})
+        await Poller(site).cycle()
+        async with session() as s:
+            rows = dict((await s.execute(text("SELECT hdrezka_id, (page_refreshed_at IS NOT NULL, read_failures) "
+                                              "FROM pages"))).all())
+            meta = (await svc.meta_get(s, "refresh_failed"), await svc.meta_get(s, "refresh_ok_at") is not None)
+        return site.reads, rows, meta
+
+    reads, rows, meta = db(scenario)
+    assert reads == [752, 751]
+    assert rows[752] == (True, 0) and rows[751] == (False, 1), "живая записана, кривая отмечена и ждёт"
+    assert meta == ("1", True)
+
+
+def test_refresh_query_selects_the_same_as_before(db):
+    """Новый запрос (EXISTS) выбирает то же, что старый (два LEFT JOIN), для всех сочетаний
+    «завершён / идёт» × «подписка на страницу / на франшизу»."""
+    old_sql = text("""
+        SELECT DISTINCT p.page_refreshed_at, p.id FROM pages p
+          LEFT JOIN subscriptions sp ON sp.page_id = p.id
+          LEFT JOIN subscriptions sf ON sf.franchise_id = p.franchise_id
+         WHERE (sp.id IS NOT NULL OR sf.id IS NOT NULL)
+           AND (NOT p.is_finished OR sp.id IS NOT NULL)
+           AND p.url <> '' AND coalesce(p.content_type, 'series') = 'series'
+           AND (p.page_refreshed_at IS NULL OR p.page_refreshed_at < now() - CASE WHEN p.is_finished
+                    THEN make_interval(days => :d) ELSE make_interval(hours => :h) END)
+         ORDER BY p.page_refreshed_at NULLS FIRST LIMIT :lim""")
+
+    async def scenario():
+        async with session() as s:
+            s.add(User(id=73))
+            n = 760
+            for finished in (False, True):
+                for scope in ("page", "franchise"):
+                    n += 1
+                    fr = Franchise(key_hdrezka_id=n, name=f"Ф{n}")
+                    s.add(fr)
+                    await s.flush()
+                    page = await _page(s, n, f"Стр {n}", last=(1, 2), franchise_id=fr.id, finished=finished)
+                    page.page_refreshed_at = _ago(days=8)
+                    await s.flush()
+                    s.add(Subscription(user_id=73, scope=scope, page_id=page.id if scope == "page" else None,
+                                       franchise_id=fr.id if scope == "franchise" else None))
+            await _page(s, 799, "Без подписки")
+            await s.commit()
+            params = {"d": 7, "h": 12, "lim": 100}
+            old = sorted(r[1] for r in (await s.execute(old_sql, params)).all())
+            new = sorted((await s.execute(Poller.REFRESH_SQL, params)).scalars().all())
+            hids = dict((await s.execute(text("SELECT id, hdrezka_id FROM pages"))).all())
+        return old, new, sorted(hids[i] for i in new)
+
+    old, new, hids = db(scenario)
+    assert old == new and hids == [761, 762, 763], "идущие — по любой подписке, завершённые — только по своей"
+
+
+def test_refresh_query_does_not_multiply_subscriptions(db):
+    """300 подписок на страницу и 300 на её франшизу: старый запрос строил 90 000 строк, новый — нет."""
+    async def scenario():
+        async with session() as s:
+            fr = Franchise(key_hdrezka_id=800, name="Популярная")
+            s.add(fr)
+            await s.flush()
+            page = await _page(s, 800, "Популярная", last=(1, 2), franchise_id=fr.id)
+            page.page_refreshed_at = _ago(days=2)
+            await s.flush()
+            await s.execute(text("INSERT INTO users (id) SELECT g FROM generate_series(1, 600) g"))
+            await s.execute(text("INSERT INTO subscriptions (user_id, scope, page_id) "
+                                 "SELECT g, 'page', :p FROM generate_series(1, 300) g"), {"p": page.id})
+            await s.execute(text("INSERT INTO subscriptions (user_id, scope, franchise_id) "
+                                 "SELECT g, 'franchise', :f FROM generate_series(301, 600) g"), {"f": fr.id})
+            await s.commit()
+            sql = Poller.REFRESH_SQL.text.replace(":d", "7").replace(":h", "12").replace(":lim", "6")
+            plan = (await s.execute(text("EXPLAIN (ANALYZE, FORMAT JSON) " + sql))).scalar()
+            old = (await s.execute(text("""EXPLAIN (ANALYZE, FORMAT JSON)
+                SELECT DISTINCT p.page_refreshed_at, p.id FROM pages p
+                  LEFT JOIN subscriptions sp ON sp.page_id = p.id
+                  LEFT JOIN subscriptions sf ON sf.franchise_id = p.franchise_id
+                 WHERE (sp.id IS NOT NULL OR sf.id IS NOT NULL)"""))).scalar()
+        return plan, old
+
+    def rows(node):
+        yield node.get("Actual Rows", 0) * node.get("Actual Loops", 1)
+        for child in node.get("Plans", []):
+            yield from rows(child)
+
+    plan, old = db(scenario)
+    assert max(rows(old[0]["Plan"])) >= 90_000, "сценарий воспроизводит перемножение в старом запросе"
+    assert max(rows(plan[0]["Plan"])) < 1000, "без перемножения подписок"

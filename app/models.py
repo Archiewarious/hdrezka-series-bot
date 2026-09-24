@@ -59,6 +59,9 @@ class Franchise(Base):
     name: Mapped[str] = mapped_column(Text)
     refreshed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    # Сверка состава не удалась — следующая попытка через 1, 2, 4… часа, не реже раза в сутки (24.09.2026)
+    refresh_failures: Mapped[int] = mapped_column(SmallInteger, default=0, server_default=text("0"))
+    next_refresh_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 
 class FranchiseMember(Base):
@@ -106,6 +109,11 @@ class Page(Base):
         ForeignKey("franchises.id", ondelete="SET NULL")
     )
     page_refreshed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    # Неудачи чтения (24.09.2026): одна недоступная страница не должна держать очередь. 404/410 — gone_at и
+    # попытка через 1, 2, 4… дня (не реже раза в 30 дней); другая ошибка — через 1, 2, 4… часа (не реже раза в сутки).
+    read_failures: Mapped[int] = mapped_column(SmallInteger, default=0, server_default=text("0"))
+    next_read_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    gone_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     last_event_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 

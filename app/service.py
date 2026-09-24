@@ -1,7 +1,7 @@
 """Доменные операции над БД, общие для поллера и бота.
 
-Здесь нет знания о Telegram и нет прямых HTTP-запросов, кроме sync_page(),
-который читает страницу через RezkaClient и раскладывает её по таблицам.
+Здесь нет знания о Telegram и нет прямых HTTP-запросов, кроме fetch_title_page() (и обёртки sync_page()),
+которая читает страницу через RezkaClient; apply_title_page() раскладывает прочитанное по таблицам.
 """
 from __future__ import annotations
 
@@ -77,6 +77,7 @@ async def pages_to_read(s: AsyncSession, limit: int) -> list[Page]:
     rows = await s.execute(text("""
         SELECT p.id FROM pages p
          WHERE p.page_refreshed_at IS NULL AND p.url <> ''
+           AND (p.next_read_at IS NULL OR p.next_read_at <= now())   -- неудачная — ждёт своего времени
          ORDER BY EXISTS (SELECT 1 FROM subscriptions sub
                            WHERE sub.page_id = p.id OR sub.franchise_id = p.franchise_id) DESC,
                   p.created_at DESC
@@ -121,12 +122,20 @@ class SyncResult:
     episodes: dict[int, list[int]]   # сезон → серии по списку на странице (озвучка по умолчанию)
 
 
+async def fetch_title_page(client: RezkaClient, url: str) -> TitlePage:
+    """Только запрос к сайту и разбор — без базы: транзакция не держится открытой, пока ждём сайт."""
+    return parse_title_page(await client.title_page(url), url)
+
+
 async def sync_page(s: AsyncSession, client: RezkaClient, hdrezka_id: int, url: str) -> SyncResult:
-    """Читает страницу тайтла и обновляет pages / voices / schedule / franchises.
-    Один HTTP-запрос. Новые части франшизы только дописывает в состав (franchise_members, pending):
-    уведомляет о них поллер (announce_new_parts), кто бы ни прочитал страницу — бот или поллер."""
-    html = await client.title_page(url)
-    tp = parse_title_page(html, url)
+    """Читает страницу тайтла и раскладывает её по таблицам: fetch_title_page + apply_title_page."""
+    return await apply_title_page(s, hdrezka_id, url, await fetch_title_page(client, url))
+
+
+async def apply_title_page(s: AsyncSession, hdrezka_id: int, url: str, tp: TitlePage) -> SyncResult:
+    """Обновляет pages / voices / schedule / franchises по прочитанной странице. Новые части франшизы
+    только дописывает в состав (franchise_members, pending): уведомляет о них поллер (announce_new_parts),
+    кто бы ни прочитал страницу — бот или поллер."""
     if tp.hdrezka_id and tp.hdrezka_id != hdrezka_id:
         log.warning("Страница %s отдала id %s (редирект на другое зеркало/слаг?)", hdrezka_id, tp.hdrezka_id)
 
@@ -152,6 +161,7 @@ async def sync_page(s: AsyncSession, client: RezkaClient, hdrezka_id: int, url: 
     elif tp.current_season is not None:
         page.last_season, page.last_episode = tp.current_season, tp.current_episode
     page.page_refreshed_at = now()
+    page.read_failures, page.next_read_at, page.gone_at = 0, None, None     # прочиталась — неудачи забыты
 
     # Озвучки — заменяем целиком: список на сайте авторитетен.
     await s.execute(delete(Voice).where(Voice.page_id == page.id))
@@ -353,13 +363,37 @@ async def _merge_franchise(s: AsyncSession, src: Franchise, dst: Franchise) -> N
 
 
 async def franchise_anchor(s: AsyncSession, franchise_id: int) -> Page | None:
-    """Любая часть годится (блок одинаковый) — но предпочитаем выходящий сериал:
-    заодно обновим его расписание."""
+    """Любая часть годится (блок одинаковый) — но предпочитаем выходящий сериал: заодно обновим его
+    расписание. Пропавшие с сайта и ждущие своей попытки после неудачи не берём — сверка идёт по другой."""
     return await s.scalar(
-        select(Page).where(Page.franchise_id == franchise_id, Page.url != "")
+        select(Page).where(Page.franchise_id == franchise_id, Page.url != "", Page.gone_at.is_(None),
+                           or_(Page.next_read_at.is_(None), Page.next_read_at <= func.now()))
         .order_by(Page.is_finished.asc(), (Page.content_type == "series").desc(), Page.id.desc())
         .limit(1)
     )
+
+
+async def mark_read_failure(s: AsyncSession, page_id: int, gone: bool) -> None:
+    """Страница не прочиталась. 404/410 — пропала с сайта: попытка через 1, 2, 4… дня, не реже раза в 30 дней;
+    другая ошибка — через 1, 2, 4… часа, не реже раза в сутки. Успешное чтение всё обнуляет (apply_title_page)."""
+    await s.execute(text("""
+        UPDATE pages
+           SET gone_at = CASE WHEN CAST(:gone AS boolean) THEN coalesce(gone_at, now()) ELSE gone_at END,
+               next_read_at = now() + CASE WHEN CAST(:gone AS boolean)
+                   THEN least(make_interval(days => CAST(power(2, least(read_failures, 5)) AS int)), interval '30 days')
+                   ELSE least(make_interval(hours => CAST(power(2, least(read_failures, 5)) AS int)), interval '1 day') END,
+               read_failures = least(read_failures + 1, 100)
+         WHERE id = :id"""), {"id": page_id, "gone": gone})
+
+
+async def mark_refresh_failure(s: AsyncSession, franchise_id: int) -> None:
+    """Сверка франшизы не удалась: следующая через 1, 2, 4… часа, не реже раза в сутки."""
+    await s.execute(text("""
+        UPDATE franchises
+           SET next_refresh_at = now() + least(make_interval(hours => CAST(power(2, least(refresh_failures, 5)) AS int)),
+                                              interval '1 day'),
+               refresh_failures = least(refresh_failures + 1, 100)
+         WHERE id = :id"""), {"id": franchise_id})
 
 
 # ----------------------------------------------------------------------------- episodes & fan-out

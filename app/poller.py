@@ -22,7 +22,7 @@ from app import service as svc
 from app.config import cfg
 from app.db import engine, init_db, session
 from app.models import Episode, Franchise, Page
-from app.rezka.client import AccessBlocked, RezkaClient
+from app.rezka.client import AccessBlocked, PageGone, RezkaClient
 from app.rezka.parser import UpdateItem, match_voice, parse_updates
 
 log = logging.getLogger("poller")
@@ -37,18 +37,25 @@ PER_CYCLE_FRANCHISES = 2                # чтобы обход не растя�
 PER_CYCLE_PAGES = 2
 PER_CYCLE_READS = 8                     # очередь чтения каталога
 PER_CYCLE_ANNOUNCE = 5                  # новых частей франшиз за цикл
-READ_GIVE_UP_AFTER = 3                  # страница не читается N раз подряд → идём дальше без неё
+READ_GIVE_UP_AFTER = 3                  # страница не читается N раз подряд → событие идёт без чтения
+REFRESH_CANDIDATES = 3                  # кандидатов на единицу квоты: неудачные не съедают слоты живых
 
 
 class Deferred(Exception):
-    """Событию нужно чтение страницы, а лимит цикла исчерпан. Разберём в следующем цикле: блок хранит
-    событие неделю, а от этой попытки в базе ничего не осталось — точка сохранения откатилась."""
+    """Событию нужно чтение страницы, а лимит цикла исчерпан или страница не прочиталась. Разберём
+    в следующем цикле: блок хранит событие неделю, а от этой попытки в базе ничего не осталось — точка
+    сохранения откатилась. failed_page_id — неудачу чтения записываем уже после отката."""
+
+    def __init__(self, failed_page_id: int | None = None) -> None:
+        super().__init__()
+        self.failed_page_id = failed_page_id
 
 
 class Poller:
     def __init__(self, client: RezkaClient | None = None) -> None:
         self.client = client or RezkaClient()
-        self._read_failures: dict[int, int] = {}
+        self._failed_now: set[int] = set()      # страницы, не прочитавшиеся в этом цикле: второй раз не просим
+        self._refresh_failed = 0                # единиц второй части цикла с ошибкой — в meta и /stats
         self._cycle_new_parts = 0               # уведомлений new_part за цикл — для строки лога
         self._reads_left = EVENT_READS          # на цикл: блок обновлений, новые части; сбрасывает cycle()
 
@@ -81,7 +88,7 @@ class Poller:
                     if part.page_refreshed_at is None and part.url:      # тип и статус части — со страницы
                         try:
                             await svc.sync_page(s, self.client, part.hdrezka_id, part.url)
-                        except AccessBlocked as exc:
+                        except (AccessBlocked, PageGone) as exc:
                             log.warning("Не прочитал часть %s для ждущего продолжения: %s", part.hdrezka_id, exc)
             # Выбранная озвучка переходит в подписку на франшизу; несколько ждавших — объединение (24.09.2026).
             voices = svc.merge_voice_filters(*(v for _, v in waited_list))
@@ -95,24 +102,32 @@ class Poller:
 
     async def _read(self, s, page: Page, required: bool) -> bool:
         """Чтение страницы ради события. Обязательное — новая серия на непрочитанной странице: без привязки
-        к франшизе её подписчики уведомления не получат; при исчерпанном лимите событие откладывается.
-        Необязательное — обновить список озвучек: берёт не больше половины лимита и просто пропускается."""
-        if self._reads_left <= (0 if required else EVENT_READS // 2):
+        к франшизе её подписчики уведомления не получат; при исчерпанном лимите или неудаче событие
+        откладывается, после READ_GIVE_UP_AFTER неудач подряд — идёт без чтения. Необязательное — обновить
+        список озвучек: берёт не больше половины лимита и просто пропускается. Неудачи — в базе (pages)."""
+        if required and page.read_failures >= READ_GIVE_UP_AFTER:
+            return False
+        waiting = page.id in self._failed_now or (page.next_read_at is not None and page.next_read_at > svc.now())
+        if waiting or self._reads_left <= (0 if required else EVENT_READS // 2):
             if required:
                 raise Deferred()
             return False
         self._reads_left -= 1
         try:
             await self.sync(s, page.hdrezka_id, page.url)
-            self._read_failures.pop(page.hdrezka_id, None)
             return True
+        except PageGone as exc:
+            log.warning("Страница %s пропала с сайта, событие без чтения: %s", page.hdrezka_id, exc)
+            await svc.mark_read_failure(s, page.id, gone=True)
+            self._failed_now.add(page.id)
+            return False
         except AccessBlocked as exc:
-            n = self._read_failures[page.hdrezka_id] = self._read_failures.get(page.hdrezka_id, 0) + 1
-            if required and n < READ_GIVE_UP_AFTER:
-                log.warning("Страница %s не прочиталась ради события (%s-й раз), повторю в следующем цикле: %s",
-                            page.hdrezka_id, n, exc)
-                raise Deferred() from exc
+            self._failed_now.add(page.id)
+            if required and page.read_failures + 1 < READ_GIVE_UP_AFTER:
+                log.warning("Страница %s не прочиталась ради события, повторю позже: %s", page.hdrezka_id, exc)
+                raise Deferred(failed_page_id=page.id) from exc
             log.warning("Страница %s не прочиталась ради события, иду дальше без неё: %s", page.hdrezka_id, exc)
+            await svc.mark_read_failure(s, page.id, gone=False)
             return False
 
     # ------------------------------------------------------------------ 1: блок обновлений
@@ -138,8 +153,10 @@ class Poller:
                 # Точка сохранения на событие: одна кривая страница не откатывает весь проход.
                 async with s.begin_nested():
                     e, q = await self._apply_update(s, item, fresh)
-            except Deferred:
+            except Deferred as d:
                 deferred += 1
+                if d.failed_page_id:                    # точка сохранения откатилась — неудачу пишем вне её
+                    await svc.mark_read_failure(s, d.failed_page_id, gone=False)
                 continue
             except AccessBlocked:
                 raise
@@ -217,6 +234,9 @@ class Poller:
                 self._reads_left -= 1
                 try:
                     await self.sync(s, page.hdrezka_id, page.url)
+                except PageGone as exc:
+                    await svc.mark_read_failure(s, page.id, gone=True)
+                    log.warning("Новая часть %s пропала с сайта: %s — сообщу без типа", hid, exc)
                 except AccessBlocked as exc:
                     log.warning("Не прочитал новую часть %s: %s — сообщу без типа", hid, exc)
             status = "skipped"
@@ -230,57 +250,117 @@ class Poller:
                             {"st": status, "f": fid, "h": hid})
         return queued
 
-    # ------------------------------------------------------------------ 2: франшизы
+    # ------------------------------------------------------------------ 2–4: по одной единице
 
-    async def refresh_franchises(self, s) -> int:
+    async def _refresh_unit(self, hdrezka_id: int, url: str, page_id: int, after=None):
+        """Одна страница вне цикла событий: запрос к сайту — без открытой транзакции, затем короткая запись
+        и коммит. Ошибка одной единицы не откатывает остальные (24.09.2026: раньше вся вторая часть цикла
+        шла одной транзакцией). PageGone и другие ошибки страницы — отметка с растущей паузой и None;
+        AccessBlocked — отметка и дальше вызывающему: доступ потерян, часть цикла заканчивается."""
+        try:
+            tp = await svc.fetch_title_page(self.client, url)
+        except PageGone as exc:
+            log.warning("Страница %s пропала с сайта: %s", hdrezka_id, exc)
+            await self._mark(page_id, gone=True)
+            return None
+        except AccessBlocked:
+            await self._mark(page_id, gone=False)
+            raise
+        except Exception:
+            log.exception("Страница %s: ошибка чтения", hdrezka_id)
+            self._refresh_failed += 1
+            await self._mark(page_id, gone=False)
+            return None
+        try:
+            async with session() as s:
+                res = await svc.apply_title_page(s, hdrezka_id, url, tp)
+                if res.franchise:
+                    await self._adopt_waiting(s, res.franchise)
+                if after:
+                    await after(s, res)
+                await s.commit()
+            return res
+        except Exception:
+            log.exception("Страница %s: ошибка записи", hdrezka_id)
+            self._refresh_failed += 1
+            await self._mark(page_id, gone=False)
+            return None
+
+    async def _mark(self, page_id: int, gone: bool) -> None:
+        async with session() as s:
+            await svc.mark_read_failure(s, page_id, gone)
+            await s.commit()
+
+    async def refresh_franchises(self) -> int:
         # Франшизы с подписчиками, а также с «ждущими продолжения» на завершённых частях:
         # франшизу мог завести бот по ссылке (без перевода ждущих) — сверка переведёт их за сутки.
-        rows = (await s.execute(text("""
-            SELECT f.id FROM franchises f
-             WHERE (EXISTS (SELECT 1 FROM subscriptions sub WHERE sub.franchise_id = f.id)
-                    OR EXISTS (SELECT 1 FROM subscriptions sub JOIN pages p ON p.id = sub.page_id
-                                WHERE p.franchise_id = f.id AND p.is_finished))
-               AND (f.refreshed_at IS NULL OR f.refreshed_at < now() - make_interval(hours => :h))
-             ORDER BY f.id LIMIT :lim"""), {"h": FRANCHISE_REFRESH_HOURS, "lim": PER_CYCLE_FRANCHISES})).all()
+        async with session() as s:
+            rows = (await s.execute(text("""
+                SELECT f.id FROM franchises f
+                 WHERE (EXISTS (SELECT 1 FROM subscriptions sub WHERE sub.franchise_id = f.id)
+                        OR EXISTS (SELECT 1 FROM subscriptions sub JOIN pages p ON p.id = sub.page_id
+                                    WHERE p.franchise_id = f.id AND p.is_finished))
+                   AND (f.refreshed_at IS NULL OR f.refreshed_at < now() - make_interval(hours => :h))
+                   AND (f.next_refresh_at IS NULL OR f.next_refresh_at <= now())
+                 ORDER BY f.refreshed_at NULLS FIRST, f.id LIMIT :lim"""),
+                {"h": FRANCHISE_REFRESH_HOURS, "lim": PER_CYCLE_FRANCHISES})).scalars().all()
         done = 0
-        for (fid,) in rows:
-            anchor = await svc.franchise_anchor(s, fid)
-            fr = await s.get(Franchise, fid)
-            if not anchor:
-                fr.refreshed_at = svc.now()
-                continue
+        for fid in rows:
+            async with session() as s:
+                anchor = await svc.franchise_anchor(s, fid)
+                if anchor is None:                       # читать нечего: все части пропали или ждут попытки
+                    await s.execute(text("UPDATE franchises SET refreshed_at = now() WHERE id = :f"), {"f": fid})
+                    await s.commit()
+                    continue
+                hid, url, pid = anchor.hdrezka_id, anchor.url, anchor.id
             try:
-                await self.sync(s, anchor.hdrezka_id, anchor.url)
-                done += 1
+                res = await self._refresh_unit(hid, url, pid)
             except AccessBlocked as exc:
                 log.warning("Сверка франшизы %s: %s", fid, exc)
+                async with session() as s:
+                    await svc.mark_refresh_failure(s, fid)
+                    await s.commit()
+                raise
+            if res is not None:
+                async with session() as s:
+                    await s.execute(text("UPDATE franchises SET refresh_failures = 0, next_refresh_at = NULL,"
+                                         " refreshed_at = now() WHERE id = :f"), {"f": fid})
+                    await s.commit()
+                done += 1
+            # Не прочиталась — якорь помечен, в следующем цикле сверка пойдёт по другой части.
         return done
 
     # ------------------------------------------------------------------ 3: страницы с подписчиками
 
-    async def refresh_pages(self, s) -> int:
-        rows = (await s.execute(text("""
-            SELECT DISTINCT p.page_refreshed_at, p.id FROM pages p
-              LEFT JOIN subscriptions sp ON sp.page_id = p.id
-              LEFT JOIN subscriptions sf ON sf.franchise_id = p.franchise_id
-             WHERE (sp.id IS NOT NULL OR sf.id IS NOT NULL)
-               AND (NOT p.is_finished OR sp.id IS NOT NULL)    -- завершённые с «жду продолжения» — раз в неделю
-               AND p.url <> ''
-               AND coalesce(p.content_type, 'series') = 'series'
-               AND (p.page_refreshed_at IS NULL OR p.page_refreshed_at < now() - CASE WHEN p.is_finished
-                        THEN make_interval(days => :d) ELSE make_interval(hours => :h) END)
-             -- колонка сортировки обязана быть в списке SELECT DISTINCT, иначе Postgres откажется
-             ORDER BY p.page_refreshed_at NULLS FIRST LIMIT :lim"""),
-            {"d": PAGE_REFRESH_DAYS, "h": PAGE_REFRESH_HOURS, "lim": PER_CYCLE_PAGES})).all()
+    REFRESH_SQL = text("""
+        SELECT p.id FROM pages p
+         WHERE p.url <> '' AND coalesce(p.content_type, 'series') = 'series'
+           AND (p.next_read_at IS NULL OR p.next_read_at <= now())
+           AND (EXISTS (SELECT 1 FROM subscriptions sp WHERE sp.page_id = p.id)
+                OR (NOT p.is_finished AND EXISTS (SELECT 1 FROM subscriptions sf WHERE sf.franchise_id = p.franchise_id)))
+           AND (p.page_refreshed_at IS NULL OR p.page_refreshed_at < now() - CASE WHEN p.is_finished
+                    THEN make_interval(days => :d) ELSE make_interval(hours => :h) END)
+         ORDER BY p.page_refreshed_at NULLS FIRST LIMIT :lim""")
+
+    async def refresh_pages(self) -> int:
+        """Страницы с подписчиками: выходящие — раз в 12 часов, завершённые («жду продолжения») — раз в неделю.
+        EXISTS вместо двух LEFT JOIN: те перемножали подписки на страницу и на франшизу (300 × 300 = 90 000 строк)."""
+        async with session() as s:
+            ids = (await s.execute(self.REFRESH_SQL, {"d": PAGE_REFRESH_DAYS, "h": PAGE_REFRESH_HOURS,
+                                                      "lim": PER_CYCLE_PAGES * REFRESH_CANDIDATES})).scalars().all()
         done = 0
-        for _, pid in rows:
-            page = await s.get(Page, pid)
+        for pid in ids:
+            if done >= PER_CYCLE_PAGES:
+                break
+            async with session() as s:
+                page = await s.get(Page, pid)
+                hid, url = page.hdrezka_id, page.url
             try:
-                res = await self.sync(s, page.hdrezka_id, page.url)
-                await self._catch_missed(s, res)
-                done += 1
+                res = await self._refresh_unit(hid, url, pid, after=self._catch_missed)
             except AccessBlocked as exc:
-                log.warning("Обновление страницы %s: %s", page.hdrezka_id, exc)
+                log.warning("Обновление страницы %s: %s", hid, exc)
+                raise
+            done += res is not None
         return done
 
     async def _catch_missed(self, s, res: svc.SyncResult) -> int:
@@ -311,42 +391,49 @@ class Poller:
 
     # ------------------------------------------------------------------ 4: очередь чтения каталога
 
-    async def read_pending_pages(self, s) -> int:
+    async def read_pending_pages(self) -> int:
         """Читает страницы, которых ещё не читали: статус, франшиза, озвучки, расписание, постер.
-        Одна и та же битая страница не должна держать очередь: после N неудач откладываем её."""
+        Неудачная страница ждёт своего времени (pages.next_read_at) и не держит очередь."""
+        async with session() as s:
+            pages = [(p.id, p.hdrezka_id, p.url) for p in await svc.pages_to_read(s, PER_CYCLE_READS)]
         done = 0
-        for page in await svc.pages_to_read(s, PER_CYCLE_READS):
+        for pid, hid, url in pages:
             try:
-                await self.sync(s, page.hdrezka_id, page.url)
-                self._read_failures.pop(page.hdrezka_id, None)
-                done += 1
+                res = await self._refresh_unit(hid, url, pid)
             except AccessBlocked as exc:
-                n = self._read_failures[page.hdrezka_id] = self._read_failures.get(page.hdrezka_id, 0) + 1
-                if n >= READ_GIVE_UP_AFTER:
-                    page.page_refreshed_at = svc.now()   # выходим из очереди; недельное обновление вернёт, если есть подписчики
-                    self._read_failures.pop(page.hdrezka_id, None)
-                    log.warning("Страница %s не читается %s раза подряд — откладываю: %s", page.hdrezka_id, n, exc)
-                else:
-                    log.warning("Очередь чтения, страница %s: %s", page.hdrezka_id, exc)
-                break   # возможно, проблема общая — не тратим остальные слоты этого цикла
+                log.warning("Очередь чтения, страница %s: %s", hid, exc)
+                raise
+            done += res is not None
         return done
 
     # ------------------------------------------------------------------ цикл
 
     async def cycle(self) -> None:
+        self._cycle_new_parts = 0
+        self._reads_left = EVENT_READS
+        self._failed_now = set()
         async with session() as s:
-            self._cycle_new_parts = 0
-            self._reads_left = EVENT_READS
             new_eps, queued = await self.process_updates(s)
-            # События и уведомления фиксируем сразу: ниже сверки и чтение страниц ходят на сайт минуты,
-            # и откат не должен забирать с собой вышедшие серии.
+            # События и уведомления фиксируем сразу: дальше сверки и чтение страниц ходят на сайт минуты.
+            await svc.meta_set(s, "last_poll_ok", svc.now().isoformat())
             await s.commit()
             queued += await self.announce_new_parts(s)
             await s.commit()
-            fr = await self.refresh_franchises(s)
-            pg = await self.refresh_pages(s)
-            rd = await self.read_pending_pages(s)
-            await svc.meta_set(s, "last_poll_ok", svc.now().isoformat())
+        # Вторая часть — по одной единице, у каждой своя короткая транзакция. Потеря доступа заканчивает её
+        # до следующего цикла; ошибка одной страницы — только её.
+        self._refresh_failed = 0
+        fr = pg = rd = 0
+        try:
+            fr = await self.refresh_franchises()
+            pg = await self.refresh_pages()
+            rd = await self.read_pending_pages()
+            refreshed = True
+        except AccessBlocked:
+            refreshed = False
+        async with session() as s:
+            await svc.meta_set(s, "refresh_failed", str(self._refresh_failed))
+            if refreshed:
+                await svc.meta_set(s, "refresh_ok_at", svc.now().isoformat())
             await s.commit()
         queued += self._cycle_new_parts
         if new_eps or queued or fr or pg or rd:

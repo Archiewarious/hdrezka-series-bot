@@ -35,6 +35,11 @@ class AccessBlocked(Exception):
     """Ни одно зеркало не отдало контент — IP забанен или сайт лежит."""
 
 
+class PageGone(Exception):
+    """404/410: страницы нет на сайте. Касается одной страницы, а не доступа: без повторов и смены зеркала —
+    иначе одна пропавшая страница стоила трёх запросов и выглядела как потеря доступа (24.09.2026)."""
+
+
 def _solve_pow(random_data: str, difficulty: int) -> tuple[str, int]:
     """Anubis PoW: ищем nonce, при котором sha256(randomData + nonce)
     начинается с `difficulty` нулей. При difficulty 2 это ~256 хешей."""
@@ -155,6 +160,9 @@ class RezkaClient:
                     log.warning("403 от %s", self.base_url)
                     self._next_mirror()
                     continue
+
+                if resp.status_code in (404, 410):
+                    raise PageGone(f"{url}: HTTP {resp.status_code}")
 
                 if resp.status_code != 200:
                     last_error = f"HTTP {resp.status_code}"
