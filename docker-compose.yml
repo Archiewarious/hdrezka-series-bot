@@ -9,6 +9,8 @@ x-logging: &logging
 x-app: &app
   build: .
   env_file: .env
+  # init: сигналы доходят до процесса, а не до PID 1 без обработчика; зомби-процессы подбираются (24.09.2026).
+  init: true
   read_only: true
   tmpfs: ["/tmp"]
   security_opt: ["no-new-privileges:true"]
@@ -56,7 +58,7 @@ services:
   poller:
     <<: *app
     command: python -m app.poller
-    stop_grace_period: 60s   # цикл поллера должен завершиться и закоммититься
+    stop_grace_period: 120s  # по SIGTERM поллер доделывает текущую страницу и выходит (app/lifecycle.py)
     # Здоровье — не «цикл завершился», а «события идут» (app/health.py): видно в `docker compose ps`.
     healthcheck:
       test: ["CMD", "python", "-m", "app.health", "events"]
@@ -72,6 +74,7 @@ services:
   sender:
     <<: *app
     command: python -m app.sender
+    stop_grace_period: 30s   # по SIGTERM досылает текущее сообщение, остальное взятое — сразу в очередь
     # Здоровье доставки: уведомления не залёживаются, не зависают в повторах и не падают (app/health.py).
     healthcheck:
       test: ["CMD", "python", "-m", "app.health", "delivery"]

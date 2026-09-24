@@ -187,7 +187,8 @@ class Subscription(Base):
 
 class Notification(Base):
     """Outbox. Транзитная таблица: отправленное удаляется через 7 дней.
-    Несколько sender'ов работают через FOR UPDATE SKIP LOCKED."""
+    Отправщик один (advisory lock, app/lifecycle.py): второй дал бы дубли — захват SKIP LOCKED защищает
+    от гонки за строки, но не от двух процессов, досылающих одно и то же после сбоя (24.09.2026)."""
     __tablename__ = "notifications"
     __table_args__ = (
         UniqueConstraint("user_id", "kind", "ref_id", name="uq_notification"),

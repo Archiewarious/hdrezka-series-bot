@@ -50,6 +50,9 @@ class Config:
     )
     feed_pages: int = int(os.getenv("FEED_PAGES", "1"))
     stale_alert_minutes: int = int(os.getenv("STALE_ALERT_MINUTES", "20"))
+    # Внешний мониторинг: пинг после успешного цикла поллера и прохода отправщика, если здоровье чисто.
+    # Пусто — выключено. В Telegram о сбоях не пишем никогда (решение владельца 1, 24.09.2026).
+    healthcheck_ping_url: str = os.getenv("HEALTHCHECK_PING_URL", "")
 
     # --- Бот и сайт: общий потолок запросов бота к сайту на всех (24.09.2026) ---
     bot_site_per_minute: int = int(os.getenv("BOT_SITE_PER_MINUTE", "10"))

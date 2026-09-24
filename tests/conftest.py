@@ -36,6 +36,17 @@ def no_network(monkeypatch):
     monkeypatch.setattr(aiohttp.ClientSession, "_request", forbidden)
 
 
+@pytest.fixture(autouse=True)
+def fresh_process_state():
+    """Флаг остановки и отложенные отметки отправщика — состояние процесса, не теста."""
+    from app import lifecycle, sender
+    lifecycle.reset()
+    sender._unmarked.clear()
+    yield
+    lifecycle.reset()
+    sender._unmarked.clear()
+
+
 @pytest.fixture(scope="session")
 def html():
     def load(name: str) -> str:

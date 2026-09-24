@@ -30,7 +30,7 @@ from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError, Teleg
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 from sqlalchemy import text
 
-from app import posters
+from app import lifecycle, posters
 from app.config import cfg
 from app.db import init_db, session
 from app.i18n import t
@@ -45,7 +45,10 @@ BUTTON_MAX_LEN = 40
 DIGEST_MAX_BUTTONS = 10
 TITLE_MAX_LEN = 150
 STUCK_MINUTES = 10
+RECOVER_EVERY = 60                      # сек: возврат зависших «отправляется» — раз в минуту, не каждые 5 с
 PER_CHAT_GAP = 1.1                      # Telegram: не чаще сообщения в секунду в один чат
+WATCHDOG_LIMIT = 10 * 60                # проход не отмечался 10 мин — процесс завершается, Docker перезапускает
+MARK_TRIES = 3
 
 
 class RateLimiter:
@@ -81,6 +84,7 @@ CLAIM_SQL = text("""
 RECOVER_SQL = text("""
     UPDATE notifications SET status = 'pending'
      WHERE status = 'sending' AND next_attempt_at < now() - make_interval(mins => CAST(:mins AS int))
+       AND NOT (id = ANY(CAST(:skip AS bigint[])))     -- отправленные, чью отметку не удалось записать
 """)
 
 EPISODE_SQL = text("""
@@ -216,67 +220,158 @@ async def _deliver(bot: Bot, s, user_id: int, items: list[Rendered], photos: boo
     return (await bot.send_message(user_id, body, reply_markup=kb, disable_web_page_preview=True)).message_id
 
 
-async def send_batch(bot: Bot, limiter: RateLimiter) -> int:
+# Отправлено, но отметка «отправлено» не записалась (сбой базы): id уведомления → (человек, номер сообщения).
+# Повторно такие не шлём — отметку дописываем в начале следующих проходов; RECOVER_SQL их не трогает.
+_unmarked: dict[int, tuple[int, int]] = {}
+
+
+async def send_batch(bot: Bot, limiter: RateLimiter, recover: bool = True,
+                     beat: lifecycle.Watchdog | None = None) -> int:
     """Каждое событие — отдельный пост (11.09.2026): склейка двух серий в текстовое сообщение без постера
     выглядела как «уведомления не было». Одним сообщением — только в режиме «дайджест раз в день».
-    Отметка «отправлено» — сразу после каждого поста, с коммитом: сбой посреди рассылки не дублирует ушедшее."""
+    Отправка и отметка «отправлено» разделены (24.09.2026): сбой базы после успешной отправки — лог с номером
+    сообщения и повтор отметки, но не повторная отправка. Ошибка отрисовки у одного человека возвращает в очередь
+    только его уведомления. Сигнал остановки: текущее сообщение досылается, остальные взятые — сразу в pending."""
+    await _flush_unmarked()
     async with session() as s:
-        await s.execute(RECOVER_SQL, {"mins": STUCK_MINUTES})
+        if recover:
+            await s.execute(RECOVER_SQL, {"mins": STUCK_MINUTES, "skip": list(_unmarked)})
         rows = (await s.execute(CLAIM_SQL, {"limit": cfg.send_batch})).all()
         await s.commit()
-        if not rows:
-            return 0
+    if not rows:
+        return 0
 
-        by_user: dict[int, list] = defaultdict(list)
-        for nid, uid, kind, ref, attempts in rows:
-            by_user[uid].append((nid, kind, ref, attempts))
+    by_user: dict[int, list] = defaultdict(list)
+    for nid, uid, kind, ref, attempts in rows:
+        by_user[uid].append((nid, kind, ref, attempts))
+    users = list(by_user.items())
 
-        sent_total = 0
-        for user_id, items in by_user.items():
+    sent_total = 0
+    for i, (user_id, items) in enumerate(users):
+        if lifecycle.stopping():
+            await _release([nid for _, its in users[i:] for nid, *_ in its])
+            break
+        sent, stopped = await _send_user(bot, limiter, user_id, items, beat)
+        sent_total += sent
+        if stopped:
+            await _release([nid for _, its in users[i + 1:] for nid, *_ in its])
+            break
+    return sent_total
+
+
+async def _send_user(bot: Bot, limiter: RateLimiter, user_id: int, items: list, beat) -> tuple[int, bool]:
+    """Уведомления одного человека. → (отправлено, остановились ли по сигналу)."""
+    tries = {nid: a for nid, _, _, a in items}
+    async with session() as s:
+        try:
             prefs = (await s.execute(text("SELECT photos, lang, digest_hour FROM users WHERE id = :u"),
                                      {"u": user_id})).first()
             photos, lang, digest = ((prefs[0] is not False, prefs[1] or "ru", prefs[2] is not None)
                                     if prefs else (True, "ru", False))
-            tries = {nid: a for nid, _, _, a in items}
             pairs = [(nid, await _render(s, user_id, k, r, lang)) for nid, k, r, _ in items]
-            dead = [nid for nid, r in pairs if r is None]
-            if dead:
-                await _mark(s, dead, "failed", "nothing to render")
-            pairs = [(nid, r) for nid, r in pairs if r is not None]
-            messages = [pairs] if digest and len(pairs) > 1 else [[pair] for pair in pairs]
+        except Exception as exc:
+            log.exception("Уведомления пользователю %s не отрисовались — вернул в очередь только их", user_id)
+            await s.rollback()
+            async with session() as rs:
+                await _requeue(rs, list(tries), seconds=retry_delay(max(tries.values())), error=str(exc)[:400])
+                await rs.commit()
+            return 0, False
+        dead = [nid for nid, r in pairs if r is None]
+        if dead:
+            await _mark(s, dead, "failed", "nothing to render")
+        pairs = [(nid, r) for nid, r in pairs if r is not None]
+        messages = [pairs] if digest and len(pairs) > 1 else [[pair] for pair in pairs]
 
-            for n, message in enumerate(messages):
-                ids = [nid for nid, _ in message]
-                if n:
-                    await asyncio.sleep(PER_CHAT_GAP)
-                await limiter.acquire()
-                try:
-                    message_id = await _deliver(bot, s, user_id, [r for _, r in message], photos, lang)
-                    await _mark(s, ids, "sent", message_id=message_id)
-                    sent_total += len(ids)
-                    log.info("Доставлено пользователю %s: сообщение Telegram №%s, уведомления %s", user_id, message_id, ids)
-                except TelegramRetryAfter as exc:
-                    rest = [nid for m in messages[n:] for nid, _ in m]
-                    log.warning("Flood control от Telegram: пауза %s с", exc.retry_after)
-                    await _requeue(s, rest, seconds=exc.retry_after)
-                    await s.commit()
-                    await asyncio.sleep(exc.retry_after)
-                    break
-                except TelegramForbiddenError:
-                    # Пользователь заблокировал бота — больше не пишем и не копим очередь.
-                    await s.execute(text("UPDATE users SET is_active = false, blocked_at = now() WHERE id = :u"), {"u": user_id})
-                    await s.execute(text("UPDATE notifications SET status = 'failed', error = 'bot blocked' "
-                                         "WHERE user_id = :u AND status IN ('pending', 'sending')"), {"u": user_id})
-                    await s.commit()
-                    break
-                except TelegramBadRequest as exc:
-                    await _mark(s, ids, "failed", str(exc)[:400])
-                except Exception as exc:
-                    log.exception("Не отправилось пользователю %s", user_id)
-                    await _requeue(s, ids, seconds=retry_delay(max(tries[i] for i in ids)), error=str(exc)[:400])
+        sent = 0
+        for n, message in enumerate(messages):
+            if lifecycle.stopping():
+                await _release([nid for m in messages[n:] for nid, _ in m], s)
                 await s.commit()
-        await s.commit()
-        return sent_total
+                return sent, True
+            ids = [nid for nid, _ in message]
+            if n:
+                await asyncio.sleep(PER_CHAT_GAP)
+            await limiter.acquire()
+            if beat:
+                beat.beat()
+            try:
+                message_id = await _deliver(bot, s, user_id, [r for _, r in message], photos, lang)
+            except TelegramRetryAfter as exc:
+                rest = [nid for m in messages[n:] for nid, _ in m]
+                log.warning("Flood control от Telegram: пауза %s с", exc.retry_after)
+                await _requeue(s, rest, seconds=exc.retry_after)
+                await s.commit()
+                await asyncio.sleep(exc.retry_after)
+                return sent, False
+            except TelegramForbiddenError:
+                # Пользователь заблокировал бота — больше не пишем и не копим очередь.
+                await s.execute(text("UPDATE users SET is_active = false, blocked_at = now() WHERE id = :u"), {"u": user_id})
+                await s.execute(text("UPDATE notifications SET status = 'failed', error = 'bot blocked' "
+                                     "WHERE user_id = :u AND status IN ('pending', 'sending')"), {"u": user_id})
+                await s.commit()
+                return sent, False
+            except TelegramBadRequest as exc:
+                await _mark(s, ids, "failed", str(exc)[:400])
+            except Exception as exc:
+                log.exception("Не отправилось пользователю %s", user_id)
+                await _requeue(s, ids, seconds=retry_delay(max(tries[i] for i in ids)), error=str(exc)[:400])
+            else:
+                sent += len(ids)
+                log.info("Доставлено пользователю %s: сообщение Telegram №%s, уведомления %s", user_id, message_id, ids)
+                await _mark_sent(ids, user_id, message_id)
+            await s.commit()
+        return sent, False
+
+
+async def _mark_sent(ids: list[int], user_id: int, message_id: int) -> bool:
+    """Отметка «отправлено» — отдельной короткой транзакцией, MARK_TRIES попыток. Не вышло — не шлём повторно:
+    номер сообщения в лог, id — в _unmarked, отметку допишет следующий проход."""
+    for attempt in range(MARK_TRIES):
+        try:
+            async with session() as ms:
+                await _mark(ms, ids, "sent", message_id=message_id)
+                await ms.commit()
+            return True
+        except Exception as exc:
+            log.warning("Отметка «отправлено» не записалась (%s-я попытка): %s", attempt + 1, exc)
+            await asyncio.sleep(0.5 * (attempt + 1))
+    log.error("ОТПРАВЛЕНО, НО НЕ ОТМЕЧЕНО: пользователь %s, сообщение Telegram №%s, уведомления %s — повторно не шлю",
+              user_id, message_id, ids)
+    for nid in ids:
+        _unmarked[nid] = (user_id, message_id)
+    return False
+
+
+async def _flush_unmarked() -> None:
+    if not _unmarked:
+        return
+    by_message: dict[int, list[int]] = defaultdict(list)
+    for nid, (_, mid) in _unmarked.items():
+        by_message[mid].append(nid)
+    try:
+        async with session() as s:
+            for mid, ids in by_message.items():
+                await _mark(s, ids, "sent", message_id=mid)
+            await s.commit()
+    except Exception as exc:
+        log.warning("Отложенные отметки «отправлено» снова не записались: %s", exc)
+        return
+    log.info("Отложенные отметки «отправлено» записаны: %s", sorted(_unmarked))
+    _unmarked.clear()
+
+
+async def _release(ids: list[int], s=None) -> None:
+    """Взятые, но не отправленные — сразу обратно в очередь, попытка не засчитывается."""
+    if not ids:
+        return
+    sql = text("UPDATE notifications SET status = 'pending', next_attempt_at = now(), "
+               "attempts = greatest(attempts - 1, 0) WHERE id = ANY(CAST(:ids AS bigint[])) AND status = 'sending'")
+    if s is not None:
+        await s.execute(sql, {"ids": ids})
+        return
+    async with session() as ss:
+        await ss.execute(sql, {"ids": ids})
+        await ss.commit()
 
 
 async def _mark(s, ids: list[int], status: str, error: str | None = None, message_id: int | None = None) -> None:
@@ -301,21 +396,24 @@ async def purge(s) -> int:
     return r.rowcount or 0
 
 
-async def main() -> None:
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
-    await init_db()
-    bot = Bot(cfg.bot_token, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
-    limiter = RateLimiter(cfg.send_rate)
-    log.info("Sender запущен: %s сообщений/сек", cfg.send_rate)
-    last_purge = 0.0
-    try:
-        while True:
-            sent = await send_batch(bot, limiter)
+async def run(bot: Bot, limiter: RateLimiter, watchdog: lifecycle.Watchdog | None = None, lock_conn=None) -> None:
+    """Главный цикл. Сбой прохода (база, сеть) — лог и пауза 5 → 10 → … → 60 с, работа продолжается: раньше любой
+    сбой базы ронял процесс, и взятые уведомления 10 минут висели «отправляется» (24.09.2026)."""
+    last_purge = last_recover = 0.0
+    backoff = 0
+    while not lifecycle.stopping():
+        if watchdog:
+            watchdog.beat()
+        if lock_conn is not None:
+            await lifecycle.check_lock(lock_conn)          # потеря лока — выход, Docker перезапустит
+        try:
+            now = time.monotonic()
+            recover = now - last_recover >= RECOVER_EVERY
+            if recover:
+                last_recover = now
+            sent = await send_batch(bot, limiter, recover=recover, beat=watchdog)
             if sent:
                 log.info("Отправлено уведомлений: %s", sent)
-            else:
-                await asyncio.sleep(5)
-            now = time.monotonic()
             if now - last_purge > 3600:
                 last_purge = now
                 async with session() as s:
@@ -323,8 +421,33 @@ async def main() -> None:
                     await s.commit()
                 if n:
                     log.info("Очистка: удалено %s отправленных уведомлений", n)
+            async with session() as s:
+                await lifecycle.ping_if_healthy(s)
+            backoff = 0
+            if not sent:
+                await lifecycle.pause(5, watchdog)
+        except Exception:
+            backoff = min(max(backoff * 2, 5), 60)
+            log.exception("Проход отправщика упал — пауза %s с", backoff)
+            await lifecycle.pause(backoff, watchdog)
+    log.info("Отправщик остановлен по сигналу")
+
+
+async def main() -> None:
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    await init_db()
+    lifecycle.install_signal_handlers()
+    # Один отправщик на базу: второй дал бы дубли при досылке после сбоя.
+    lock_conn = await lifecycle.acquire_lock(lifecycle.SENDER_LOCK, "отправщик")
+    watchdog = lifecycle.Watchdog("sender", WATCHDOG_LIMIT).start()
+    bot = Bot(cfg.bot_token, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+    log.info("Sender запущен: %s сообщений/сек", cfg.send_rate)
+    try:
+        await run(bot, RateLimiter(cfg.send_rate), watchdog, lock_conn)
     finally:
+        watchdog.stop()
         await bot.session.close()
+        await lock_conn.close()
 
 
 if __name__ == "__main__":

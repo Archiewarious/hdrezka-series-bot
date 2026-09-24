@@ -143,8 +143,13 @@ async def send_photo_cached(bot: Bot, s, chat_id: int, page_id: int, poster_url:
         log.warning("Постер страницы %s: Telegram не принял картинку (%s) — отправлю текстом", page_id, exc.message)
         return None
     if msg.photo:
-        # Привязываем к URL: если постер к этому моменту сменился, file_id уже не тот.
-        await s.execute(text("UPDATE pages SET poster_file_id = :f WHERE id = :p AND poster_url = :u"),
-                        {"f": msg.photo[-1].file_id, "p": page_id, "u": poster_url})
-        log.info("Постер страницы %s загружен в Telegram (%s байт)", page_id, len(data))
+        # Привязываем к URL: если постер к этому моменту сменился, file_id уже не тот. Точка сохранения: сбой
+        # записи кэша не должен выглядеть как неудачная отправка — сообщение уже ушло (24.09.2026).
+        try:
+            async with s.begin_nested():
+                await s.execute(text("UPDATE pages SET poster_file_id = :f WHERE id = :p AND poster_url = :u"),
+                                {"f": msg.photo[-1].file_id, "p": page_id, "u": poster_url})
+            log.info("Постер страницы %s загружен в Telegram (%s байт)", page_id, len(data))
+        except Exception as exc:
+            log.warning("Постер страницы %s: file_id не записался (%s) — загрузится ещё раз", page_id, exc)
     return msg

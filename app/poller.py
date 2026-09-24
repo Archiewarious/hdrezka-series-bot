@@ -18,16 +18,17 @@ from datetime import timedelta
 
 from sqlalchemy import select, text
 
+from app import lifecycle
 from app import service as svc
 from app.config import cfg
-from app.db import engine, init_db, session
+from app.db import init_db, session
 from app.models import Episode, Franchise, Page
 from app.rezka.client import AccessBlocked, PageGone, RezkaClient
 from app.rezka.parser import UpdateItem, match_voice, parse_updates
 
 log = logging.getLogger("poller")
 
-ADVISORY_LOCK_KEY = 0x52455A4B          # "REZK" — ровно один поллер на базу
+WATCHDOG_LIMIT = 30 * 60                # цикл не отмечался 30 мин — процесс завершается, Docker перезапускает
 EVENT_READS = 10                        # чтений страниц ради событий за цикл; не хватило — событие ждёт цикла
 VOICE_REREAD = timedelta(hours=24)      # незнакомая озвучка → перечитать список озвучек страницы, не чаще
 FRANCHISE_REFRESH_HOURS = 24
@@ -56,6 +57,7 @@ class Poller:
         self.client = client or RezkaClient()
         self._failed_now: set[int] = set()      # страницы, не прочитавшиеся в этом цикле: второй раз не просим
         self._refresh_failed = 0                # единиц второй части цикла с ошибкой — в meta и /stats
+        self.watchdog: lifecycle.Watchdog | None = None
         self._cycle_new_parts = 0               # уведомлений new_part за цикл — для строки лога
         self._reads_left = EVENT_READS          # на цикл: блок обновлений, новые части; сбрасывает cycle()
 
@@ -145,6 +147,9 @@ class Poller:
         fresh_from = svc.now().date() - timedelta(days=1)          # «Сегодня» и «Вчера»
         new_eps = queued = deferred = failed = 0
         for item in reversed(items):                                # от старых к новым
+            if lifecycle.stopping():
+                break                                               # остальное — в следующем запуске: блок хранит неделю
+            self._beat()
             fresh = item.day is not None and item.day >= fresh_from
             try:
                 # Точка сохранения на событие: одна кривая страница не откатывает весь проход.
@@ -254,6 +259,7 @@ class Poller:
         и коммит. Ошибка одной единицы не откатывает остальные (24.09.2026: раньше вся вторая часть цикла
         шла одной транзакцией). PageGone и другие ошибки страницы — отметка с растущей паузой и None;
         AccessBlocked — отметка и дальше вызывающему: доступ потерян, часть цикла заканчивается."""
+        self._beat()
         try:
             tp = await svc.fetch_title_page(self.client, url)
         except PageGone as exc:
@@ -288,6 +294,10 @@ class Poller:
             await svc.mark_read_failure(s, page_id, gone)
             await s.commit()
 
+    def _beat(self) -> None:
+        if self.watchdog:
+            self.watchdog.beat()
+
     async def refresh_franchises(self) -> int:
         # Франшизы с подписчиками, а также с «ждущими продолжения» на завершённых частях:
         # франшизу мог завести бот по ссылке (без перевода ждущих) — сверка переведёт их за сутки.
@@ -303,6 +313,8 @@ class Poller:
                 {"h": FRANCHISE_REFRESH_HOURS, "lim": PER_CYCLE_FRANCHISES})).scalars().all()
         done = 0
         for fid in rows:
+            if lifecycle.stopping():
+                break
             async with session() as s:
                 anchor = await svc.franchise_anchor(s, fid)
                 if anchor is None:                       # читать нечего: все части пропали или ждут попытки
@@ -347,7 +359,7 @@ class Poller:
                                                       "lim": PER_CYCLE_PAGES * REFRESH_CANDIDATES})).scalars().all()
         done = 0
         for pid in ids:
-            if done >= PER_CYCLE_PAGES:
+            if done >= PER_CYCLE_PAGES or lifecycle.stopping():
                 break
             async with session() as s:
                 page = await s.get(Page, pid)
@@ -395,6 +407,8 @@ class Poller:
             pages = [(p.id, p.hdrezka_id, p.url) for p in await svc.pages_to_read(s, PER_CYCLE_READS)]
         done = 0
         for pid, hid, url in pages:
+            if lifecycle.stopping():
+                break
             try:
                 res = await self._refresh_unit(hid, url, pid)
             except AccessBlocked as exc:
@@ -432,6 +446,7 @@ class Poller:
             if refreshed:
                 await svc.meta_set(s, "refresh_ok_at", svc.now().isoformat())
             await s.commit()
+            await lifecycle.ping_if_healthy(s)
         queued += self._cycle_new_parts
         if new_eps or queued or fr or pg or rd:
             log.info("Цикл: новых серий=%s, уведомлений=%s, франшиз сверено=%s, страниц обновлено=%s, прочитано новых=%s",
@@ -439,11 +454,14 @@ class Poller:
 
     async def run(self) -> None:
         await init_db()
+        lifecycle.install_signal_handlers()
         lock_conn = await acquire_lock()
+        self.watchdog = lifecycle.Watchdog("poller", WATCHDOG_LIMIT).start()
         log.info("Поллер запущен: интервал=%sс", cfg.poll_interval)
         failures = 0
         try:
-            while True:
+            while not lifecycle.stopping():
+                self._beat()
                 await check_lock(lock_conn)          # вне try ниже: потеря лока завершает процесс
                 try:
                     await self.cycle()
@@ -453,34 +471,24 @@ class Poller:
                     # Не долбимся: временный бан легко превратить в постоянный.
                     pause = min(60 * 2 ** failures, 1800)
                     log.error("Доступ потерян (%s), неудач подряд: %s, пауза %sс", exc, failures, pause)
-                    await asyncio.sleep(pause)
+                    await lifecycle.pause(pause, self.watchdog)
                 except Exception:
                     failures += 1
                     log.exception("Ошибка цикла")
-                await asyncio.sleep(cfg.poll_interval)
+                await lifecycle.pause(cfg.poll_interval, self.watchdog)
+            log.info("Поллер остановлен по сигналу")
         finally:
+            self.watchdog.stop()
             await self.client.close()
             await lock_conn.close()
 
 
 async def acquire_lock():
-    """Один поллер на базу: второй экземпляр (например, при обновлении) ждёт, а не дублирует.
-    Соединение с локом — в autocommit: иначе оно висит «idle in transaction» вечно, и Postgres обрывает
-    его по idle_in_transaction_session_timeout (app/db.py) — лок молча пропадает (23.09.2026)."""
-    conn = await (await engine.connect()).execution_options(isolation_level="AUTOCOMMIT")
-    while not await conn.scalar(text("SELECT pg_try_advisory_lock(:k)"), {"k": ADVISORY_LOCK_KEY}):
-        log.warning("Другой поллер держит лок — жду 30 с")
-        await asyncio.sleep(30)
-    return conn
+    """Один поллер на базу: второй экземпляр (например, при обновлении) ждёт, а не дублирует (app/lifecycle.py)."""
+    return await lifecycle.acquire_lock(lifecycle.POLLER_LOCK, "поллер")
 
 
-async def check_lock(conn) -> None:
-    """Лок всё ещё наш. Соединение оборвалось (перезапуск базы, таймаут) — исключение: процесс выходит,
-    Docker его перезапускает, и лок берётся заново. Иначе второй поллер мог бы работать параллельно."""
-    held = await conn.scalar(text("SELECT count(*) FROM pg_locks WHERE locktype = 'advisory' AND granted"
-                                  " AND pid = pg_backend_pid()"))
-    if not held:
-        raise RuntimeError("Лок поллера потерян")
+check_lock = lifecycle.check_lock
 
 
 def main() -> None:
