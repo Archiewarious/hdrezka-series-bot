@@ -215,9 +215,9 @@ async def _deliver(bot: Bot, s, user_id: int, items: list[Rendered], photos: boo
             msg = await posters.send_photo_cached(bot, s, user_id, r.page_id, r.poster_url, r.poster_file_id, r.text, kb)
             if msg is not None:
                 return msg.message_id
-        return (await bot.send_message(user_id, r.text, reply_markup=kb, disable_web_page_preview=True)).message_id
+        return (await bot.send_message(user_id, r.text, reply_markup=kb)).message_id
     body, kb = _digest(items, lang)
-    return (await bot.send_message(user_id, body, reply_markup=kb, disable_web_page_preview=True)).message_id
+    return (await bot.send_message(user_id, body, reply_markup=kb)).message_id
 
 
 # Отправлено, но отметка «отправлено» не записалась (сбой базы): id уведомления → (человек, номер сообщения).
@@ -440,7 +440,7 @@ async def main() -> None:
     # Один отправщик на базу: второй дал бы дубли при досылке после сбоя.
     lock_conn = await lifecycle.acquire_lock(lifecycle.SENDER_LOCK, "отправщик")
     watchdog = lifecycle.Watchdog("sender", WATCHDOG_LIMIT).start()
-    bot = Bot(cfg.bot_token, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+    bot = Bot(cfg.bot_token, default=DefaultBotProperties(parse_mode=ParseMode.HTML, link_preview_is_disabled=True))
     log.info("Sender запущен: %s сообщений/сек", cfg.send_rate)
     try:
         await run(bot, RateLimiter(cfg.send_rate), watchdog, lock_conn)

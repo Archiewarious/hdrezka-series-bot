@@ -77,13 +77,22 @@ docker compose up -d --build       # migrate → bot, poller, sender
 на настоящем Postgres. Интеграционные запускаются только на отдельной базе с именем `*_test`:
 
 ```bash
-docker compose build bot
-docker compose run --rm --no-deps bot sh -c 'TEST_DATABASE_URL="${DATABASE_URL%/*}/rezka_test" python -m pytest -q'
+docker compose --profile test build tests
+docker compose --profile test run --rm --no-deps tests
 ```
 
+Тесты — отдельная цель образа (`Dockerfile`, `target: test`): в боевом образе нет ни `tests/`, ни pytest.
 `--no-deps` обязателен: без него compose запустит сервис `migrate` на рабочей базе. База `rezka_test` создаётся
 один раз: `docker compose exec postgres psql -U rezka -c 'CREATE DATABASE rezka_test'`. В CI Postgres поднимается
-сервисом GitHub Actions.
+сервисом GitHub Actions. Тесты не ходят в сеть: настоящий HTTP-запрос из теста — ошибка (`tests/conftest.py`).
+
+Зависимости: верхний уровень — `requirements.in` и `requirements-dev.in`, закреплённые версии с хешами —
+`requirements.txt` и `requirements-dev.txt`, ставятся с `--require-hashes`. Обновить:
+
+```bash
+uv pip compile requirements.in --universal --python-version 3.12 --generate-hashes -o requirements.txt
+uv pip compile requirements-dev.in --universal --python-version 3.12 --generate-hashes -o requirements-dev.txt
+```
 
 ## Обслуживание
 

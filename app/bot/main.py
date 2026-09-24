@@ -291,7 +291,7 @@ async def cmd_start(msg: Message, command: CommandObject) -> None:
             await _send_card(msg, msg.from_user.id, target[1])
         else:
             text_, kb = await _render_franchise_overview(msg.from_user.id, target[1], None)
-            await msg.answer(_clip(text_), reply_markup=kb, disable_web_page_preview=True)
+            await msg.answer(_clip(text_), reply_markup=kb)
         return
     if is_new:
         # Первый Start: язык — осознанный выбор, а не догадка по клиенту Telegram.
@@ -352,7 +352,7 @@ async def cmd_my(msg: Message) -> None:
     if not guard.cheap_actions.allow(msg.from_user.id):
         return
     text_, kb = await _render_my(msg.from_user.id)
-    await msg.answer(_clip(text_), reply_markup=kb, disable_web_page_preview=True)
+    await msg.answer(_clip(text_), reply_markup=kb)
 
 
 @dp.message(F.text.in_(MENU["btn_find"]))
@@ -367,7 +367,7 @@ async def cmd_new(msg: Message) -> None:
     if not guard.cheap_actions.allow(msg.from_user.id):
         return
     text_, kb = await _render_new(msg.from_user.id)
-    await msg.answer(_clip(text_), reply_markup=kb, disable_web_page_preview=True)
+    await msg.answer(_clip(text_), reply_markup=kb)
 
 
 @dp.message(Command("settings"))
@@ -663,7 +663,7 @@ async def _handle_search(msg: Message, lang: str, query: str) -> None:
     text_ = t(lang, "found_n", n=len(rows) - 1)
     if g.hidden:
         text_ += t(lang, "hidden_local", n=g.hidden)
-    await msg.answer(text_, reply_markup=_kb(rows), disable_web_page_preview=True)
+    await msg.answer(text_, reply_markup=_kb(rows))
 
 
 _site_queries: dict[str, tuple[str, float]] = {}
@@ -901,7 +901,7 @@ async def _send_card(target: Message, user_id: int, page_id: int, just_created: 
         if row and row[0]:
             sent = await posters.send_photo_cached(target.bot, s, target.chat.id, page_id, row[0], row[1], text_, kb)
         await s.commit()
-    return sent or await target.answer(_clip(text_), reply_markup=kb, disable_web_page_preview=True)
+    return sent or await target.answer(_clip(text_), reply_markup=kb)
 
 
 def _voice_label(lang: str, sub: Subscription | None, voices: list[Voice]) -> str:
@@ -1740,14 +1740,14 @@ async def _edit_message(m: Message, text_: str, kb: InlineKeyboardMarkup) -> Non
     try:
         if m.photo:
             if len(text_) > posters.CAPTION_MAX_LEN:
-                await m.answer(text_, reply_markup=kb, disable_web_page_preview=True)
+                await m.answer(text_, reply_markup=kb)
             else:
                 await m.edit_caption(caption=text_, reply_markup=kb)
         else:
-            await m.edit_text(text_, reply_markup=kb, disable_web_page_preview=True)
+            await m.edit_text(text_, reply_markup=kb)
     except TelegramBadRequest as exc:
         if "message is not modified" not in str(exc):
-            await m.answer(text_, reply_markup=kb, disable_web_page_preview=True)
+            await m.answer(text_, reply_markup=kb)
 
 
 @dp.errors()
@@ -1776,7 +1776,8 @@ async def main() -> None:
     global bot
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     await init_db()
-    bot = Bot(cfg.bot_token, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+    # Превью ссылок выключено для всех сообщений разом: disable_web_page_preview в каждом вызове устарел (aiogram 3.31).
+    bot = Bot(cfg.bot_token, default=DefaultBotProperties(parse_mode=ParseMode.HTML, link_preview_is_disabled=True))
     global BOT_USERNAME
     BOT_USERNAME = (await bot.get_me()).username or BOT_USERNAME
     # Список команд: без language_code — запасной для всех прочих языков, дальше три явных.
