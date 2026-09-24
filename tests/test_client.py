@@ -188,3 +188,18 @@ def test_no_user_agent_by_default():
         await sess.close()
         return ua
     assert cfg.user_agent == "" and asyncio.run(scenario()) is None
+
+
+def test_403_on_every_mirror_is_access_blocked(mirrors):
+    c, script = client_with([FakeResp(403), FakeResp(403), FakeResp(403)])
+    with pytest.raises(AccessBlocked):
+        asyncio.run(c.get("/x/1-a.html"))
+    assert [u.split("/x/")[0] for u in script.calls] == ["https://m1.test", "https://m2.test", "https://m1.test"]
+
+
+def test_failed_anubis_pass_is_retried_then_blocked():
+    challenge = FakeResp(200, _challenge_page(1))
+    c, script = client_with([challenge, FakeResp(200, "pass"), FakeResp(200, _challenge_page(1))] * 3)
+    with pytest.raises(AccessBlocked):
+        asyncio.run(c.get("/x/1-a.html"))
+    assert len(script.calls) == 9, "каждая попытка: задача, «пройдено», снова задача"
