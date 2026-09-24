@@ -3,6 +3,7 @@
 Каждый тест — живой случай 10.09.2026 или защита от него. Сайт подменён: главная и страницы тайтлов
 собираются здесь же по той вёрстке, которую разбирает app/rezka/parser.py.
 """
+import asyncio
 import re
 from datetime import date, timedelta
 from types import SimpleNamespace
@@ -951,3 +952,32 @@ def test_buttons_are_built_from_the_public_url(db, monkeypatch):
     assert watch_url("/a/1-x.html", 5, 1, 2) == "https://public.test/a/1-x.html#t:5-s:1-e:2"
     assert post == "https://public.test/series/x/9100-a.html#t:56-s:1-e:3"
     assert site == ["https://public.test/series/x/9100-a.html"], "«На сайте» в карточке — от публичного домена"
+
+
+# ----------------------------------------------------------------------------- шаг 4 аудита (24.09.2026)
+
+def test_parallel_writes_of_one_new_franchise(db):
+    """Бот и поллер пишут одну новую франшизу одновременно: add + flush давал IntegrityError, теперь
+    INSERT … ON CONFLICT и блокировка страниц по возрастанию id."""
+    async def scenario():
+        voices = [(56, "Дубляж", None)]
+        pages = {5001: title_page(5001, "Новая [ТВ-1]", 1, 3, voices, [(5002, "Новая [ТВ-2]", TODAY.year)]),
+                 5002: title_page(5002, "Новая [ТВ-2]", 1, 3, voices, [(5001, "Новая [ТВ-1]", 2020)])}
+        site = FakeSite("", pages)
+        tps = {h: await svc.fetch_title_page(site, f"/series/y/{h}-p.html") for h in pages}
+
+        async def write(hid):
+            async with session() as s:
+                await svc.apply_title_page(s, hid, f"/series/y/{hid}-p.html", tps[hid])
+                await asyncio.sleep(0.05)                       # транзакции открыты одновременно
+                await s.commit()
+
+        await asyncio.gather(write(5001), write(5002), write(5001))
+        async with session() as s:
+            keys = (await s.execute(select(Franchise.key_hdrezka_id))).scalars().all()
+            links = (await s.execute(select(Page.hdrezka_id, Page.franchise_id))).all()
+            members = (await s.execute(text("SELECT count(*) FROM franchise_members"))).scalar()
+        return keys, links, members
+
+    keys, links, members = db(scenario)
+    assert keys == [5001] and len({f for _, f in links}) == 1 and len(links) == 2 and members == 2

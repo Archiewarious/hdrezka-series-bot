@@ -161,11 +161,14 @@ async def apply_title_page(s: AsyncSession, hdrezka_id: int, url: str, tp: Title
         log.warning("Страница %s отдала id %s (редирект на другое зеркало/слаг?)", hdrezka_id, tp.hdrezka_id)
 
     url = to_path(url)
-    page = await page_by_hid(s, hdrezka_id)
-    if page is None:
-        page = Page(hdrezka_id=hdrezka_id, title=tp.title or url, url=url)
-        s.add(page)
-        await s.flush()
+    # Страница и её части из блока — INSERT … ON CONFLICT и блокировка строк по возрастанию id: бот и поллер
+    # могут писать одну новую франшизу одновременно. Раньше add + flush давал IntegrityError, а разный порядок
+    # записи — взаимную блокировку (24.09.2026).
+    await _ensure_pages(s, [dict(hdrezka_id=hdrezka_id, title=tp.title or url, url=url)]
+                        + [dict(hdrezka_id=p.hdrezka_id, title=p.title, url=to_path(p.url), year=p.year)
+                           for p in tp.franchise if p.hdrezka_id and not p.is_current and p.hdrezka_id != hdrezka_id])
+    page = await s.get(Page, await s.scalar(select(Page.id).where(Page.hdrezka_id == hdrezka_id)),
+                       populate_existing=True)
 
     if tp.title:
         page.title = tp.title
@@ -300,9 +303,11 @@ async def _apply_franchise(s: AsyncSession, page: Page, tp: TitlePage) -> Franch
         if fr.key_hdrezka_id != key:          # ключ — минимальный id части (F15)
             fr.key_hdrezka_id = key
     else:
-        fr = Franchise(key_hdrezka_id=min(ids), name="")
-        s.add(fr)
-        await s.flush()
+        ins = pg_insert(Franchise).values(key_hdrezka_id=min(ids), name="")
+        fid = (await s.execute(ins.on_conflict_do_update(index_elements=[Franchise.key_hdrezka_id],
+                                                         set_={"key_hdrezka_id": ins.excluded.key_hdrezka_id})
+                               .returning(Franchise.id))).scalar_one()
+        fr = await s.get(Franchise, fid, populate_existing=True)
         known = False
 
     titles = [(p.title, p.year) for p in tp.franchise if p.title]
@@ -312,16 +317,12 @@ async def _apply_franchise(s: AsyncSession, page: Page, tp: TitlePage) -> Franch
     for part in tp.franchise:
         if part.is_current or not part.hdrezka_id:
             continue
-        existing = await page_by_hid(s, part.hdrezka_id)
-        if existing is None:
-            s.add(Page(hdrezka_id=part.hdrezka_id, title=part.title, url=to_path(part.url),
-                       year=part.year, franchise_id=fr.id))
-        else:
-            existing.franchise_id = fr.id
-            if part.year and not existing.year:
-                existing.year = part.year
-            if part.url and not existing.url:     # у анонса страницы ещё не было — появилась
-                existing.url = to_path(part.url)
+        existing = await page_by_hid(s, part.hdrezka_id)      # есть: _ensure_pages в apply_title_page
+        existing.franchise_id = fr.id
+        if part.year and not existing.year:
+            existing.year = part.year
+        if part.url and not existing.url:     # у анонса страницы ещё не было — появилась
+            existing.url = to_path(part.url)
     page.franchise_id = fr.id
     await s.flush()
 
@@ -382,6 +383,16 @@ async def _merge_franchise(s: AsyncSession, src: Franchise, dst: Franchise) -> N
         await s.delete(sub)
     await s.delete(src)
     await s.flush()
+
+
+async def _ensure_pages(s: AsyncSession, rows: list[dict]) -> None:
+    """Строки pages для этих id есть и заблокированы до конца транзакции. Порядок — по возрастанию id:
+    две транзакции с пересекающимися страницами ждут друг друга, а не блокируют взаимно."""
+    rows = sorted({r["hdrezka_id"]: r for r in rows}.values(), key=lambda r: r["hdrezka_id"])
+    for r in rows:
+        await s.execute(pg_insert(Page).values(**r).on_conflict_do_nothing(index_elements=[Page.hdrezka_id]))
+    await s.execute(select(Page.id).where(Page.hdrezka_id.in_([r["hdrezka_id"] for r in rows]))
+                    .order_by(Page.hdrezka_id).with_for_update())
 
 
 async def franchise_anchor(s: AsyncSession, franchise_id: int) -> Page | None:
@@ -489,10 +500,11 @@ async def upsert_page_from_update(s: AsyncSession, item: UpdateItem, url: str) -
     """Тайтл из блока обновлений, которого нет в каталоге: минимальная строка, остальное
     (тип, франшиза, озвучки, постер) дочитает очередь чтения — page_refreshed_at пуст."""
     page = await page_by_hid(s, item.hdrezka_id)
-    if page is None:
-        page = Page(hdrezka_id=item.hdrezka_id, title=item.title, url=to_path(url), section=item.section)
-        s.add(page)
-        await s.flush()
+    if page is None:        # без гонки с ботом: ON CONFLICT вместо add + flush
+        await s.execute(pg_insert(Page).values(hdrezka_id=item.hdrezka_id, title=item.title, url=to_path(url),
+                                               section=item.section)
+                        .on_conflict_do_nothing(index_elements=[Page.hdrezka_id]))
+        page = await page_by_hid(s, item.hdrezka_id)
     return page
 
 

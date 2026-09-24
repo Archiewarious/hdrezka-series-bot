@@ -51,6 +51,10 @@ class Config:
     feed_pages: int = int(os.getenv("FEED_PAGES", "1"))
     stale_alert_minutes: int = int(os.getenv("STALE_ALERT_MINUTES", "20"))
 
+    # --- Бот и сайт: общий потолок запросов бота к сайту на всех (24.09.2026) ---
+    bot_site_per_minute: int = int(os.getenv("BOT_SITE_PER_MINUTE", "10"))
+    bot_site_per_hour: int = int(os.getenv("BOT_SITE_PER_HOUR", "120"))
+
     # --- Рассылка ---
     send_rate: float = float(os.getenv("SEND_RATE", "25"))            # сообщений/сек
     send_batch: int = int(os.getenv("SEND_BATCH", "200"))

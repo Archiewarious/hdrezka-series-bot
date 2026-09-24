@@ -257,6 +257,16 @@ async def _site(coro):
     return await asyncio.wait_for(coro, timeout=guard.SITE_TIMEOUT)
 
 
+async def _read_page(hdrezka_id: int, url: str) -> svc.SyncResult:
+    """Чтение страницы ботом: запрос к сайту — с потолком ожидания и без открытой транзакции, запись — без таймаута:
+    отмена посреди записи оставила бы полусделанное (24.09.2026). Разрешение (guard.site_permit) — у вызывающего."""
+    tp = await _site(svc.fetch_title_page(client, url))
+    async with session() as s:
+        res = await svc.apply_title_page(s, hdrezka_id, url, tp)
+        await s.commit()
+    return res
+
+
 # ----------------------------------------------------------------------------- команды и меню
 
 @dp.message(CommandStart())
@@ -590,8 +600,9 @@ async def on_text(msg: Message) -> None:
         await msg.answer(t(lang, "query_short"), reply_markup=menu(lang))
         return
     link = _PATH_RX.search(msg.text[:guard.MAX_LINK_SCAN])
-    limiter = guard.site_actions if link else guard.cheap_actions   # локальный поиск сайт не трогает
-    if not limiter.allow(msg.from_user.id):
+    # Разрешение на сайт — там, где запрос к сайту действительно нужен (guard.site_permit): ссылка на известную
+    # страницу и поиск по каталогу отвечают из базы.
+    if not guard.cheap_actions.allow(msg.from_user.id):
         await msg.answer(t(lang, "too_fast"))
         return
     async with session() as s:
@@ -611,11 +622,15 @@ async def on_other(msg: Message) -> None:
         await msg.answer(t(lang, "text_only"), reply_markup=menu(lang))
 
 
+def _cached_search(query: str) -> list[FeedItem] | None:
+    hit = _search_cache.get(query.lower())
+    return hit[0] if hit and time.time() - hit[1] < SEARCH_TTL else None
+
+
 async def _search(query: str) -> list[FeedItem]:
     key = query.lower()
-    hit = _search_cache.get(key)
-    if hit and time.time() - hit[1] < SEARCH_TTL:
-        return hit[0]
+    if (cached := _cached_search(query)) is not None:
+        return cached
     items = parse_feed(await _site(client.search(query)))
     if len(_search_cache) > 2000:
         _search_cache.clear()
@@ -629,8 +644,8 @@ async def _handle_search(msg: Message, lang: str, query: str) -> None:
         g = group_hits(await svc.search_catalog(s, query))
         stats = await svc.franchise_stats(s, g.franchise_ids) if g.franchise_ids else {}
     if g.empty:
-        if not guard.site_actions.allow(msg.from_user.id):
-            await msg.answer(t(lang, "too_fast"))
+        if _cached_search(query) is None and (reason := guard.site_permit(msg.from_user.id)):
+            await msg.answer(t(lang, reason))
             return
         note = await msg.answer(t(lang, "searching"))
         await _site_search(note, lang, query, local_hidden=g.hidden)
@@ -670,8 +685,8 @@ async def cb_site_search(cb: CallbackQuery) -> None:
     if not hit or time.time() - hit[1] > SEARCH_TTL * 6:
         await cb.answer(t(lang, "query_stale"), show_alert=True)
         return
-    if not guard.site_actions.allow(cb.from_user.id):
-        await cb.answer(t(lang, "too_fast"))
+    if _cached_search(hit[0]) is None and (reason := guard.site_permit(cb.from_user.id)):
+        await cb.answer(t(lang, reason))
         return
     await cb.answer()
     note = await cb.message.answer(t(lang, "searching_site"))
@@ -755,13 +770,14 @@ async def _handle_link(msg: Message, lang: str, hdrezka_id: int, path: str) -> N
             _background(_refine_finished(note, msg.from_user.id, hdrezka_id, page_id, title))
         return
 
+    if reason := guard.site_permit(msg.from_user.id):
+        await msg.answer(t(lang, reason))
+        return
     url = path                     # путь: домен подставит клиент — текущее зеркало (24.09.2026)
     note = await msg.answer(t(lang, "reading_page"))
     try:
-        async with session() as s:
-            res = await _site(svc.sync_page(s, client, hdrezka_id, url))
-            await s.commit()
-            page_id, title = res.page.id, res.page.title
+        res = await _read_page(hdrezka_id, url)
+        page_id, title = res.page.id, res.page.title
     except PageGone:
         await note.edit_text(t(lang, "link_gone"))
         return
@@ -778,6 +794,9 @@ async def _handle_link(msg: Message, lang: str, hdrezka_id: int, path: str) -> N
 
 
 async def _refine_finished(note: Message, user_id: int, hdrezka_id: int, page_id: int, title: str) -> None:
+    """Флаг «завершён» отдаёт только поиск — уточняем в фоне, если разрешает лимит; нет — не уточняем."""
+    if _cached_search(title) is None and guard.site_permit(user_id):
+        return
     try:
         items = await _search(title)
     except (AccessBlocked, asyncio.TimeoutError):
@@ -948,11 +967,11 @@ async def cb_subscribe(cb: CallbackQuery) -> None:
     else:
         send_new = True
 
-    if not fresh or (svc.now() - fresh).days >= 1:
+    # Свежая страница — для карточки и расписания. Только если разрешает лимит: подписка уже создана,
+    # а страницу иначе прочитает поллер (очередь каталога или обновление подписанных).
+    if (not fresh or (svc.now() - fresh).days >= 1) and not guard.site_permit(cb.from_user.id):
         try:
-            async with session() as s:
-                await _site(svc.sync_page(s, client, hid, url))
-                await s.commit()
+            await _read_page(hid, url)
         except (AccessBlocked, PageGone, asyncio.TimeoutError):
             log.warning("Не прочитал страницу %s после подписки", hid)
 
@@ -1029,14 +1048,12 @@ async def _prefetch_parts(m: Message, user_id: int, fid: int, origin: int | None
         parts = (await s.execute(
             select(Page.hdrezka_id, Page.url).where(Page.franchise_id == fid, Page.page_refreshed_at.is_(None), Page.url != "")
             .order_by(Page.year.desc().nulls_last(), Page.id.desc()).limit(PREFETCH_PARTS))).all()
-    if not parts or not guard.site_actions.allow(user_id):
-        return
     done = 0
     for hid, url in parts:
+        if guard.site_permit(user_id):         # одно разрешение на каждое чтение
+            break
         try:
-            async with session() as s:
-                await _site(svc.sync_page(s, client, hid, url))
-                await s.commit()
+            await _read_page(hid, url)
             done += 1
         except PageGone:
             continue
