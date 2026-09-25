@@ -44,12 +44,12 @@ REFRESH_CANDIDATES = 3                  # кандидатов на единиц
 
 class Deferred(Exception):
     """Событию нужно чтение страницы, а лимит цикла исчерпан или страница не прочиталась. Разберём
-    в следующем цикле: блок хранит событие неделю, а от этой попытки в базе ничего не осталось — точка
-    сохранения откатилась. failed_page_id — неудачу чтения записываем уже после отката."""
+    в следующем цикле: блок хранит событие неделю, а от этой попытки в базе ничего не осталось — транзакция
+    события откатилась. read_failed — неудачу чтения записываем уже после отката."""
 
-    def __init__(self, failed_page_id: int | None = None) -> None:
+    def __init__(self, read_failed: bool = False) -> None:
         super().__init__()
-        self.failed_page_id = failed_page_id
+        self.read_failed = read_failed
 
 
 class Poller:
@@ -105,12 +105,15 @@ class Poller:
     async def _read(self, s, page: Page, required: bool) -> bool:
         """Чтение страницы ради события. Обязательное — новая серия на непрочитанной странице: без привязки
         к франшизе её подписчики уведомления не получат; при исчерпанном лимите или неудаче событие
-        откладывается, после READ_GIVE_UP_AFTER неудач подряд — идёт без чтения. Необязательное — обновить
-        список озвучек: берёт не больше половины лимита и просто пропускается. Неудачи — в базе (pages)."""
-        if required and page.read_failures >= READ_GIVE_UP_AFTER:
+        откладывается до следующего цикла, после READ_GIVE_UP_AFTER неудач подряд — идёт без чтения, пока не
+        подойдёт время следующей попытки. Часовых пауз очередей обновления событие не ждёт: премьера после одного
+        сбоя чтения приходила через час, а не через цикл (25.09.2026). Необязательное — обновить список озвучек:
+        берёт не больше половины лимита, ждёт паузу после неудач и просто пропускается. Неудачи — в базе (pages)."""
+        paused = page.next_read_at is not None and page.next_read_at > svc.now()
+        if required and page.read_failures >= READ_GIVE_UP_AFTER and paused:
             return False
-        waiting = page.id in self._failed_now or (page.next_read_at is not None and page.next_read_at > svc.now())
-        if waiting or self._reads_left <= (0 if required else EVENT_READS // 2):
+        if page.id in self._failed_now or (paused and not required) \
+                or self._reads_left <= (0 if required else EVENT_READS // 2):
             if required:
                 raise Deferred()
             return False
@@ -126,8 +129,8 @@ class Poller:
         except AccessBlocked as exc:
             self._failed_now.add(page.id)
             if required and page.read_failures + 1 < READ_GIVE_UP_AFTER:
-                log.warning("Страница %s не прочиталась ради события, повторю позже: %s", page.hdrezka_id, exc)
-                raise Deferred(failed_page_id=page.id) from exc
+                log.warning("Страница %s не прочиталась ради события, повторю в следующем цикле: %s", page.hdrezka_id, exc)
+                raise Deferred(read_failed=True) from exc
             log.warning("Страница %s не прочиталась ради события, иду дальше без неё: %s", page.hdrezka_id, exc)
             await svc.mark_read_failure(s, page.id, gone=False)
             return False
@@ -144,6 +147,7 @@ class Poller:
             return 0, 0
         await svc.meta_set(s, "updates_ok_at", svc.now().isoformat())
         await svc.meta_set(s, "updates_events", str(len(items)))
+        await s.commit()
         fresh_from = svc.now().date() - timedelta(days=1)          # «Сегодня» и «Вчера»
         new_eps = queued = deferred = failed = 0
         for item in reversed(items):                                # от старых к новым
@@ -151,26 +155,40 @@ class Poller:
                 break                                               # остальное — в следующем запуске: блок хранит неделю
             self._beat()
             fresh = item.day is not None and item.day >= fresh_from
+            # Событие — своей транзакцией: одна кривая страница не откатывает весь проход, а блокировки строк (чтение
+            # страницы блокирует все части франшизы) держатся одно событие, а не весь проход — бот не ждёт (25.09.2026).
             try:
-                # Точка сохранения на событие: одна кривая страница не откатывает весь проход.
-                async with s.begin_nested():
-                    e, q = await self._apply_update(s, item, fresh)
+                e, q = await self._apply_update(s, item, fresh)
+                await s.commit()
             except Deferred as d:
+                await s.rollback()
                 deferred += 1
-                if d.failed_page_id:                    # точка сохранения откатилась — неудачу пишем вне её
-                    await svc.mark_read_failure(s, d.failed_page_id, gone=False)
+                if d.read_failed:                       # попытку откатили — неудачу чтения пишем отдельно
+                    await self._mark_event_read_failure(s, item)
+                    await s.commit()
                 continue
             except AccessBlocked:
+                await s.rollback()
                 raise
             except Exception:
+                await s.rollback()
                 failed += 1
                 log.exception("Событие блока обновлений пропущено: %s s%se%s", item.hdrezka_id, item.season, item.episode)
                 continue
             new_eps, queued = new_eps + e, queued + q
         if deferred:
-            log.info("Блок обновлений: отложено до следующего цикла событий %s — кончился лимит чтения страниц", deferred)
+            log.info("Блок обновлений: отложено до следующего цикла событий %s — лимит чтения страниц или неудачное чтение",
+                     deferred)
         await svc.meta_set(s, "updates_failed", str(failed))      # видно в проверке здоровья, а не только в логе
         return new_eps, queued
+
+    async def _mark_event_read_failure(self, s, item: UpdateItem) -> None:
+        """Неудача чтения ради события — после отката его транзакции. Страницу, которую завело само событие,
+        заводим заново: иначе отметка ушла бы вместе с ней, счётчик неудач не рос, и событие про новый тайтл,
+        который не читается, откладывалось бы каждый цикл, пока блок его хранит (25.09.2026)."""
+        page = await svc.page_by_hid(s, item.hdrezka_id) or await svc.upsert_page_from_update(s, item, item.url)
+        await svc.mark_read_failure(s, page.id, gone=False)
+        self._failed_now.add(page.id)
 
     async def _apply_update(self, s, item: UpdateItem, fresh: bool) -> tuple[int, int]:
         """Одно событие блока → (новых серий, уведомлений)."""
@@ -217,40 +235,60 @@ class Poller:
 
     # ------------------------------------------------------------------ 1б: новые части франшиз
 
-    async def announce_new_parts(self, s) -> int:
+    PENDING_SQL = text("""
+        SELECT m.franchise_id, m.hdrezka_id FROM franchise_members m
+          JOIN pages p ON p.hdrezka_id = m.hdrezka_id
+         WHERE m.announce = 'pending' AND p.url <> ''   -- анонс без страницы ждёт, пока она появится
+         ORDER BY m.seen_at, m.hdrezka_id LIMIT :lim""")
+
+    async def announce_new_parts(self) -> int:
         """Новые части франшиз — фильмы, спин-оффы, сезоны. В состав (franchise_members, pending) их дописывает
         любое чтение страницы, бота или поллера; уведомляет только поллер, здесь. Старые части — молча
         (skipped). Сериал, у которого уже есть серии, — только подписчикам других частей: подписчики
-        франшизы знают о нём по уведомлениям о сериях. Дубли отсекает uq_notification."""
-        rows = (await s.execute(text("""
-            SELECT m.franchise_id, m.hdrezka_id FROM franchise_members m
-              JOIN pages p ON p.hdrezka_id = m.hdrezka_id
-             WHERE m.announce = 'pending' AND p.url <> ''   -- анонс без страницы ждёт, пока она появится
-             ORDER BY m.seen_at, m.hdrezka_id LIMIT :lim"""), {"lim": PER_CYCLE_ANNOUNCE})).all()
+        франшизы знают о нём по уведомлениям о сериях. Дубли отсекает uq_notification.
+        Каждая часть — отдельно: неожиданная ошибка одной — лог и следующая. Раньше она роняла весь цикл,
+        вторая его часть не выполнялась ни разу, а проверка здоровья этого не видела (25.09.2026)."""
+        async with session() as s:
+            rows = (await s.execute(self.PENDING_SQL, {"lim": PER_CYCLE_ANNOUNCE})).all()
         queued = 0
         for fid, hid in rows:
+            if lifecycle.stopping():
+                break
+            self._beat()
+            try:
+                queued += await self._announce_part(fid, hid)
+            except Exception:
+                self._refresh_failed += 1
+                log.exception("Новая часть %s франшизы %s: объявление не удалось — повторю в следующем цикле", hid, fid)
+        return queued
+
+    async def _announce_part(self, fid: int, hid: int) -> int:
+        """Одна новая часть: тип дочитываем вне транзакции (_refresh_unit), объявление — короткой транзакцией."""
+        async with session() as s:
             page = await svc.page_by_hid(s, hid)
-            if page.content_type is None:                 # тип части — для текста и решения, кому писать
-                if self._reads_left <= 0:
-                    continue                              # лимит чтений цикла — дочитаем в следующем
-                self._reads_left -= 1
-                try:
-                    await self.sync(s, page.hdrezka_id, page.url)
-                except PageGone as exc:
-                    await svc.mark_read_failure(s, page.id, gone=True)
-                    log.warning("Новая часть %s пропала с сайта: %s — сообщу без типа", hid, exc)
-                except AccessBlocked as exc:
-                    log.warning("Не прочитал новую часть %s: %s — сообщу без типа", hid, exc)
-            status = "skipped"
+            pid, url, ctype = page.id, page.url, page.content_type
+            waiting = page.next_read_at is not None and page.next_read_at > svc.now()
+        if ctype is None and not waiting:                  # тип части — для текста и решения, кому писать
+            if self._reads_left <= 0:
+                return 0                                   # лимит чтений цикла — дочитаем в следующем
+            self._reads_left -= 1
+            try:
+                await self._refresh_unit(hid, url, pid)    # не прочиталась — неудача отмечена, сообщим без типа
+            except AccessBlocked as exc:
+                self._reads_left = 0                       # доступа нет — в этом цикле больше не читаем
+                log.warning("Не прочитал новую часть %s: %s — сообщу без типа", hid, exc)
+        async with session() as s:
+            page = await svc.page_by_hid(s, hid)
+            n, status = 0, "skipped"
             if svc.is_recent_part(page):
                 has_episodes = await s.scalar(select(Episode.id).where(Episode.page_id == page.id).limit(1)) is not None
                 n = await svc.enqueue_new_part(s, fid, page, only_page_subscribers=has_episodes)
-                queued += n
                 status = "sent"
                 log.info("НОВАЯ ЧАСТЬ франшизы %s: %s → %s уведомлений", fid, page.title, n)
             await s.execute(text("UPDATE franchise_members SET announce = :st WHERE franchise_id = :f AND hdrezka_id = :h"),
                             {"st": status, "f": fid, "h": hid})
-        return queued
+            await s.commit()
+        return n
 
     # ------------------------------------------------------------------ 2–4: по одной единице
 
@@ -423,16 +461,15 @@ class Poller:
         self._cycle_new_parts = 0
         self._reads_left = EVENT_READS
         self._failed_now = set()
+        self._refresh_failed = 0
         async with session() as s:
             new_eps, queued = await self.process_updates(s)
             # События и уведомления фиксируем сразу: дальше сверки и чтение страниц ходят на сайт минуты.
             await svc.meta_set(s, "last_poll_ok", svc.now().isoformat())
             await s.commit()
-            queued += await self.announce_new_parts(s)
-            await s.commit()
+        queued += await self.announce_new_parts()
         # Вторая часть — по одной единице, у каждой своя короткая транзакция. Потеря доступа заканчивает её
         # до следующего цикла; ошибка одной страницы — только её.
-        self._refresh_failed = 0
         fr = pg = rd = 0
         try:
             fr = await self.refresh_franchises()

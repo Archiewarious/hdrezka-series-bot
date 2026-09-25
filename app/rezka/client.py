@@ -245,8 +245,14 @@ class RezkaClient:
         return await self.request("GET", path, retries=retries)
 
     async def home(self) -> str:
-        """Главная: блок «Обновления» — неделя вышедших серий по дням, с озвучкой (F13)."""
-        return await self.get("/")
+        """Главная: блок «Обновления» — неделя вышедших серий по дням, с озвучкой (F13). Главная не может «пропасть
+        с сайта»: 404 на корне — сломанное зеркало. Следующее зеркало и AccessBlocked — поллер берёт паузу, а не
+        повторяет каждые 3 минуты на том же адресе (25.09.2026)."""
+        try:
+            return await self.get("/")
+        except PageGone as exc:
+            self._next_mirror()
+            raise AccessBlocked(f"главная: {exc}") from exc
 
     async def title_page(self, url: str) -> str:
         """Страница тайтла: озвучки, серии, франшиза, расписание."""

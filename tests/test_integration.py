@@ -550,13 +550,18 @@ def test_health_sees_that_events_stopped(db):
             before = await health.check(s)
             await svc.meta_set(s, "last_poll_ok", svc.now().isoformat())
             await svc.meta_set(s, "updates_ok_at", svc.now().isoformat())
+            await svc.meta_set(s, "refresh_ok_at", (svc.now() - timedelta(hours=1)).isoformat())
             await _page(s, 900, "Живой", rows=[(1, 1)])
+            refresh_stale = await health.check(s)
+            await svc.meta_set(s, "refresh_ok_at", svc.now().isoformat())
             after = await health.check(s)
             await s.commit()
-        return before, after
+        return before, refresh_stale, after
 
-    before, after = db(scenario)
-    assert len(before) == 3 and after == []
+    before, refresh_stale, after = db(scenario)
+    assert len(before) == 4 and after == []
+    # 25.09.2026: цикл, падавший после блока обновлений, выглядел здоровым — вторая часть цикла тоже здоровье.
+    assert refresh_stale == ["обновление страниц и сверка франшиз не завершались уже 1 ч"]
 
 
 # ----------------------------------------------------------------------------- шаг 1 аудита (24.09.2026)

@@ -203,3 +203,14 @@ def test_failed_anubis_pass_is_retried_then_blocked():
     with pytest.raises(AccessBlocked):
         asyncio.run(c.get("/x/1-a.html"))
     assert len(script.calls) == 9, "каждая попытка: задача, «пройдено», снова задача"
+
+
+def test_home_404_means_broken_mirror_not_gone_page(mirrors):
+    """Главная не пропадает с сайта: 404 на корне — сломанное зеркало. Раньше это был PageGone — поллер не менял
+    зеркало и без паузы повторял запрос каждый цикл (25.09.2026)."""
+    c, script = client_with([FakeResp(404), FakeResp(200, "<html>блок</html>")])
+    with pytest.raises(AccessBlocked):
+        asyncio.run(c.home())
+    assert c.base_url == "https://m2.test", "следующее зеркало"
+    assert asyncio.run(c.home()) == "<html>блок</html>"
+    assert script.calls == ["https://m1.test/", "https://m2.test/"]

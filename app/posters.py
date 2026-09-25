@@ -133,7 +133,11 @@ async def send_photo_cached(bot: Bot, s, chat_id: int, page_id: int, poster_url:
             return await bot.send_photo(chat_id, poster_file_id, caption=caption, reply_markup=kb)
         except TelegramBadRequest as exc:
             if not _FILE_ID_ERROR_RX.search(exc.message or ""):
-                raise                       # ошибка не про картинку: кэш верный, отказ разберёт вызывающий
+                # Отказ не про file_id: кэш не трогаем, пост уйдёт текстом. Не прошёл и текст (чат недоступен) —
+                # отказ разберёт вызывающий. Раньше такое уведомление сразу помечалось неотправленным, а незнакомая
+                # формулировка отказа по file_id стоила человеку уведомления (25.09.2026).
+                log.warning("Постер страницы %s: Telegram отказал (%s) — отправлю текстом", page_id, exc.message)
+                return None
             log.warning("Постер страницы %s: file_id не принят (%s) — загружу заново", page_id, exc.message)
             await s.execute(text("UPDATE pages SET poster_file_id = NULL WHERE id = :p"), {"p": page_id})
     if not poster_url:

@@ -314,7 +314,9 @@ async def _send_user(bot: Bot, limiter: RateLimiter, user_id: int, items: list, 
                 log.warning("Flood control от Telegram: пауза %s с", exc.retry_after)
                 await _requeue(s, rest, seconds=exc.retry_after)
                 await s.commit()
-                await asyncio.sleep(exc.retry_after)
+                # Пауза прерывается сигналом остановки и отмечает сторожа: долгий flood wait не должен ни держать
+                # остановку до SIGKILL, ни сойти за зависание (25.09.2026).
+                await lifecycle.pause(exc.retry_after, beat)
                 return sent, False
             except TelegramForbiddenError:
                 # Пользователь заблокировал бота — больше не пишем и не копим очередь.

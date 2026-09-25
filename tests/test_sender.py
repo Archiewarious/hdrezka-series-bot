@@ -51,9 +51,9 @@ def test_blocked_bot_deactivates_the_person(db):
 def test_flood_control_requeues_with_its_pause(db, monkeypatch):
     slept = []
 
-    async def fake_sleep(sec):
+    async def fake_pause(sec, beat=None):
         slept.append(sec)
-    monkeypatch.setattr(sender.asyncio, "sleep", fake_sleep)
+    monkeypatch.setattr(sender.lifecycle, "pause", fake_pause)
 
     async def scenario():
         await _two_new_episodes(32)
@@ -199,7 +199,11 @@ def test_long_daily_digest_goes_out_in_parts_and_nothing_is_lost(db):
 def test_poster_cache_survives_errors_that_are_not_about_the_picture(db, monkeypatch):
     """Кэш постера сбрасывался при любом отказе Telegram — и картинка грузилась заново без причины."""
     class ChatGoneBot(PhotoBot):
+        """Чат недоступен — и для фото, и для текста."""
         async def send_photo(self, chat_id, photo, caption=None, reply_markup=None, **kw):
+            raise TelegramBadRequest(method=None, message="chat not found")
+
+        async def send_message(self, chat_id, text, reply_markup=None, **kw):
             raise TelegramBadRequest(method=None, message="chat not found")
 
     async def scenario():
@@ -212,6 +216,28 @@ def test_poster_cache_survives_errors_that_are_not_about_the_picture(db, monkeyp
     assert db(scenario) == ("GOOD-ID", "failed")
 
 
+def test_unknown_refusal_of_the_picture_still_delivers_the_post_as_text(db, monkeypatch):
+    """Telegram отказал фото по причине, которую мы не распознали: кэш постера не трогаем, пост уходит текстом.
+    Раньше такое уведомление сразу помечалось неотправленным (25.09.2026)."""
+    async def no_download(url):
+        raise AssertionError("кэш верный — картинку заново не качаем")
+    monkeypatch.setattr(posters, "download", no_download)
+
+    class OddRefusalBot(PhotoBot):
+        async def send_photo(self, chat_id, photo, caption=None, reply_markup=None, **kw):
+            raise TelegramBadRequest(method=None, message="MEDIA_EMPTY")
+
+    async def scenario():
+        pid = await _post_with_poster(40, 4000, "GOOD-ID")
+        bot = OddRefusalBot()
+        await sender.send_batch(bot, sender.RateLimiter(1000))
+        async with session() as s:
+            file_id = await s.scalar(text("SELECT poster_file_id FROM pages WHERE id = :p"), {"p": pid})
+        return file_id, len(bot.sent), (await _rows())[0][0]
+
+    assert db(scenario) == ("GOOD-ID", 1, "sent")
+
+
 def test_poster_only_from_allowed_hosts_and_formats():
     assert posters.safe_url("https://static.hdrezka.ac/i/x.jpg")
     assert not posters.safe_url("https://evil.example/x.jpg"), "чужой хост — не качаем"
@@ -219,3 +245,28 @@ def test_poster_only_from_allowed_hosts_and_formats():
     Image.new("RGB", (10, 10)).save(buf, "GIF")
     with pytest.raises(Exception):
         posters._to_standard(buf.getvalue())
+
+
+def test_stop_signal_interrupts_a_long_flood_control_pause(db):
+    """Flood wait на 1000 с: сигнал остановки прерывает паузу, а взятые уведомления других людей сразу возвращаются
+    в очередь. Раньше пауза была обычным sleep — остановка ждала её до SIGKILL (25.09.2026)."""
+    import asyncio
+
+    from app import lifecycle
+
+    class FloodThenStop(FakeBot):
+        async def send_message(self, chat_id, text, reply_markup=None, **kw):
+            lifecycle.request_stop()
+            raise TelegramRetryAfter(method=None, message="Too Many Requests", retry_after=1000)
+
+    async def scenario():
+        await _two_new_episodes(41)
+        await _two_new_episodes(42)
+        await asyncio.wait_for(sender.send_batch(FloodThenStop(), sender.RateLimiter(1000)), timeout=10)
+        async with session() as s:
+            return [tuple(r) for r in (await s.execute(text(
+                "SELECT user_id, status, attempts, next_attempt_at > now() + interval '900 seconds' "
+                "FROM notifications ORDER BY user_id, id"))).all()]
+
+    assert db(scenario) == [(41, "pending", 1, True)] * 2 + [(42, "pending", 0, False)] * 2, \
+        "первому — повтор после flood wait, второму — сразу в очередь без штрафа"

@@ -254,7 +254,7 @@ def test_healthcheck_process_runs_on_its_own_engine(db):
     async def scenario():
         from app import service as svc
         async with session() as s:
-            for key in ("last_poll_ok", "updates_ok_at"):
+            for key in ("last_poll_ok", "updates_ok_at", "refresh_ok_at"):
                 await svc.meta_set(s, key, svc.now().isoformat())
             await s.execute(text("INSERT INTO users (id) VALUES (1)"))
             await s.execute(text("INSERT INTO pages (hdrezka_id, title, url) VALUES (1, 'x', '/x/1-a.html')"))
