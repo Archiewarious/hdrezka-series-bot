@@ -4,7 +4,7 @@
 что события идут и что уведомления действительно уходят.
 
     python -m app.health            # всё: код выхода 1 и причины построчно
-    python -m app.health events     # поллер: блок разбирается, новые серии появляются
+    python -m app.health events     # поллер: блок разбирается, новые серии появляются, вторая часть цикла идёт
     python -m app.health delivery   # отправщик: уведомления не залёживаются и не падают
 """
 from __future__ import annotations
@@ -20,6 +20,9 @@ from app.config import cfg
 
 POLL_STALE = timedelta(minutes=cfg.stale_alert_minutes)
 EVENTS_STALE = timedelta(minutes=cfg.stale_alert_minutes)
+# Вторая часть цикла (сверка франшиз, обновление подписанных страниц, очередь каталога) идёт каждый цикл. Её не
+# смотрели: цикл, падавший после блока обновлений, выглядел здоровым, и пинг мониторинга шёл дальше (25.09.2026).
+REFRESH_STALE = timedelta(minutes=cfg.stale_alert_minutes)
 NO_NEW_EPISODES = timedelta(hours=12)    # на сайте 70–100 событий в сутки (F13): полсуток без новых серий — сбой
 DELIVERY_LATE = timedelta(minutes=15)    # срок наступил, а уведомление не ушло
 
@@ -32,7 +35,8 @@ def _fmt(d: timedelta) -> str:
 async def _events(s, at: datetime) -> list[str]:
     problems: list[str] = []
     for key, limit, what in (("last_poll_ok", POLL_STALE, "поллер не завершал цикл"),
-                             ("updates_ok_at", EVENTS_STALE, "блок обновлений не разбирается")):
+                             ("updates_ok_at", EVENTS_STALE, "блок обновлений не разбирается"),
+                             ("refresh_ok_at", REFRESH_STALE, "обновление страниц и сверка франшиз не завершались")):
         value = await svc.meta_get(s, key)
         if not value:
             problems.append(f"{what}: ни разу")
@@ -79,10 +83,18 @@ async def check(s, at: datetime | None = None, part: str = "all") -> list[str]:
 
 
 async def _main(part: str) -> int:
-    from app.db import engine, session
-    async with session() as s:
-        problems = await check(s, part=part)
-    await engine.dispose()
+    """Healthcheck контейнера — отдельный короткий процесс раз в 5 минут: пул ему не нужен (NullPool), одно
+    соединение открывается и закрывается."""
+    from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
+    from sqlalchemy.pool import NullPool
+
+    from app.db import CONNECT_ARGS
+    engine = create_async_engine(cfg.database_url, poolclass=NullPool, connect_args=CONNECT_ARGS)
+    try:
+        async with AsyncSession(engine) as s:
+            problems = await check(s, part=part)
+    finally:
+        await engine.dispose()
     for p in problems:
         print(p)
     return 1 if problems else 0

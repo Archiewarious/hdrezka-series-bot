@@ -8,6 +8,7 @@ import asyncio
 import io
 import ipaddress
 import logging
+import re
 from urllib.parse import urlsplit
 
 import aiohttp
@@ -28,6 +29,9 @@ POSTER_TIMEOUT = 10
 POSTER_MAX_BYTES = 10 * 1024 * 1024  # лимит Telegram на загрузку фото
 POSTER_MAX_PIXELS = 40_000_000       # постеры HDREZKA до ~6 Мп; больше — «бомба», распаковка съест память
 Image.MAX_IMAGE_PIXELS = POSTER_MAX_PIXELS
+POSTER_FORMATS = ["JPEG", "PNG", "WEBP"]   # Pillow открывает только их: у редких форматов свои уязвимости разбора
+# Ошибки самого file_id: только они сбрасывают кэш. Прочие (чат, подпись, кнопки) к картинке не относятся.
+_FILE_ID_ERROR_RX = re.compile(r"(?i)file[ _]?(id|identifier|reference)|wrong remote file|wrong type of the web page")
 
 
 class PosterRejected(Exception):
@@ -47,7 +51,9 @@ def safe_url(url: str | None) -> bool:
         ipaddress.ip_address(u.hostname)
         return False
     except ValueError:
-        return True
+        pass
+    # Только разрешённые хосты CDN (POSTER_HOSTS, 24.09.2026): поддомены тоже.
+    return any(u.hostname == h or u.hostname.endswith("." + h) for h in cfg.poster_hosts)
 
 
 async def download(url: str) -> bytes | None:
@@ -57,7 +63,8 @@ async def download(url: str) -> bytes | None:
     try:
         async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=POSTER_TIMEOUT)) as http:
             # Без редиректов: иначе проверка адреса выше обходится перенаправлением на внутренний адрес.
-            async with http.get(url, headers={"User-Agent": cfg.user_agent}, allow_redirects=False) as resp:
+            headers = {"User-Agent": cfg.user_agent} if cfg.user_agent else None   # пусто — UA aiohttp
+            async with http.get(url, headers=headers, allow_redirects=False) as resp:
                 if resp.status != 200 or not resp.content_type.startswith("image/"):
                     log.warning("Постер %s: HTTP %s, %s", url, resp.status, resp.content_type)
                     return None
@@ -81,7 +88,7 @@ def _to_standard(data: bytes) -> bytes:
     выглядела лесенкой (12.09.2026). Картинка вписывается целиком — не обрезаем, у постеров текст по краям, —
     а поля закрывает размытая затемнённая копия её же: так это читается как фон, а не как пустые полосы."""
     try:
-        src = Image.open(io.BytesIO(data))
+        src = Image.open(io.BytesIO(data), formats=POSTER_FORMATS)
     except Image.DecompressionBombError as exc:          # больше 2×POSTER_MAX_PIXELS — Pillow сам
         raise PosterRejected(str(exc)) from exc
     with src:
@@ -125,6 +132,12 @@ async def send_photo_cached(bot: Bot, s, chat_id: int, page_id: int, poster_url:
         try:
             return await bot.send_photo(chat_id, poster_file_id, caption=caption, reply_markup=kb)
         except TelegramBadRequest as exc:
+            if not _FILE_ID_ERROR_RX.search(exc.message or ""):
+                # Отказ не про file_id: кэш не трогаем, пост уйдёт текстом. Не прошёл и текст (чат недоступен) —
+                # отказ разберёт вызывающий. Раньше такое уведомление сразу помечалось неотправленным, а незнакомая
+                # формулировка отказа по file_id стоила человеку уведомления (25.09.2026).
+                log.warning("Постер страницы %s: Telegram отказал (%s) — отправлю текстом", page_id, exc.message)
+                return None
             log.warning("Постер страницы %s: file_id не принят (%s) — загружу заново", page_id, exc.message)
             await s.execute(text("UPDATE pages SET poster_file_id = NULL WHERE id = :p"), {"p": page_id})
     if not poster_url:
@@ -142,8 +155,13 @@ async def send_photo_cached(bot: Bot, s, chat_id: int, page_id: int, poster_url:
         log.warning("Постер страницы %s: Telegram не принял картинку (%s) — отправлю текстом", page_id, exc.message)
         return None
     if msg.photo:
-        # Привязываем к URL: если постер к этому моменту сменился, file_id уже не тот.
-        await s.execute(text("UPDATE pages SET poster_file_id = :f WHERE id = :p AND poster_url = :u"),
-                        {"f": msg.photo[-1].file_id, "p": page_id, "u": poster_url})
-        log.info("Постер страницы %s загружен в Telegram (%s байт)", page_id, len(data))
+        # Привязываем к URL: если постер к этому моменту сменился, file_id уже не тот. Точка сохранения: сбой
+        # записи кэша не должен выглядеть как неудачная отправка — сообщение уже ушло (24.09.2026).
+        try:
+            async with s.begin_nested():
+                await s.execute(text("UPDATE pages SET poster_file_id = :f WHERE id = :p AND poster_url = :u"),
+                                {"f": msg.photo[-1].file_id, "p": page_id, "u": poster_url})
+            log.info("Постер страницы %s загружен в Telegram (%s байт)", page_id, len(data))
+        except Exception as exc:
+            log.warning("Постер страницы %s: file_id не записался (%s) — загрузится ещё раз", page_id, exc)
     return msg

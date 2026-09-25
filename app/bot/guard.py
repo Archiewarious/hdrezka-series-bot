@@ -7,6 +7,8 @@ import re
 import time
 from collections import defaultdict, deque
 
+from app.config import cfg
+
 MAX_QUERY_LEN = 100
 MAX_SUBSCRIPTIONS = 100
 MAX_VOICES = 30              # озвучек в одном фильтре: больше не бывает у самых популярных тайтлов
@@ -15,7 +17,9 @@ MAX_LINK_SCAN = 512          # ссылку ищем в начале сообщ�
 SITE_TIMEOUT = 25            # сек ожидания ответа сайта, дальше — «попробуйте позже»
 TEXT_MAX = 4000              # лимит Telegram 4096 считается после разбора разметки и в UTF-16: запас
 
-_CONTROL_RX = re.compile(r"[\x00-\x08\x0b-\x1f\x7f​-‏ -‮]")
+# Управляющие и невидимые символы: нулевой ширины, направление текста (в т. ч. изоляты U+2066–2069), BOM.
+# Экранированы: невидимые символы в исходнике прячут, что на самом деле написано (ruff PLE2502/2515).
+_CONTROL_RX = re.compile(r"[\x00-\x08\x0b-\x1f\x7f\u200b-\u200f\u2028-\u202e\u2066-\u2069\ufeff]")
 _SPACES_RX = re.compile(r"\s+")
 
 
@@ -53,4 +57,20 @@ feedback_actions = UserLimiter(per_minute=3, per_hour=15)  # письма авт
 # Общий предел на все апдейты человека — поверх пределов отдельных действий: нестандартный клиент или
 # скрипт не должен загрузить бота, базу и общий лимит Telegram на исходящие (~30 сообщений/с на бота).
 flood = UserLimiter(per_minute=40, per_hour=1000)
+# Общий потолок запросов бота к сайту — на всех людей сразу. Рабочий IP один, бюджет 30–60 запросов в час на всё:
+# без потолка один аккаунт заставлял бота сделать ~300 запросов в час (подписка читала страницу под дешёвым
+# лимитом, уточнение «завершён» и дочитывание частей — без лимита; 24.09.2026).
+bot_site = UserLimiter(per_minute=cfg.bot_site_per_minute, per_hour=cfg.bot_site_per_hour)
+_BOT = 0
 flood_log = UserLimiter(per_minute=1, per_hour=10)          # строка в лог о флуде — не чаще раза в минуту
+
+
+def site_permit(user_id: int) -> str | None:
+    """Разрешение на один запрос бота к сайту: None — можно; иначе ключ ответа — too_fast (предел человека)
+    или busy (общий потолок бота исчерпан: «сайт занят»). Фоновые чтения при отказе просто пропускаются —
+    страницу прочитает поллер."""
+    if not site_actions.allow(user_id):
+        return "too_fast"
+    if not bot_site.allow(_BOT):
+        return "busy"
+    return None

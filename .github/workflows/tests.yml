@@ -1,5 +1,8 @@
 name: tests
 on: [push, pull_request]
+# Токену CI нужно только читать код (24.09.2026): ни записи в репозиторий, ни пакетов, ни комментариев.
+permissions:
+  contents: read
 jobs:
   pytest:
     runs-on: ubuntu-latest
@@ -17,11 +20,24 @@ jobs:
           --health-cmd "pg_isready -U rezka" --health-interval 5s --health-timeout 5s --health-retries 20
     env:
       TEST_DATABASE_URL: postgresql+asyncpg://rezka:rezka@localhost:5432/rezka_test
+      DATABASE_URL: postgresql+asyncpg://rezka:rezka@localhost:5432/rezka_test   # alembic — тоже на тестовой базе
+      BOT_TOKEN: "0:test"
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
           cache: pip
-      - run: pip install -r requirements.txt
-      - run: python -m pytest -q
+          cache-dependency-path: requirements-dev.txt
+      - name: зависимости строго по хешам
+        run: pip install --require-hashes -r requirements-dev.txt
+      - name: ruff
+        run: ruff check --select F,B,E9,PLE app
+      - name: миграции вверх и сверка с моделями
+        run: python -m alembic upgrade head && python -m alembic check
+      - name: миграции вниз до нуля и снова вверх
+        run: python -m alembic downgrade base && python -m alembic upgrade head
+      - name: pytest
+        run: python -m pytest -q
+      - name: известные уязвимости зависимостей
+        run: pip-audit -r requirements.txt --require-hashes --disable-pip

@@ -59,6 +59,26 @@ class Franchise(Base):
     name: Mapped[str] = mapped_column(Text)
     refreshed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    # Сверка состава не удалась — следующая попытка через 1, 2, 4… часа, не реже раза в сутки (24.09.2026)
+    refresh_failures: Mapped[int] = mapped_column(SmallInteger, default=0, server_default=text("0"))
+    next_refresh_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class FranchiseMember(Base):
+    """Состав франшизы таким, каким его показывал блок частей сайта (24.09.2026). Новую часть поллер узнаёт
+    по нему, а не по появлению страницы в базе: бот заносит страницы раньше (поиск, ссылка), и о новом
+    фильме тогда не узнавал никто. announce: baseline — было в составе при знакомстве с франшизой;
+    pending — появилось позже и ждёт уведомления; sent — уведомление поставлено; skipped — старая часть."""
+    __tablename__ = "franchise_members"
+    __table_args__ = (
+        CheckConstraint("announce IN ('baseline', 'pending', 'sent', 'skipped')", name="ck_franchise_member_announce"),
+        Index("franchise_members_pending", "seen_at", postgresql_where=text("announce = 'pending'")),
+    )
+
+    franchise_id: Mapped[int] = mapped_column(ForeignKey("franchises.id", ondelete="CASCADE"), primary_key=True)
+    hdrezka_id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    announce: Mapped[str] = mapped_column(String(8), server_default=text("'baseline'"))
 
 
 class Page(Base):
@@ -89,6 +109,11 @@ class Page(Base):
         ForeignKey("franchises.id", ondelete="SET NULL")
     )
     page_refreshed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    # Неудачи чтения (24.09.2026): одна недоступная страница не должна держать очередь. 404/410 — gone_at и
+    # попытка через 1, 2, 4… дня (не реже раза в 30 дней); другая ошибка — через 1, 2, 4… часа (не реже раза в сутки).
+    read_failures: Mapped[int] = mapped_column(SmallInteger, default=0, server_default=text("0"))
+    next_read_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    gone_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     last_event_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
@@ -149,6 +174,8 @@ class Subscription(Base):
               postgresql_where=text("franchise_id IS NOT NULL")),
         Index("subs_by_page", "page_id"),
         Index("subs_by_franchise", "franchise_id"),
+        # «Мои подписки», календарь, «Новое» ищут по человеку; частичные уникальные индексы выше этого не дают.
+        Index("subs_by_user", "user_id"),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
@@ -162,16 +189,21 @@ class Subscription(Base):
 
 class Notification(Base):
     """Outbox. Транзитная таблица: отправленное удаляется через 7 дней.
-    Несколько sender'ов работают через FOR UPDATE SKIP LOCKED."""
+    Отправщик один (advisory lock, app/lifecycle.py): второй дал бы дубли — захват SKIP LOCKED защищает
+    от гонки за строки, но не от двух процессов, досылающих одно и то же после сбоя (24.09.2026)."""
     __tablename__ = "notifications"
     __table_args__ = (
         UniqueConstraint("user_id", "kind", "ref_id", name="uq_notification"),
         Index("notifications_queue", "next_attempt_at", "id", postgresql_where=text("status = 'pending'")),
+        # Возврат зависших «отправляется» (RECOVER_SQL) и очистка отправленного — без чтения всей таблицы.
+        Index("notifications_sending", "next_attempt_at", postgresql_where=text("status = 'sending'")),
+        Index("notifications_done", func.coalesce(text("sent_at"), text("created_at")),
+              postgresql_where=text("status IN ('sent', 'failed')")),
     )
 
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
     user_id: Mapped[int] = mapped_column(BigInteger)
-    kind: Mapped[str] = mapped_column(String(16))                  # episode | voice | new_part
+    kind: Mapped[str] = mapped_column(String(16))                  # episode | voice:<translator_id> | new_part
     ref_id: Mapped[int] = mapped_column(BigInteger)                # episodes.id / episodes.id / pages.id
     status: Mapped[str] = mapped_column(String(16), default="pending", server_default=text("'pending'"))
     attempts: Mapped[int] = mapped_column(Integer, default=0, server_default=text("0"))
@@ -195,10 +227,13 @@ class Meta(Base):
 class Feedback(Base):
     """Обращение к автору. Текст не храним — он у автора в Telegram; здесь кто, тема и когда ответили."""
     __tablename__ = "feedback"
-    __table_args__ = (CheckConstraint("topic IN ('bug', 'idea', 'collab', 'other')", name="ck_feedback_topic"),)
+    __table_args__ = (
+        CheckConstraint("topic IN ('bug', 'idea', 'collab', 'other')", name="ck_feedback_topic"),
+        Index("feedback_user", "user_id"),     # имя из миграции c9d0e1f2a3b4; index=True дал бы ix_feedback_user_id
+    )
 
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
-    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"))
     topic: Mapped[str] = mapped_column(String(16))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     answered_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
@@ -208,7 +243,10 @@ class FeedbackLink(Base):
     """Сообщение Telegram, относящееся к обращению: «Ответить» на него находит адресата.
     side='admin' — лежит у автора, ответ уходит человеку; 'user' — лежит у человека, уходит автору."""
     __tablename__ = "feedback_links"
-    __table_args__ = (CheckConstraint("side IN ('admin', 'user')", name="ck_feedback_link_side"),)
+    __table_args__ = (
+        CheckConstraint("side IN ('admin', 'user')", name="ck_feedback_link_side"),
+        Index("feedback_links_by_feedback", "feedback_id"),   # каскадное удаление обращения — без чтения всей таблицы
+    )
 
     chat_id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
     message_id: Mapped[int] = mapped_column(BigInteger, primary_key=True)

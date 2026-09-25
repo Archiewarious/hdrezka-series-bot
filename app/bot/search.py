@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 from app.models import Page
+from app.service import is_airing
 
 MAX_STANDALONE = 5
 MAX_WAITING = 3        # завершённые без франшизы: карточка с «🔔 Сообщить о продолжении»
@@ -12,7 +13,7 @@ MAX_WAITING = 3        # завершённые без франшизы: кар�
 
 def is_ongoing(p: Page) -> bool:
     """Выходит: не завершён, не фильм, серии уже были (объявленные без серий не предлагаем)."""
-    return not p.is_finished and p.content_type != "film" and p.last_episode is not None
+    return is_airing(p)
 
 
 @dataclass

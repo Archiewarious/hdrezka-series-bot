@@ -81,7 +81,7 @@ async def answer(bot, s, fb, admin_chat: int, message_id: int, html_text: str | 
     head, hint = t(lang, "fb_answer_head"), t(lang, "fb_answer_hint")
     try:
         if html_text is not None:
-            sent = [await bot.send_message(fb.user_id, f"{head}\n\n{html_text}\n\n{hint}", disable_web_page_preview=True)]
+            sent = [await bot.send_message(fb.user_id, f"{head}\n\n{html_text}\n\n{hint}")]
         else:                                           # фото, файл, голосовое — копией после заголовка
             first = await bot.send_message(fb.user_id, f"{head}\n{hint}")
             sent = [first, await bot.copy_message(fb.user_id, admin_chat, message_id)]
@@ -97,7 +97,7 @@ async def answer(bot, s, fb, admin_chat: int, message_id: int, html_text: str | 
 
 async def _to_admin(bot, s, admin: int, fb_id: int, card: str, chat_id: int, message_id: int) -> bool:
     try:
-        head = await bot.send_message(admin, card, disable_web_page_preview=True)
+        head = await bot.send_message(admin, card)
         copy = await bot.copy_message(admin, chat_id, message_id,
                                       reply_parameters=ReplyParameters(message_id=head.message_id,
                                                                        allow_sending_without_reply=True))

@@ -1,7 +1,7 @@
 #!/bin/bash
 # Бэкап базы бота: pg_dump (custom-формат, сжатый) → локально + копия на сервер-выход по SSH.
-# Запускается таймером rezka-backup.timer от пользователя alex (docker — через sudo -n).
-# Восстановление проверяется deploy/restore-check.sh.
+# Запускается таймером rezka-backup.timer от пользователя из юнита (docker — через sudo -n).
+# Восстановление проверяется deploy/restore-check.sh; из копии на сервере-выходе — README, «Обслуживание».
 set -euo pipefail
 
 PROJECT=$(cd "$(dirname "$0")/.." && pwd)
@@ -24,7 +24,8 @@ sudo -n docker compose exec -T postgres pg_dump -U rezka -Fc --no-owner rezka > 
 mv "$file.tmp" "$file"
 size=$(du -h "$file" | cut -f1)
 
-scp -q -P "$REMOTE_PORT" -i "$SSH_KEY" -o BatchMode=yes -o ConnectTimeout=20 "$file" "$REMOTE_HOST:$REMOTE_DIR/"
+scp -q -P "$REMOTE_PORT" -i "$SSH_KEY" -o BatchMode=yes -o ConnectTimeout=20 -o StrictHostKeyChecking=accept-new \
+    "$file" "$REMOTE_HOST:$REMOTE_DIR/"
 # Ротация: на сервере-выходе — последние KEEP_REMOTE, локально — KEEP_LOCAL.
 ssh "${SSH_OPTS[@]}" "$REMOTE_HOST" "cd $REMOTE_DIR && ls -1t rezka-*.dump 2>/dev/null | tail -n +$((KEEP_REMOTE + 1)) | xargs -r rm -f"
 ls -1t "$LOCAL_DIR"/rezka-*.dump | tail -n +$((KEEP_LOCAL + 1)) | xargs -r rm -f

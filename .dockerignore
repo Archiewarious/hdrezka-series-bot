@@ -1,0 +1,14 @@
+# В образ — только код, миграции, тесты (цель test) и требования. Секреты и история — никогда (24.09.2026).
+.git
+.github
+.env
+.env.*
+deploy/backup.env
+**/__pycache__
+**/*.pyc
+.venv
+.pytest_cache
+.ruff_cache
+*.dump
+docs
+tools

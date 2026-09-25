@@ -1,23 +1,25 @@
 """Доменные операции над БД, общие для поллера и бота.
 
-Здесь нет знания о Telegram и нет прямых HTTP-запросов, кроме sync_page(),
-который читает страницу через RezkaClient и раскладывает её по таблицам.
+Здесь нет знания о Telegram и нет прямых HTTP-запросов, кроме fetch_title_page() (и обёртки sync_page()),
+которая читает страницу через RezkaClient; apply_title_page() раскладывает прочитанное по таблицам.
 """
 from __future__ import annotations
 
 import logging
 import re
 from dataclasses import dataclass
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, timezone
+from urllib.parse import urlsplit
 
-from sqlalchemy import case, delete, func, select, text, tuple_
+from sqlalchemy import and_, case, delete, func, or_, select, text, tuple_
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models import (
-    Episode, EpisodeVoice, Franchise, Meta, Notification, Page, Schedule,
+    Episode, EpisodeVoice, Franchise, FranchiseMember, Meta, Page, Schedule,
     Subscription, User, Voice,
 )
+from app.config import cfg
 from app.i18n import detect
 from app.rezka.client import RezkaClient
 from app.rezka.parser import FeedItem, ScheduleRow, TitlePage, UpdateItem, franchise_name, parse_title_page
@@ -59,6 +61,48 @@ async def reschedule_pending(s: AsyncSession, user_id: int) -> int:
     return r.rowcount or 0
 
 
+# ----------------------------------------------------------------------------- адреса страниц
+
+def to_path(url: str | None) -> str:
+    """Адрес страницы → путь от корня зеркала (/animation/…/88552-….html). Домен не храним: с абсолютным
+    адресом запасные зеркала не работали для страниц тайтлов — клиент не менял чужой домен (24.09.2026).
+    Все места записи pages.url проходят через эту функцию."""
+    if not url:
+        return ""
+    path = urlsplit(url).path
+    return path if path.startswith("/") else "/" + path
+
+
+def public_url(path: str) -> str:
+    """Путь → ссылка для кнопок «Смотреть» и «На сайте»: домен из HDREZKA_PUBLIC_URL."""
+    if not path or path.startswith("http"):
+        return path
+    return cfg.public_url + path
+
+
+# ----------------------------------------------------------------------------- «часть сейчас выходит»
+
+# Одно определение (24.09.2026): раньше условие было переписано семь раз, и копии разошлись — где-то без проверки
+# на фильм. Не завершена, серии уже были (объявленные без серий не предлагаем), не фильм.
+AIRING_SQL_TEMPLATE = ("(NOT {p}.is_finished AND {p}.last_episode IS NOT NULL"
+                       " AND coalesce({p}.content_type, 'series') <> 'film')")
+
+
+def airing_sql(alias: str = "p") -> str:
+    return AIRING_SQL_TEMPLATE.format(p=alias)
+
+
+def airing_clause():
+    """То же для запросов SQLAlchemy."""
+    return and_(Page.is_finished.is_(False), Page.last_episode.isnot(None),
+                func.coalesce(Page.content_type, "series") != "film")
+
+
+def is_airing(p: Page) -> bool:
+    """То же для загруженной страницы."""
+    return not p.is_finished and p.last_episode is not None and p.content_type != "film"
+
+
 # ----------------------------------------------------------------------------- pages
 
 async def page_by_hid(s: AsyncSession, hdrezka_id: int) -> Page | None:
@@ -77,6 +121,7 @@ async def pages_to_read(s: AsyncSession, limit: int) -> list[Page]:
     rows = await s.execute(text("""
         SELECT p.id FROM pages p
          WHERE p.page_refreshed_at IS NULL AND p.url <> ''
+           AND (p.next_read_at IS NULL OR p.next_read_at <= now())   -- неудачная — ждёт своего времени
          ORDER BY EXISTS (SELECT 1 FROM subscriptions sub
                            WHERE sub.page_id = p.id OR sub.franchise_id = p.franchise_id) DESC,
                   p.created_at DESC
@@ -86,13 +131,13 @@ async def pages_to_read(s: AsyncSession, limit: int) -> list[Page]:
 
 async def upsert_page_from_feed(s: AsyncSession, item: FeedItem) -> Page:
     """Карточка ленты/поиска знает мало, но это дёшево и всегда свежо."""
-    values = dict(hdrezka_id=item.hdrezka_id, title=item.title, url=item.url,
+    values = dict(hdrezka_id=item.hdrezka_id, title=item.title, url=to_path(item.url),
                   section=item.section, is_finished=item.is_finished,
                   meta_line=item.meta_line, year=year_from_meta(item.meta_line))
     if item.has_episode:
         values.update(last_season=item.season, last_episode=item.episode)
-    if item.looks_like_film:
-        values["content_type"] = None  # окончательно скажет только страница
+    # content_type не трогаем: его знает только страница. Карточка фильма без подписи раньше стирала
+    # прочитанный тип, и карточка фильма предлагала «Следить» (24.09.2026).
     stmt = pg_insert(Page).values(**values)
     set_ = {k: v for k, v in values.items() if k != "hdrezka_id"}
     # Карточка без слова «Завершен» — не доказательство, что сезон идёт (сайт помечает не все).
@@ -118,25 +163,35 @@ async def upsert_page_from_feed(s: AsyncSession, item: FeedItem) -> Page:
 class SyncResult:
     page: Page
     franchise: Franchise | None
-    franchise_was_known: bool        # франшиза уже была в БД до этого чтения
-    new_parts: list[Page]            # части, которых в БД не было
     episodes: dict[int, list[int]]   # сезон → серии по списку на странице (озвучка по умолчанию)
 
 
+async def fetch_title_page(client: RezkaClient, url: str) -> TitlePage:
+    """Только запрос к сайту и разбор — без базы: транзакция не держится открытой, пока ждём сайт."""
+    return parse_title_page(await client.title_page(url), url)
+
+
 async def sync_page(s: AsyncSession, client: RezkaClient, hdrezka_id: int, url: str) -> SyncResult:
-    """Читает страницу тайтла и обновляет pages / voices / schedule / franchises.
-    Один HTTP-запрос. Новые части франшизы возвращает, но НЕ уведомляет — это
-    решает вызывающий: при первом знакомстве с франшизой они не «новые» для сайта."""
-    html = await client.title_page(url)
-    tp = parse_title_page(html, url)
+    """Читает страницу тайтла и раскладывает её по таблицам: fetch_title_page + apply_title_page."""
+    return await apply_title_page(s, hdrezka_id, url, await fetch_title_page(client, url))
+
+
+async def apply_title_page(s: AsyncSession, hdrezka_id: int, url: str, tp: TitlePage) -> SyncResult:
+    """Обновляет pages / voices / schedule / franchises по прочитанной странице. Новые части франшизы
+    только дописывает в состав (franchise_members, pending): уведомляет о них поллер (announce_new_parts),
+    кто бы ни прочитал страницу — бот или поллер."""
     if tp.hdrezka_id and tp.hdrezka_id != hdrezka_id:
         log.warning("Страница %s отдала id %s (редирект на другое зеркало/слаг?)", hdrezka_id, tp.hdrezka_id)
 
-    page = await page_by_hid(s, hdrezka_id)
-    if page is None:
-        page = Page(hdrezka_id=hdrezka_id, title=tp.title or url, url=url)
-        s.add(page)
-        await s.flush()
+    url = to_path(url)
+    # Страница и её части из блока — INSERT … ON CONFLICT и блокировка строк по возрастанию id: бот и поллер
+    # могут писать одну новую франшизу одновременно. Раньше add + flush давал IntegrityError, а разный порядок
+    # записи — взаимную блокировку (24.09.2026).
+    await _ensure_pages(s, [dict(hdrezka_id=hdrezka_id, title=tp.title or url, url=url)]
+                        + [dict(hdrezka_id=p.hdrezka_id, title=p.title, url=to_path(p.url), year=p.year)
+                           for p in tp.franchise if p.hdrezka_id and not p.is_current and p.hdrezka_id != hdrezka_id])
+    page = await s.get(Page, await s.scalar(select(Page.id).where(Page.hdrezka_id == hdrezka_id)),
+                       populate_existing=True)
 
     if tp.title:
         page.title = tp.title
@@ -154,6 +209,7 @@ async def sync_page(s: AsyncSession, client: RezkaClient, hdrezka_id: int, url: 
     elif tp.current_season is not None:
         page.last_season, page.last_episode = tp.current_season, tp.current_episode
     page.page_refreshed_at = now()
+    page.read_failures, page.next_read_at, page.gone_at = 0, None, None     # прочиталась — неудачи забыты
 
     # Озвучки — заменяем целиком: список на сайте авторитетен.
     await s.execute(delete(Voice).where(Voice.page_id == page.id))
@@ -173,9 +229,9 @@ async def sync_page(s: AsyncSession, client: RezkaClient, hdrezka_id: int, url: 
                                         or finished_by_silence(page, bool(tp.schedule))):
         page.is_finished = True
 
-    franchise, was_known, new_parts = await _apply_franchise(s, page, tp)
+    franchise = await _apply_franchise(s, page, tp)
     await s.flush()
-    return SyncResult(page, franchise, was_known, new_parts, tp.episodes)
+    return SyncResult(page, franchise, tp.episodes)
 
 
 FINISHED_AFTER_DAYS = 60
@@ -246,61 +302,154 @@ def card_state(page: Page, page_sub: bool, franchise_sub: bool, franchise: bool)
     return "follow"
 
 
-async def _apply_franchise(s: AsyncSession, page: Page, tp: TitlePage):
+async def _apply_franchise(s: AsyncSession, page: Page, tp: TitlePage) -> Franchise | None:
     if not tp.franchise:
-        return None, False, []
+        return None
 
     ids = set(tp.franchise_ids) | {page.hdrezka_id}
-    key = min(ids)
-
-    fr = await s.scalar(select(Franchise).where(Franchise.key_hdrezka_id == key))
-    was_known = fr is not None
-    if fr is None:
-        # Кто-то из участников мог быть привязан к франшизе с другим ключом
-        # (например, читали блок, когда самой ранней части ещё не было) — переиспользуем.
-        fr = await s.scalar(
-            select(Franchise).join(Page, Page.franchise_id == Franchise.id)
-            .where(Page.hdrezka_id.in_(ids)).limit(1)
-        )
-        was_known = fr is not None
-        if fr is not None:
+    # Франшизы, к которым уже привязаны части из блока, и франшиза с ключом из блока. Больше одной —
+    # сайт объединил группы: сливаем в старшую по ключу, иначе подписчики второй остались бы
+    # на опустевшей франшизе и не получали ничего (24.09.2026).
+    involved = (await s.execute(
+        select(Franchise).where(or_(
+            Franchise.key_hdrezka_id.in_(ids),
+            Franchise.id.in_(select(Page.franchise_id).where(Page.hdrezka_id.in_(ids), Page.franchise_id.isnot(None)))))
+        .order_by(Franchise.key_hdrezka_id))).scalars().all()
+    if involved:
+        fr = involved[0]
+        known = await s.scalar(select(func.count()).select_from(FranchiseMember)
+                               .where(FranchiseMember.franchise_id.in_([f.id for f in involved]))) > 0
+        await s.flush()
+        for other in involved[1:]:
+            await _merge_franchise(s, other, fr)
+        key = min(ids | {f.key_hdrezka_id for f in involved})
+        if fr.key_hdrezka_id != key:          # ключ — минимальный id части (F15)
             fr.key_hdrezka_id = key
-        else:
-            fr = Franchise(key_hdrezka_id=key, name="")
-            s.add(fr)
-            await s.flush()
+    else:
+        ins = pg_insert(Franchise).values(key_hdrezka_id=min(ids), name="")
+        fid = (await s.execute(ins.on_conflict_do_update(index_elements=[Franchise.key_hdrezka_id],
+                                                         set_={"key_hdrezka_id": ins.excluded.key_hdrezka_id})
+                               .returning(Franchise.id))).scalar_one()
+        fr = await s.get(Franchise, fid, populate_existing=True)
+        known = False
 
     titles = [(p.title, p.year) for p in tp.franchise if p.title]
     fr.name = franchise_name(titles) or fr.name or tp.title
     fr.refreshed_at = now()
 
-    new_parts: list[Page] = []
     for part in tp.franchise:
         if part.is_current or not part.hdrezka_id:
             continue
-        existing = await page_by_hid(s, part.hdrezka_id)
-        if existing is None:
-            existing = Page(hdrezka_id=part.hdrezka_id, title=part.title, url=part.url or "",
-                            year=part.year, franchise_id=fr.id)
-            s.add(existing)
-            new_parts.append(existing)
-        else:
-            existing.franchise_id = fr.id
-            if part.year and not existing.year:
-                existing.year = part.year
+        existing = await page_by_hid(s, part.hdrezka_id)      # есть: _ensure_pages в apply_title_page
+        existing.franchise_id = fr.id
+        if part.year and not existing.year:
+            existing.year = part.year
+        if part.url and not existing.url:     # у анонса страницы ещё не было — появилась
+            existing.url = to_path(part.url)
     page.franchise_id = fr.id
     await s.flush()
-    return fr, was_known, new_parts
+
+    # Состав: новое в блоке — pending, если франшизу уже знали (о нём сообщит поллер), иначе baseline:
+    # при первом знакомстве все части — не новость.
+    await s.execute(pg_insert(FranchiseMember)
+                    .values([{"franchise_id": fr.id, "hdrezka_id": h, "announce": "pending" if known else "baseline"}
+                             for h in sorted(ids)])
+                    .on_conflict_do_nothing())
+    stray = (await s.execute(select(Page.hdrezka_id).where(Page.franchise_id == fr.id,
+                                                           Page.hdrezka_id.notin_(ids)))).scalars().all()
+    if stray:
+        # Разделение группы сайтом не обрабатываем — только видно в логе.
+        log.warning("Франшиза %s «%s»: в блоке страницы %s нет частей %s — сайт разделил группу?",
+                    fr.id, fr.name, page.hdrezka_id, sorted(stray))
+    return fr
+
+
+MAX_VOICES = 30   # как guard.MAX_VOICES и CHECK в базе
+
+
+def merge_voice_filters(*filters: list[int] | None) -> list[int] | None:
+    """Объединение фильтров озвучек: «любая» (None) шире любого списка; не больше MAX_VOICES."""
+    out: set[int] = set()
+    for f in filters:
+        if not f:
+            return None
+        out |= set(f)
+    return sorted(out)[:MAX_VOICES]
+
+
+async def _merge_franchise(s: AsyncSession, src: Franchise, dst: Franchise) -> None:
+    """Страницы, состав и подписки src переходят в dst, src удаляется. Подписан на обе — одна подписка
+    с объединённым фильтром. Через ORM, а не сырым SQL: объекты в сессии должны видеть новую франшизу."""
+    log.warning("СЛИЯНИЕ франшиз: «%s» (ключ %s) → «%s» (ключ %s)",
+                src.name, src.key_hdrezka_id, dst.name, dst.key_hdrezka_id)
+    for p in (await s.execute(select(Page).where(Page.franchise_id == src.id))).scalars():
+        p.franchise_id = dst.id
+    await s.execute(text("""
+        INSERT INTO franchise_members (franchise_id, hdrezka_id, seen_at, announce)
+        SELECT :dst, hdrezka_id, seen_at, announce FROM franchise_members WHERE franchise_id = :src
+        ON CONFLICT DO NOTHING"""), {"src": src.id, "dst": dst.id})
+    for sub in (await s.execute(select(Subscription).where(Subscription.franchise_id == src.id))).scalars().all():
+        twin = await s.scalar(select(Subscription).where(Subscription.franchise_id == dst.id,
+                                                         Subscription.user_id == sub.user_id))
+        if twin is None:
+            sub.franchise_id = dst.id
+        else:
+            twin.voice_filter = merge_voice_filters(twin.voice_filter, sub.voice_filter)
+            await s.delete(sub)
+    await s.flush()
+    # Подписка на франшизу поглощает подписки на её страницы — как в subscribe_franchise.
+    absorbed = (await s.execute(
+        select(Subscription).join(Page, Page.id == Subscription.page_id)
+        .where(Page.franchise_id == dst.id, Subscription.user_id.in_(
+            select(Subscription.user_id).where(Subscription.franchise_id == dst.id))))).scalars().all()
+    for sub in absorbed:
+        await s.delete(sub)
+    await s.delete(src)
+    await s.flush()
+
+
+async def _ensure_pages(s: AsyncSession, rows: list[dict]) -> None:
+    """Строки pages для этих id есть и заблокированы до конца транзакции. Порядок — по возрастанию id:
+    две транзакции с пересекающимися страницами ждут друг друга, а не блокируют взаимно."""
+    rows = sorted({r["hdrezka_id"]: r for r in rows}.values(), key=lambda r: r["hdrezka_id"])
+    for r in rows:
+        await s.execute(pg_insert(Page).values(**r).on_conflict_do_nothing(index_elements=[Page.hdrezka_id]))
+    await s.execute(select(Page.id).where(Page.hdrezka_id.in_([r["hdrezka_id"] for r in rows]))
+                    .order_by(Page.hdrezka_id).with_for_update())
 
 
 async def franchise_anchor(s: AsyncSession, franchise_id: int) -> Page | None:
-    """Любая часть годится (блок одинаковый) — но предпочитаем выходящий сериал:
-    заодно обновим его расписание."""
+    """Любая часть годится (блок одинаковый) — но предпочитаем выходящий сериал: заодно обновим его
+    расписание. Пропавшие с сайта и ждущие своей попытки после неудачи не берём — сверка идёт по другой."""
     return await s.scalar(
-        select(Page).where(Page.franchise_id == franchise_id, Page.url != "")
+        select(Page).where(Page.franchise_id == franchise_id, Page.url != "", Page.gone_at.is_(None),
+                           or_(Page.next_read_at.is_(None), Page.next_read_at <= func.now()))
         .order_by(Page.is_finished.asc(), (Page.content_type == "series").desc(), Page.id.desc())
         .limit(1)
     )
+
+
+async def mark_read_failure(s: AsyncSession, page_id: int, gone: bool) -> None:
+    """Страница не прочиталась. 404/410 — пропала с сайта: попытка через 1, 2, 4… дня, не реже раза в 30 дней;
+    другая ошибка — через 1, 2, 4… часа, не реже раза в сутки. Успешное чтение всё обнуляет (apply_title_page)."""
+    await s.execute(text("""
+        UPDATE pages
+           SET gone_at = CASE WHEN CAST(:gone AS boolean) THEN coalesce(gone_at, now()) ELSE gone_at END,
+               next_read_at = now() + CASE WHEN CAST(:gone AS boolean)
+                   THEN least(make_interval(days => CAST(power(2, least(read_failures, 5)) AS int)), interval '30 days')
+                   ELSE least(make_interval(hours => CAST(power(2, least(read_failures, 5)) AS int)), interval '1 day') END,
+               read_failures = least(read_failures + 1, 100)
+         WHERE id = :id"""), {"id": page_id, "gone": gone})
+
+
+async def mark_refresh_failure(s: AsyncSession, franchise_id: int) -> None:
+    """Сверка франшизы не удалась: следующая через 1, 2, 4… часа, не реже раза в сутки."""
+    await s.execute(text("""
+        UPDATE franchises
+           SET next_refresh_at = now() + least(make_interval(hours => CAST(power(2, least(refresh_failures, 5)) AS int)),
+                                              interval '1 day'),
+               refresh_failures = least(refresh_failures + 1, 100)
+         WHERE id = :id"""), {"id": franchise_id})
 
 
 # ----------------------------------------------------------------------------- episodes & fan-out
@@ -374,10 +523,11 @@ async def upsert_page_from_update(s: AsyncSession, item: UpdateItem, url: str) -
     """Тайтл из блока обновлений, которого нет в каталоге: минимальная строка, остальное
     (тип, франшиза, озвучки, постер) дочитает очередь чтения — page_refreshed_at пуст."""
     page = await page_by_hid(s, item.hdrezka_id)
-    if page is None:
-        page = Page(hdrezka_id=item.hdrezka_id, title=item.title, url=url, section=item.section)
-        s.add(page)
-        await s.flush()
+    if page is None:        # без гонки с ботом: ON CONFLICT вместо add + flush
+        await s.execute(pg_insert(Page).values(hdrezka_id=item.hdrezka_id, title=item.title, url=to_path(url),
+                                               section=item.section)
+                        .on_conflict_do_nothing(index_elements=[Page.hdrezka_id]))
+        page = await page_by_hid(s, item.hdrezka_id)
     return page
 
 
@@ -438,14 +588,15 @@ async def enqueue_new_part(s: AsyncSession, franchise_id: int, part: Page, user_
 
 # ----------------------------------------------------------------------------- «жду продолжения»
 
-async def waiting_subscriptions(s: AsyncSession, franchise_id: int) -> list[tuple[int, int]]:
-    """Подписки на завершённые части франшизы = «жду продолжения» (§7, решение 3): (user_id, page_id)."""
+async def waiting_subscriptions(s: AsyncSession, franchise_id: int) -> list[tuple[int, int, list[int] | None]]:
+    """Подписки на завершённые части франшизы = «жду продолжения» (§7, решение 3):
+    (user_id, page_id, voice_filter) — выбранная озвучка переходит в подписку на франшизу."""
     rows = await s.execute(text("""
-        SELECT sub.user_id, sub.page_id FROM subscriptions sub
+        SELECT sub.user_id, sub.page_id, sub.voice_filter FROM subscriptions sub
           JOIN pages p ON p.id = sub.page_id
          WHERE p.franchise_id = :f AND p.is_finished
          ORDER BY sub.id"""), {"f": franchise_id})
-    return [(u, pid) for u, pid in rows]
+    return [(u, pid, vf) for u, pid, vf in rows]
 
 
 def _year(p: Page) -> int | None:
@@ -501,10 +652,8 @@ async def search_catalog(s: AsyncSession, query: str, limit: int = 30) -> list[P
 
 async def franchise_stats(s: AsyncSession, ids: list[int]) -> dict[int, tuple[str, int, int]]:
     """franchise_id → (имя, всего частей, из них выходят)."""
-    rows = await s.execute(text("""
-        SELECT f.id, f.name, count(p.id),
-               count(*) FILTER (WHERE NOT p.is_finished AND coalesce(p.content_type, 'series') <> 'film'
-                                  AND p.last_episode IS NOT NULL)
+    rows = await s.execute(text(f"""
+        SELECT f.id, f.name, count(p.id), count(*) FILTER (WHERE {airing_sql()})
           FROM franchises f JOIN pages p ON p.franchise_id = f.id
          WHERE f.id = ANY(CAST(:ids AS int[])) GROUP BY f.id, f.name"""), {"ids": ids})
     return {fid: (name, parts, ongoing) for fid, name, parts, ongoing in rows}
@@ -545,11 +694,9 @@ async def _default_voices(s: AsyncSession, user_id: int, page_id: int | None = N
     wanted = await s.scalar(text("SELECT default_voice_filter FROM users WHERE id = :u"), {"u": user_id})
     if not wanted:
         return None
-    have = set((await s.execute(text("""
+    have = set((await s.execute(text(f"""
         SELECT DISTINCT v.translator_id FROM voices v JOIN pages p ON p.id = v.page_id
-         WHERE p.id = :page_id
-            OR (p.franchise_id = :franchise_id AND NOT p.is_finished AND p.last_episode IS NOT NULL
-                AND coalesce(p.content_type, 'series') <> 'film')"""),
+         WHERE p.id = :page_id OR (p.franchise_id = :franchise_id AND {airing_sql()})"""),
         {"page_id": page_id or -1, "franchise_id": franchise_id or -1})).scalars())
     return pick_voices(wanted, have)
 
@@ -565,10 +712,17 @@ async def subscribe_page(s: AsyncSession, user_id: int, page_id: int) -> bool:
     return created
 
 
-async def subscribe_franchise(s: AsyncSession, user_id: int, franchise_id: int) -> bool:
-    """Подписка на франшизу поглощает подписки на её страницы — в /my одна строка."""
+DEFAULT_VOICES = object()   # subscribe_franchise: озвучка по умолчанию из настроек человека
+
+
+async def subscribe_franchise(s: AsyncSession, user_id: int, franchise_id: int, voices=DEFAULT_VOICES) -> bool:
+    """Подписка на франшизу поглощает подписки на её страницы — в /my одна строка. voices — явный фильтр
+    (None — любая): при переводе «жду продолжения» озвучка берётся из ждавшей подписки, а не из настроек
+    (24.09.2026). Уже существующую подписку на франшизу не трогает."""
+    if voices is DEFAULT_VOICES:
+        voices = await _default_voices(s, user_id, franchise_id=franchise_id)
     stmt = (pg_insert(Subscription).values(user_id=user_id, scope="franchise", franchise_id=franchise_id,
-                                           voice_filter=await _default_voices(s, user_id, franchise_id=franchise_id))
+                                           voice_filter=voices)
             .on_conflict_do_nothing(index_elements=["user_id", "franchise_id"],
                                     index_where=text("franchise_id IS NOT NULL"))
             .returning(Subscription.id))

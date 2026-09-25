@@ -58,8 +58,9 @@ def fmt_date(lang: str, d: date | None) -> str | None:
     return f"{m} {d.day}" if lang == "en" else f"{d.day} {m}"
 
 
-def when(lang: str, d: date) -> str:
-    delta = (d - date.today()).days
+def when(lang: str, d: date, today: date | None = None) -> str:
+    """«пт 25 сен · завтра». today — сегодняшняя дата у человека (его пояс); без неё — дата сервера."""
+    delta = (d - (today or date.today())).days
     if delta == 0:
         rel = t(lang, "today")
     elif delta == 1:
@@ -411,6 +412,13 @@ STRINGS: dict[str, dict[str, str | tuple]] = {
     "my_next": {"ru": "след. {d}", "uk": "наст. {d}", "en": "next {d}"},
     "my_waiting": {"ru": "завершён, жду продолжения", "uk": "завершено, чекаю на продовження", "en": "finished, waiting for a sequel"},
     "my_late": {"ru": "ждём {s}×{e}, эфир {d}", "uk": "чекаємо {s}×{e}, ефір {d}", "en": "waiting for {s}×{e}, aired {d}"},
+    "already_franchise": {"ru": "Вы уже следите за всей франшизой — этот сезон в неё входит.",
+                          "uk": "Ви вже стежите за всією франшизою — цей сезон до неї входить.",
+                          "en": "You already follow the whole franchise — this season is part of it."},
+    "my_gone": {"ru": "пропала с сайта", "uk": "зникла з сайту", "en": "removed from the site"},
+    "link_gone": {"ru": "Такой страницы на сайте нет — проверьте ссылку.",
+                  "uk": "Такої сторінки на сайті немає — перевірте посилання.",
+                  "en": "There is no such page on the site — check the link."},
     "my_nothing_airing": {"ru": "сейчас ничего не выходит", "uk": "зараз нічого не виходить", "en": "nothing airing now"},
     "my_hint": {"ru": "<i>Нажмите на сериал — там озвучка и отписка.</i>",
                 "uk": "<i>Натисніть на серіал — там озвучка й відписка.</i>",
