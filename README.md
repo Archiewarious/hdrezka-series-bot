@@ -48,7 +48,7 @@ update feed, not subscriptions. UI in Russian, Ukrainian and English. Docs are i
 
 | Проблема | Решение |
 |---|---|
-| Дата-центровые IP (Oracle, Cloudflare WARP…) забанены — 403 «Ошибка доступа 105» | SOCKS5 через SSH-туннель на сервер с чистым IP (`deploy/rezka-tunnel.service`) |
+| Дата-центровые IP банят — 403 «Ошибка доступа 105» (IP этого сервера был забанен в сентябре 2026, с октября открыт) | ходим напрямую; бан — «БАН» в логе поллера и первой строкой `/stats`, тогда прокси через незабаненный IP: `HDREZKA_PROXY` в `.env` |
 | Anubis proof-of-work | решается в `app/rezka/client.py`, браузер не нужен; cookie живёт 30 дней |
 
 Вся эта логика изолирована в `RezkaClient`; остальной код видит только HTML.
@@ -57,14 +57,6 @@ update feed, not subscriptions. UI in Russian, Ukrainian and English. Docs are i
 
 ```bash
 cp .env.example .env      # BOT_TOKEN, ADMIN_IDS, POSTGRES_PASSWORD
-```
-
-Туннель (без него сайт недоступен). В юните — адрес, порт и пользователь
-вашего сервера-выхода; замените плейсхолдеры:
-
-```bash
-sudo cp deploy/rezka-tunnel.service /etc/systemd/system/
-sudo systemctl daemon-reload && sudo systemctl enable --now rezka-tunnel
 ```
 
 Проверка доступа и запуск:
@@ -111,7 +103,7 @@ deploy/restore-check.sh                             # проверить све�
 удаляет правило бакета; версии объектов включены — перезапись по тому же имени не теряет копию. Заливка идёт по
 ссылке «только запись» (pre-authenticated request `AnyObjectWrite`, листинг запрещён) из `deploy/backup.env`
 (образец `backup.env.example`, в git не попадает): по ней нельзя ни прочитать, ни удалить копии. Ссылка действует
-до 03.10.2031 — см. `docs/TODO.md`. Архив прежнего сервера-выхода (06.09–03.10.2026, 30 дампов) — префикс
+до 03.10.2031 — см. `docs/TODO.md`. Архив прежнего офсайт-сервера (06.09–03.10.2026, 30 дампов) — префикс
 `archive-lv/`, хранится бессрочно. Установка юнита — `deploy/rezka-backup.service` (команда в шапке).
 
 Восстановление:

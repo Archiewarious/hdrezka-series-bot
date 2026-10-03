@@ -46,7 +46,7 @@ bot: Bot
 
 MAX_RESULTS = 5
 SEARCH_TTL = 600
-# Из ссылки берём только путь: хост всегда наш. Иначе бот — открытый прокси через туннель.
+# Из ссылки берём только путь: хост всегда наш. Иначе бот — открытый прокси к чужим хостам с нашего IP.
 _PATH_RX = re.compile(r"(/[A-Za-z0-9_\-/]*?/([0-9]{1,9})-[A-Za-z0-9_\-.]*?\.html)")
 SECTION_KEY = {"series": "sec_series", "animation": "sec_animation", "cartoons": "sec_cartoons", "films": "sec_films"}
 MENU_KEYS = ("btn_find", "btn_my", "btn_new", "btn_cal", "btn_settings", "btn_help")

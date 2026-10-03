@@ -113,7 +113,7 @@ class RezkaClient:
         return self._session
 
     async def _reset_session(self) -> None:
-        """Сеть/туннель отвалились: старую сессию закрываем (раньше она просто бросалась), cookie переносим."""
+        """Сеть или прокси отвалились: старую сессию закрываем (раньше она просто бросалась), cookie переносим."""
         old, self._session = self._session, None
         if old is None:
             return

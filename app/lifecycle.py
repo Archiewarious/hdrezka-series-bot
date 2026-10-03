@@ -105,7 +105,7 @@ _last_ping = 0.0
 
 
 async def ping_if_healthy(s) -> bool:
-    """После успешного цикла: пинг HEALTHCHECK_PING_URL, если проверка здоровья чиста. Напрямую, не через туннель,
+    """После успешного цикла: пинг HEALTHCHECK_PING_URL, если проверка здоровья чиста. Напрямую, не через прокси,
     таймаут 5 с, ошибки игнорируются. Пустой адрес — выключено. True — пинг ушёл."""
     global _last_ping
     if not cfg.healthcheck_ping_url or time.monotonic() - _last_ping < PING_EVERY:

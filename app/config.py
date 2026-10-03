@@ -46,7 +46,7 @@ class Config:
     base_urls: list[str] = field(
         default_factory=lambda: _list("HDREZKA_BASE_URLS", "https://rezka-ua.tv")
     )
-    # Пусто — напрямую (с 03.10.2026, туннель в Латвию снят). Если IP сервера снова забанят (403 «Ошибка доступа 105»,
+    # Пусто — напрямую (с 03.10.2026, SSH-туннель на сервер-выход снят). Если IP сервера снова забанят (403 «Ошибка доступа 105»,
     # в /stats — «БАН»), — прокси через незабаненный IP, например socks5h://host:1080.
     proxy: str | None = os.getenv("HDREZKA_PROXY") or None
     impersonate: str = os.getenv("HDREZKA_IMPERSONATE", "chrome")
@@ -57,7 +57,7 @@ class Config:
     # первое зеркало из HDREZKA_BASE_URLS.
     public_url: str = field(default_factory=lambda: (
         os.getenv("HDREZKA_PUBLIC_URL") or _list("HDREZKA_BASE_URLS", "https://rezka-ua.tv")[0]).rstrip("/"))
-    # Хосты постеров: качаем напрямую, без туннеля, поэтому только с CDN сайта (поддомены тоже). 24.09.2026
+    # Хосты постеров: качаем напрямую, без прокси, поэтому только с CDN сайта (поддомены тоже). 24.09.2026
     poster_hosts: list[str] = field(default_factory=lambda: _list("POSTER_HOSTS", "hdrezka.ac"))
     # Anubis: выше этой сложности не решаем — сложность 7 это ~4 мин, 8 — час, 9 — 15 ч счёта в потоке.
     max_pow_difficulty: int = int(os.getenv("MAX_POW_DIFFICULTY", "6"))

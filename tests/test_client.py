@@ -114,7 +114,7 @@ def test_5xx_pause_grows(sleeps):
 
 def test_network_error_closes_the_old_session_and_keeps_cookies():
     """Сессия бросалась без закрытия, а с ней и пропуск Anubis на 30 дней."""
-    c, script = client_with([ConnectionError("туннель"), ConnectionError("туннель"), ConnectionError("туннель")])
+    c, script = client_with([ConnectionError("сеть"), ConnectionError("сеть"), ConnectionError("сеть")])
 
     async def scenario():
         first = await c._ensure_session()
