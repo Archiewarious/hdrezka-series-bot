@@ -107,19 +107,29 @@ deploy/restore-check.sh                             # проверить све�
 ```
 
 Бэкапы: `deploy/rezka-backup.timer` раз в сутки (03:30 UTC) делает `pg_dump -Fc` в `/var/backups/rezka`
-(7 последних) и копирует на сервер-выход по SSH (`~/rezka-backups`, 30 последних). Адрес сервера и SSH-ключ —
-`deploy/backup.env` (образец `backup.env.example`, в git не попадает). Установка юнита — `deploy/rezka-backup.service`
-(команда в шапке).
+(7 последних) и заливает в Oracle Object Storage: бакет `rezka-backups`, префикс `daily/`. Копии старше 30 дней
+удаляет правило бакета; версии объектов включены — перезапись по тому же имени не теряет копию. Заливка идёт по
+ссылке «только запись» (pre-authenticated request `AnyObjectWrite`, листинг запрещён) из `deploy/backup.env`
+(образец `backup.env.example`, в git не попадает): по ней нельзя ни прочитать, ни удалить копии. Ссылка действует
+до 03.10.2031 — см. `docs/TODO.md`. Архив прежнего сервера-выхода (06.09–03.10.2026, 30 дампов) — префикс
+`archive-lv/`, хранится бессрочно. Установка юнита — `deploy/rezka-backup.service` (команда в шапке).
 
 Восстановление:
 
 ```bash
 # из локального дампа
 docker compose exec -T postgres pg_restore -U rezka -d rezka --no-owner --clean --if-exists < /var/backups/rezka/rezka-….dump
-# из копии на сервере-выходе
-scp -P <порт> <пользователь>@<сервер>:rezka-backups/rezka-….dump .
+# из офсайт-копии: нужен ключ OCI API (подписанный запрос) или консоль Oracle → Buckets → rezka-backups
+export OCI_HOST=objectstorage.eu-frankfurt-1.oraclecloud.com
+~/.oci/oci-req.sh GET '/n/<namespace>/b/rezka-backups/o?prefix=daily/'                        # список
+~/.oci/oci-req.sh GET /n/<namespace>/b/rezka-backups/o/daily/rezka-….dump > rezka-….dump      # скачать
 docker compose exec -T postgres pg_restore -U rezka -d rezka --no-owner --clean --if-exists < rezka-….dump
 ```
+
+Новая ссылка «только запись» (старая истекла или утекла — её можно удалить в консоли, Pre-Authenticated Requests):
+`POST /n/<namespace>/b/rezka-backups/p/` с телом
+`{"name":"rezka-backup-upload","accessType":"AnyObjectWrite","bucketListingAction":"Deny","timeExpires":"…"}`;
+`OFFSITE_URL` = `https://objectstorage.<регион>.oraclecloud.com` + `accessUri` из ответа.
 
 Обновление прода — `deploy/update.sh`: свежий бэкап, затем `docker compose up -d --build`.
 

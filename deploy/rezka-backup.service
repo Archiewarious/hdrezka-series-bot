@@ -5,7 +5,7 @@
 #   sudo systemctl daemon-reload && sudo systemctl enable --now rezka-backup.timer
 # Лог: journalctl -u rezka-backup
 [Unit]
-Description=HDREZKA bot: pg_dump backup to local dir and egress server
+Description=HDREZKA bot: pg_dump backup to local dir and Object Storage
 After=docker.service network-online.target
 Wants=network-online.target
 
