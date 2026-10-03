@@ -503,11 +503,17 @@ class Poller:
                 try:
                     await self.cycle()
                     failures = 0
+                    await note_access(None)
                 except AccessBlocked as exc:
                     failures += 1
                     # Не долбимся: временный бан легко превратить в постоянный.
                     pause = min(60 * 2 ** failures, 1800)
-                    log.error("Доступ потерян (%s), неудач подряд: %s, пауза %sс", exc, failures, pause)
+                    if exc.banned:
+                        log.error("БАН: сайт отдаёт 403 на всех попытках, выход %s — IP закрыт для сайта. Нужен прокси: "
+                                  "HDREZKA_PROXY в .env. Неудач подряд: %s, пауза %sс (%s)", cfg.egress, failures, pause, exc)
+                    else:
+                        log.error("Доступ потерян (%s), выход %s, неудач подряд: %s, пауза %sс", exc, cfg.egress, failures, pause)
+                    await note_access(exc)
                     await lifecycle.pause(pause, self.watchdog)
                 except Exception:
                     failures += 1
@@ -518,6 +524,27 @@ class Poller:
             self.watchdog.stop()
             await self.client.close()
             await lock_conn.close()
+
+
+async def note_access(exc: AccessBlocked | None) -> None:
+    """Потеря доступа к сайту — в meta: её видят /stats и проверка здоровья (app/health.py), в Telegram не пишем.
+    exc None — цикл прошёл: отметка снимается. Сбой базы здесь не валит поллер — цикл и так повторится."""
+    try:
+        async with session() as s:
+            since = await svc.meta_get(s, "access_lost_at")
+            if exc is None:
+                if not since:
+                    return
+                log.warning("Доступ к сайту восстановлен, выход %s (потерян с %s)", cfg.egress, since)
+                await svc.meta_set(s, "access_lost_at", "")
+            else:
+                if not since:
+                    await svc.meta_set(s, "access_lost_at", svc.now().isoformat())
+                await svc.meta_set(s, "access_banned", "1" if exc.banned else "0")
+                await svc.meta_set(s, "access_error", str(exc)[:300])
+            await s.commit()
+    except Exception:
+        log.exception("Не записал состояние доступа в meta")
 
 
 async def acquire_lock():

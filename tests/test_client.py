@@ -192,9 +192,18 @@ def test_no_user_agent_by_default():
 
 def test_403_on_every_mirror_is_access_blocked(mirrors):
     c, script = client_with([FakeResp(403), FakeResp(403), FakeResp(403)])
-    with pytest.raises(AccessBlocked):
+    with pytest.raises(AccessBlocked) as exc:
         asyncio.run(c.get("/x/1-a.html"))
     assert [u.split("/x/")[0] for u in script.calls] == ["https://m1.test", "https://m2.test", "https://m1.test"]
+    assert exc.value.banned, "403 на всех попытках — бан IP: поллер пишет «БАН» в лог и /stats (03.10.2026)"
+
+
+def test_403_mixed_with_other_failures_is_not_a_ban(mirrors, sleeps):
+    """Сайт лежит (5xx) или сеть отвалилась — это не бан: прокси не поможет, и «БАН» в /stats был бы ложной тревогой."""
+    c, _ = client_with([FakeResp(403), FakeResp(502), ConnectionError("reset")])
+    with pytest.raises(AccessBlocked) as exc:
+        asyncio.run(c.get("/x/1-a.html"))
+    assert not exc.value.banned
 
 
 def test_failed_anubis_pass_is_retried_then_blocked():

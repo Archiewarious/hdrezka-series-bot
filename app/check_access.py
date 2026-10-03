@@ -14,7 +14,7 @@ from app.rezka.parser import parse_updates
 async def main() -> int:
     logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
     print(f"зеркала : {cfg.base_urls}")
-    print(f"прокси  : {cfg.proxy or 'нет (прямое подключение)'}")
+    print(f"выход   : {cfg.egress}")
 
     client = RezkaClient()
     try:
@@ -30,7 +30,10 @@ async def main() -> int:
         return 0
     except AccessBlocked as exc:
         print(f"\nДОСТУПА НЕТ: {exc}")
-        print("Проверьте SSH-туннель:  ss -tln | grep 1080")
+        if exc.banned:
+            print("403 на всех попытках — IP выхода забанен. Нужен прокси через незабаненный IP: HDREZKA_PROXY в .env")
+        else:
+            print("Сайт не ответил: проверьте сеть, зеркала HDREZKA_BASE_URLS" + (" и прокси HDREZKA_PROXY" if cfg.proxy else ""))
         return 1
     finally:
         await client.close()

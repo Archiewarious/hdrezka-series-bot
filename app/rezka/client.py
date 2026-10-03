@@ -1,7 +1,7 @@
 """HTTP-клиент к HDREZKA.
 
 Единственное место, где живёт вся боль с доступом:
-  * SOCKS5-прокси (SSH-туннель на сервер с незабаненным IP);
+  * прокси, если задан (HDREZKA_PROXY; по умолчанию — напрямую);
   * TLS-фингерпринт браузера (curl_cffi impersonate);
   * proof-of-work Anubis;
   * перебор зеркал;
@@ -32,7 +32,12 @@ _ANUBIS_PASS = "/.within.website/x/cmd/anubis/api/pass-challenge"
 
 
 class AccessBlocked(Exception):
-    """Ни одно зеркало не отдало контент — IP забанен или сайт лежит."""
+    """Ни одно зеркало не отдало контент — IP забанен или сайт лежит. banned — все попытки получили 403: это бан
+    IP выхода, а не сбой сайта. С 03.10.2026 ходим напрямую, без туннеля, и бан сервера может вернуться."""
+
+    def __init__(self, message: str, *, banned: bool = False):
+        super().__init__(message)
+        self.banned = banned
 
 
 class PageGone(Exception):
@@ -177,6 +182,7 @@ class RezkaClient:
         Всё, что связано с доступом (прокси, Anubis, зеркала, паузы), — здесь."""
         async with self._lock:
             last_error = "неизвестно"
+            forbidden = 0
 
             for attempt in range(retries + 1):
                 url = path if path.startswith("http") else f"{self.base_url}{path}"
@@ -186,7 +192,7 @@ class RezkaClient:
                 try:
                     resp = await s.request(method, url, data=data, headers=headers,
                                            allow_redirects=True)
-                except Exception as exc:  # сеть/туннель отвалился
+                except Exception as exc:  # сеть или прокси отвалились
                     last_error = f"{type(exc).__name__}: {exc}"
                     log.warning("Запрос упал (%s), попытка %s", last_error, attempt + 1)
                     await self._reset_session()
@@ -195,6 +201,7 @@ class RezkaClient:
                 if resp.status_code == 403:
                     # Бан по IP — зеркала обычно не помогают, но попробуем следующее.
                     last_error = "403 (IP заблокирован)"
+                    forbidden += 1
                     log.warning("403 от %s", self.base_url)
                     self._next_mirror()
                     continue
@@ -239,7 +246,7 @@ class RezkaClient:
 
                 return resp.text
 
-            raise AccessBlocked(f"{self.base_url}{path}: {last_error}")
+            raise AccessBlocked(f"{self.base_url}{path}: {last_error}", banned=forbidden == retries + 1)
 
     async def get(self, path: str, *, retries: int = 2) -> str:
         return await self.request("GET", path, retries=retries)

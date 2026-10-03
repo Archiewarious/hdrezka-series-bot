@@ -1,6 +1,7 @@
 """Поллер: очередь каталога, сверка франшиз, границы транзакций цикла, паузы при потере доступа.
 Сайт подменён (FakeSite из test_integration)."""
 import asyncio
+import dataclasses
 from datetime import timedelta
 
 from sqlalchemy import text
@@ -106,6 +107,41 @@ def test_run_pauses_after_lost_access_and_resets_after_success(db, monkeypatch):
     db(scenario)
     # После последнего цикла пауза тоже вызывается — настоящая при сигнале остановки возвращается сразу.
     assert pauses == [120, 180, 240, 180, 180], "пауза после потери доступа растёт, между циклами — интервал опроса"
+
+
+def test_ban_is_visible_in_health_until_access_returns(db, monkeypatch):
+    """03.10.2026: туннель снят, ходим напрямую, а бан IP сервера может вернуться. В Telegram о нём не пишем — значит,
+    он обязан быть в проверке здоровья (/stats, healthcheck поллера), пока доступ не вернётся."""
+    from app import health
+    seen, results = [], [AccessBlocked("https://rezka.test/: 403", banned=True), AccessBlocked("таймаут"), None]
+
+    async def access_problems():
+        async with session() as s:
+            return [p for p in await health.check(s, part="events") if "403" in p or "доступа" in p]
+
+    async def fake_cycle(self):
+        seen.append(await access_problems())
+        r = results.pop(0)
+        if not results:
+            lifecycle.request_stop()
+        if r:
+            raise r
+
+    async def no_pause(seconds, beat=None):
+        pass
+    monkeypatch.setattr(Poller, "cycle", fake_cycle)
+    monkeypatch.setattr(lifecycle, "pause", no_pause)
+    monkeypatch.setattr(health, "cfg", dataclasses.replace(health.cfg, proxy=None))
+
+    async def scenario():
+        await Poller(FakeSite("", {})).run()
+        return await access_problems()
+
+    after = db(scenario)
+    assert seen[0] == []
+    assert len(seen[1]) == 1 and seen[1][0].startswith("БАН: сайт отдаёт 403 уже 0 мин, выход напрямую")
+    assert seen[2] == ["нет доступа к сайту уже 0 мин, выход напрямую: таймаут"], "не бан — без совета про прокси"
+    assert after == [], "доступ вернулся — отметка снята"
 
 
 def test_new_part_announcement_waits_for_the_read_budget(db):

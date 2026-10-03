@@ -23,3 +23,14 @@ def test_bad_admin_ids_say_what_is_wrong(monkeypatch):
     assert "ADMIN_IDS" in str(exc.value) and "@alex" in str(exc.value)
     monkeypatch.setenv("ADMIN_IDS", " 1, 2 ,")
     assert config._admin_ids() == [1, 2]
+
+
+@pytest.mark.parametrize("proxy, shown", [
+    (None, "напрямую"),
+    ("socks5h://172.28.0.1:1080", "через прокси socks5h://172.28.0.1:1080"),
+    ("http://user:secret@proxy.test:3128", "через прокси http://proxy.test:3128"),
+])
+def test_egress_is_shown_without_proxy_password(proxy, shown):
+    """Выход на сайт виден в логе, /stats и check_access (03.10.2026) — пароль прокси туда не попадает."""
+    import dataclasses
+    assert dataclasses.replace(config.cfg, proxy=proxy).egress == shown

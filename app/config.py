@@ -1,7 +1,7 @@
 """Конфигурация. Всё через env — ничего не хардкодим, домены и доступ меняются."""
 import os
 from dataclasses import dataclass, field
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit
 
 
 def _list(name: str, default: str) -> list[str]:
@@ -46,7 +46,8 @@ class Config:
     base_urls: list[str] = field(
         default_factory=lambda: _list("HDREZKA_BASE_URLS", "https://rezka-ua.tv")
     )
-    # SOCKS5 через SSH-туннель на сервер с незабаненным IP.
+    # Пусто — напрямую (с 03.10.2026, туннель в Латвию снят). Если IP сервера снова забанят (403 «Ошибка доступа 105»,
+    # в /stats — «БАН»), — прокси через незабаненный IP, например socks5h://host:1080.
     proxy: str | None = os.getenv("HDREZKA_PROXY") or None
     impersonate: str = os.getenv("HDREZKA_IMPERSONATE", "chrome")
     # Пусто — User-Agent ставит curl_cffi, согласованный с impersonate: свой UA рядом с чужим TLS-отпечатком
@@ -83,6 +84,14 @@ class Config:
     # --- Рассылка ---
     send_rate: float = float(os.getenv("SEND_RATE", "25"))            # сообщений/сек
     send_batch: int = int(os.getenv("SEND_BATCH", "200"))
+
+    @property
+    def egress(self) -> str:
+        """Как ходим на сайт — для лога, /stats и check_access. Логин и пароль прокси не показываем."""
+        if not self.proxy:
+            return "напрямую"
+        u = urlsplit(self.proxy)
+        return f"через прокси {u.scheme}://{u.hostname}" + (f":{u.port}" if u.port else "")
 
 
 cfg = Config()

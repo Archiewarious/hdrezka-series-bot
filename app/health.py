@@ -32,8 +32,19 @@ def _fmt(d: timedelta) -> str:
     return f"{hours} ч" if hours else f"{int(d.total_seconds() // 60)} мин"
 
 
+async def _access(s, at: datetime) -> list[str]:
+    """Доступ к сайту — отметка поллера (app/poller.py, note_access). Первой строкой: при бане всё остальное — следствие."""
+    since = await svc.meta_get(s, "access_lost_at")
+    if not since:
+        return []
+    lost = _fmt(at - datetime.fromisoformat(since))
+    if await svc.meta_get(s, "access_banned") == "1":
+        return [f"БАН: сайт отдаёт 403 уже {lost}, выход {cfg.egress} — нужен прокси, HDREZKA_PROXY в .env"]
+    return [f"нет доступа к сайту уже {lost}, выход {cfg.egress}: {await svc.meta_get(s, 'access_error')}"]
+
+
 async def _events(s, at: datetime) -> list[str]:
-    problems: list[str] = []
+    problems: list[str] = await _access(s, at)
     for key, limit, what in (("last_poll_ok", POLL_STALE, "поллер не завершал цикл"),
                              ("updates_ok_at", EVENTS_STALE, "блок обновлений не разбирается"),
                              ("refresh_ok_at", REFRESH_STALE, "обновление страниц и сверка франшиз не завершались")):
