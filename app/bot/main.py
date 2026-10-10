@@ -36,7 +36,7 @@ from app.i18n import DETECT_FALLBACK, LANGS, fmt_date, t, when
 from app.models import Episode, Franchise, Page, Schedule, Subscription, User, Voice
 from app.rezka.client import AccessBlocked, PageGone, RezkaClient
 from app.rezka.parser import FeedItem, parse_feed
-from app import feedback
+from app import events, feedback
 from app.sender import fit_button, watch_url
 
 log = logging.getLogger("bot")
@@ -153,6 +153,41 @@ class FloodGuard(BaseMiddleware):
 
 
 dp.update.outer_middleware(FloodGuard())
+
+_MENU_KEY = {text_: key for key, texts in MENU.items() for text_ in texts}
+
+
+def _event_of(event: Update) -> tuple[int, str, str | None] | None:
+    """Что сделал человек — для app/events.py. Тип и метка, текст сообщения не берём; только личные чаты."""
+    if (cb := event.callback_query) is not None:
+        if cb.message is None or cb.message.chat.type != ChatType.PRIVATE:
+            return None
+        name = next((k for k, rx in CB_RX.items() if rx.match(cb.data or "")), "stale")
+        return cb.from_user.id, "button", name
+    msg = event.message
+    if msg is None or msg.from_user is None or msg.from_user.is_bot or msg.chat.type != ChatType.PRIVATE:
+        return None
+    if msg.text is None:
+        return msg.from_user.id, "media", msg.content_type
+    if msg.text.startswith("/"):
+        cmd, _, args = msg.text.partition(" ")
+        cmd = cmd.split("@")[0][:24]
+        return msg.from_user.id, "cmd", cmd + (" ссылка" if cmd == "/start" and args.strip() else "")
+    if msg.text in _MENU_KEY:
+        return msg.from_user.id, "menu", _MENU_KEY[msg.text]
+    return msg.from_user.id, "text", None
+
+
+class RecordEvents(BaseMiddleware):
+    """Путь человека в боте (app/events.py) — после FloodGuard: отброшенный флуд не пишем."""
+
+    async def __call__(self, handler, event: Update, data):
+        if (ev := _event_of(event)) is not None:
+            await events.record(*ev)
+        return await handler(event, data)
+
+
+dp.update.outer_middleware(RecordEvents())
 
 _bg_tasks: set[asyncio.Task] = set()
 
@@ -524,6 +559,19 @@ async def cmd_stats(msg: Message) -> None:
         f"Событий в блоке обновлений: {events}")
 
 
+@dp.message(Command("events"))
+async def cmd_events(msg: Message, command: CommandObject) -> None:
+    """Путь людей в боте (app/events.py): без аргумента — сводка за неделю, с id — путь одного человека.
+    Только админу и только по запросу, как /stats. Время — по поясу админа из ⚙️."""
+    if msg.from_user.id not in cfg.admin_ids:
+        return
+    arg = (command.args or "").strip()
+    async with session() as s:
+        tz = await s.scalar(select(User.tz_offset).where(User.id == msg.from_user.id)) or 0
+        text_ = await events.path(s, int(arg), tz) if arg.isdigit() else await events.summary(s, tz)
+    await msg.answer(_clip(text_))
+
+
 # ----------------------------------------------------------------------------- обратная связь (app/feedback.py)
 
 def _fb_topics(lang: str) -> InlineKeyboardMarkup:
@@ -622,6 +670,8 @@ async def on_feedback_message(msg: Message, topic: str) -> None:
                 await s.commit()
     except Exception:
         log.exception("Обращение от %s не отправилось", msg.from_user.id)
+    if fb_id:
+        await events.record(msg.from_user.id, "feedback", topic)
     await msg.answer(t(lang, "fb_sent" if fb_id else "fb_failed"), reply_markup=menu(lang))
 
 
@@ -632,12 +682,14 @@ async def on_text(msg: Message) -> None:
     query = guard.clean_query(msg.text)
     lang = await _lang(msg.from_user.id)
     if len(query) < 2:
+        await events.record(msg.from_user.id, "search", "short")
         await msg.answer(t(lang, "query_short"), reply_markup=menu(lang))
         return
     link = _PATH_RX.search(msg.text[:guard.MAX_LINK_SCAN])
     # Разрешение на сайт — там, где запрос к сайту действительно нужен (guard.site_permit): ссылка на известную
     # страницу и поиск по каталогу отвечают из базы.
     if not guard.cheap_actions.allow(msg.from_user.id):
+        await events.record(msg.from_user.id, "link" if link else "search", "limit")
         await msg.answer(t(lang, "too_fast"))
         return
     async with session() as s:
@@ -680,6 +732,7 @@ async def _handle_search(msg: Message, lang: str, query: str) -> None:
         stats = await svc.franchise_stats(s, g.franchise_ids) if g.franchise_ids else {}
     if g.empty:
         if _cached_search(query) is None and (reason := guard.site_permit(msg.from_user.id)):
+            await events.record(msg.from_user.id, "search", "limit")
             await msg.answer(t(lang, reason))
             return
         note = await msg.answer(t(lang, "searching"))
@@ -696,6 +749,7 @@ async def _handle_search(msg: Message, lang: str, query: str) -> None:
     rows += [[(f"🔔 {p.title[:34]} · {t(lang, 'finished_word')}", f"pcard:{p.id}")] for p in g.waiting]
     rows.append([(t(lang, "btn_search_site"), f"site:{_site_token(query)}")])
     text_ = t(lang, "found_n", n=len(rows) - 1)
+    await events.record(msg.from_user.id, "search", events.found("catalog", len(rows) - 1))
     if g.hidden:
         text_ += t(lang, "hidden_local", n=g.hidden)
     await msg.answer(text_, reply_markup=_kb(rows))
@@ -721,6 +775,7 @@ async def cb_site_search(cb: CallbackQuery) -> None:
         await cb.answer(t(lang, "query_stale"), show_alert=True)
         return
     if _cached_search(hit[0]) is None and (reason := guard.site_permit(cb.from_user.id)):
+        await events.record(cb.from_user.id, "search", "limit")
         await cb.answer(t(lang, reason))
         return
     await cb.answer()
@@ -732,6 +787,7 @@ async def _site_search(note: Message, lang: str, query: str, local_hidden: int =
     try:
         items = await _search(query)
     except (AccessBlocked, asyncio.TimeoutError):
+        await events.record(note.chat.id, "search", "busy")
         await note.edit_text(t(lang, "busy"))
         return
     _remember(items)
@@ -765,6 +821,7 @@ async def _site_search(note: Message, lang: str, query: str, local_hidden: int =
     waiting = [i for i in items if (i.is_finished or i.hdrezka_id in finished_known) and not i.looks_like_film
                and i.section in cfg.feed_sections and i.hdrezka_id in page_ids][:MAX_WAITING]
     fr_rows += [[(f"🔔 {i.title[:34]} · {t(lang, 'finished_word')}", f"pcard:{page_ids[i.hdrezka_id]}")] for i in waiting]
+    await events.record(note.chat.id, "search", events.found("site", len(ongoing) + len(fr_rows)))
     if not ongoing:
         hidden = local_hidden + sum(1 for i in items if i.is_finished or i.looks_like_film
                                     or i.hdrezka_id in finished_known) - len(waiting)
@@ -798,6 +855,7 @@ async def _handle_link(msg: Message, lang: str, hdrezka_id: int, path: str) -> N
 
     if known:
         log.info("Ссылка на %s — из базы, без запроса к сайту", hdrezka_id)
+        await events.record(msg.from_user.id, "link", "known")
         note = await _send_card(msg, msg.from_user.id, page_id)
         # Флаг «завершён» знаем наверняка, если он уже стоит или серии выходили недавно.
         recently_active = last_event is not None and (svc.now() - last_event).days < 30
@@ -806,6 +864,7 @@ async def _handle_link(msg: Message, lang: str, hdrezka_id: int, path: str) -> N
         return
 
     if reason := guard.site_permit(msg.from_user.id):
+        await events.record(msg.from_user.id, "link", "limit")
         await msg.answer(t(lang, reason))
         return
     url = path                     # путь: домен подставит клиент — текущее зеркало (24.09.2026)
@@ -814,11 +873,14 @@ async def _handle_link(msg: Message, lang: str, hdrezka_id: int, path: str) -> N
         res = await _read_page(hdrezka_id, url)
         page_id, title = res.page.id, res.page.title
     except PageGone:
+        await events.record(msg.from_user.id, "link", "gone")
         await note.edit_text(t(lang, "link_gone"))
         return
     except (AccessBlocked, asyncio.TimeoutError):
+        await events.record(msg.from_user.id, "link", "busy")
         await note.edit_text(t(lang, "busy"))
         return
+    await events.record(msg.from_user.id, "link", "read")
     try:
         await note.delete()
     except TelegramBadRequest:

@@ -239,6 +239,23 @@ class Feedback(Base):
     answered_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 
+class UserEvent(Base):
+    """Действие человека в боте — чтобы видеть, где новички теряются (10.10.2026, app/events.py). Только тип и
+    короткая метка: тексты сообщений и запросов не храним. Живёт 30 дней. Без внешнего ключа: первое нажатие /start
+    записывается раньше, чем заводится строка users."""
+    __tablename__ = "user_events"
+    __table_args__ = (
+        Index("user_events_by_user", "user_id", "at"),     # путь одного человека — /events <id>
+        Index("user_events_by_time", "at"),                # сводка за неделю и очистка старых
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    user_id: Mapped[int] = mapped_column(BigInteger)
+    at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    kind: Mapped[str] = mapped_column(String(16))
+    detail: Mapped[str | None] = mapped_column(String(32))
+
+
 class FeedbackLink(Base):
     """Сообщение Telegram, относящееся к обращению: «Ответить» на него находит адресата.
     side='admin' — лежит у автора, ответ уходит человеку; 'user' — лежит у человека, уходит автору."""

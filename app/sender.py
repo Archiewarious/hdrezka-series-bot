@@ -30,7 +30,7 @@ from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError, Teleg
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 from sqlalchemy import text
 
-from app import lifecycle, posters
+from app import events, lifecycle, posters
 from app.config import cfg
 from app.db import init_db, session
 from app.i18n import t
@@ -433,9 +433,12 @@ async def run(bot: Bot, limiter: RateLimiter, watchdog: lifecycle.Watchdog | Non
                 last_purge = now
                 async with session() as s:
                     n = await purge(s)
+                    ev = await events.purge(s)
                     await s.commit()
                 if n:
                     log.info("Очистка: удалено %s отправленных уведомлений", n)
+                if ev:
+                    log.info("Очистка: удалено %s действий людей старше %s дней", ev, events.KEEP_DAYS)
             async with session() as s:
                 await lifecycle.ping_if_healthy(s)
             backoff = 0
