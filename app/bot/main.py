@@ -29,7 +29,7 @@ from sqlalchemy import exists, func, select, text
 from app import health, posters
 from app import service as svc
 from app.bot import guard
-from app.bot.search import MAX_WAITING, group_hits
+from app.bot.search import group_hits
 from app.config import cfg
 from app.db import init_db, session
 from app.i18n import DETECT_FALLBACK, LANGS, fmt_date, t, when
@@ -85,6 +85,9 @@ CB = {
     "fb_topic": rf"fb:(?:{'|'.join(feedback.TOPICS)})",
     "fb_cancel": r"fb:cancel",
     "noop": r"noop",
+    # Выдача поиска (10.10.2026): нажал — слежу; «↩️ Отменить» в карточке после этого.
+    "go": rf"go:(?:p|f):{ID}",
+    "undo": rf"undo:(?:p|f):{ID}:{ID}",
 }
 CB_RX = {k: re.compile(rf"\A(?:{v})\Z") for k, v in CB.items()}
 
@@ -368,8 +371,9 @@ async def cmd_start(msg: Message, command: CommandObject) -> None:
 
 
 async def _welcome(msg: Message, lang: str) -> None:
+    """Одно короткое сообщение (10.10.2026): что написать — и пример. Раньше было три сообщения подряд с пересказом
+    функций и пятью «сейчас выходят» — новичку случайными; человек 07.10 ушёл, ничего не выбрав."""
     await msg.answer(t(lang, "start"), reply_markup=menu(lang))
-    await _suggest_airing(msg, lang)
 
 
 @dp.callback_query(_cb("startlang"))
@@ -388,20 +392,6 @@ async def cb_start_lang(cb: CallbackQuery) -> None:
     await cb.answer()
     await _edit(cb, t(code, "lang_switched"), _kb([]))
     await _welcome(cb.message, code)
-
-
-START_SUGGESTIONS = 5
-
-
-async def _suggest_airing(msg: Message, lang: str) -> None:
-    """Первый экран (07.09.2026): подписаться можно сразу, не придумывая название. Отдельным
-    сообщением — нижнее меню и inline-кнопки в одном сообщении не уживаются."""
-    async with session() as s:
-        rows = await svc.airing_now(s, START_SUGGESTIONS)
-    if not rows:
-        return
-    await msg.answer(t(lang, "start_pick"), reply_markup=_kb(
-        [[(f"📺 {title[:30]} · {season}×{episode}", f"pcard:{pid}")] for pid, title, season, episode in rows]))
 
 
 @dp.message(Command("help"))
@@ -730,6 +720,7 @@ async def _handle_search(msg: Message, lang: str, query: str) -> None:
     async with session() as s:
         g = group_hits(await svc.search_catalog(s, query))
         stats = await svc.franchise_stats(s, g.franchise_ids) if g.franchise_ids else {}
+        named = await svc.franchises_named(s, query, g.franchise_ids)
     if g.empty:
         if _cached_search(query) is None and (reason := guard.site_permit(msg.from_user.id)):
             await events.record(msg.from_user.id, "search", "limit")
@@ -738,21 +729,43 @@ async def _handle_search(msg: Message, lang: str, query: str) -> None:
         note = await msg.answer(t(lang, "searching"))
         await _site_search(note, lang, query, local_hidden=g.hidden)
         return
-    rows = []
-    for fid in g.franchise_ids:
-        name, parts, ongoing = stats.get(fid, (t(lang, "franchise_word"), 0, 0))
-        tail = t(lang, "parts_n", n=parts) + ", " + (t(lang, "ongoing_n", n=ongoing) if ongoing else t(lang, "nothing_airing"))
-        rows.append([(f"🎞 {name[:22]} · {tail}", f"subf:{fid}:{g.origin[fid]}")])
-    rows += [[(f"➕ {p.title[:34]} · {_section_label(lang, p.section)} · {p.last_season}×{p.last_episode}",
-               f"sub:{p.hdrezka_id}")] for p in g.standalone]
-    # Завершённые без франшизы — карточкой: там кнопка «🔔 Сообщить о продолжении».
-    rows += [[(f"🔔 {p.title[:34]} · {t(lang, 'finished_word')}", f"pcard:{p.id}")] for p in g.waiting]
+    rows = _hit_rows(lang, g, stats, named)
     rows.append([(t(lang, "btn_search_site"), f"site:{_site_token(query)}")])
     text_ = t(lang, "found_n", n=len(rows) - 1)
     await events.record(msg.from_user.id, "search", events.found("catalog", len(rows) - 1))
     if g.hidden:
         text_ += t(lang, "hidden_local", n=g.hidden)
     await msg.answer(text_, reply_markup=_kb(rows))
+
+
+def _progress(lang: str, p: Page) -> str:
+    """Где сейчас часть: «2×8», «завершён», «фильм» — для кнопки выдачи."""
+    if p.content_type == "film":
+        return t(lang, "kind_film")
+    if p.is_finished:
+        return t(lang, "finished_word")
+    return f"{p.last_season}×{p.last_episode}" if p.last_episode else ""
+
+
+def _hit_rows(lang: str, g, stats: dict, named: set[int]) -> list[list[tuple[str, str]]]:
+    """Выдача поиска (10.10.2026): кнопка называется тем, что нашлось, и нажатие сразу подписывает (cb_go).
+    Часть франшизы — своим названием и пометкой франшизы: на «дом дракона» раньше была кнопка «Игра престолов».
+    Франшизой строка называется, только если запрос совпал с её именем («ведьмак» → «Ведьмак»)."""
+    def btn(*parts: str) -> str:
+        return "🔔 " + " · ".join(x for x in parts if x)
+
+    rows = []
+    for fid in g.franchise_ids:
+        name, parts, ongoing = stats.get(fid, (t(lang, "franchise_word"), 0, 0))
+        if fid in named:
+            tail = t(lang, "parts_n", n=parts) + ", " + (t(lang, "ongoing_n", n=ongoing) if ongoing else t(lang, "nothing_airing"))
+            rows.append([(btn(name[:28], tail), f"go:f:{fid}")])
+        else:
+            lead = g.leads[fid]
+            rows.append([(btn(lead.title[:28], _progress(lang, lead), f"«{name[:20]}»"), f"go:p:{lead.id}")])
+    rows += [[(btn(p.title[:30], _section_label(lang, p.section), _progress(lang, p)), f"go:p:{p.id}")] for p in g.standalone]
+    rows += [[(btn(p.title[:30], _progress(lang, p)), f"go:p:{p.id}")] for p in g.waiting]
+    return rows
 
 
 _site_queries: dict[str, tuple[str, float]] = {}
@@ -791,53 +804,27 @@ async def _site_search(note: Message, lang: str, query: str, local_hidden: int =
         await note.edit_text(t(lang, "busy"))
         return
     _remember(items)
-    # Каталог-first: все карточки ответа — в pages (страницы дочитает очередь поллера).
-    # База учится на пользователях: следующий такой поиск ответит без сайта.
-    finished_known: set[int] = set()
-    franchises: list = []
-    page_ids: dict[int, int] = {}          # hdrezka_id → pages.id для страниц без франшизы
+    # Каталог-first: все карточки ответа — в pages (страницы дочитает очередь поллера). База учится на пользователях:
+    # следующий такой поиск ответит без сайта. Выдача — по тем же правилам, что у каталога (_hit_rows): разделы не из
+    # FEED_SECTIONS (фильмы и т. п.) — только если они часть франшизы.
     async with session() as s:
-        known = [i.hdrezka_id for i in items]
+        pages = []
         for i in items:
             pg = await svc.upsert_page_from_feed(s, i)
-            if pg.franchise_id is None:
-                page_ids[i.hdrezka_id] = pg.id
-        if known:
-            # База знает больше карточки: сезон, завершённый по расписанию (сайт его так не пометил),
-            # в «Сейчас выходит» не попадает — иначе предложим подписку на то, где серий не будет.
-            finished_known = set((await s.execute(select(Page.hdrezka_id).where(
-                Page.hdrezka_id.in_(known), Page.is_finished.is_(True)))).scalars())
-            franchises = (await s.execute(
-                select(Franchise.id, Franchise.name, func.min(Page.id))
-                .join(Page, Page.franchise_id == Franchise.id)
-                .where(Page.hdrezka_id.in_(known))
-                .group_by(Franchise.id, Franchise.name))).all()
+            if pg.franchise_id or i.section in cfg.feed_sections:
+                pages.append(pg)
         await s.commit()
-    ongoing = [i for i in items if i.section in cfg.feed_sections and i.has_episode
-               and i.hdrezka_id not in finished_known][:MAX_RESULTS]
-    # Франшиза известна — отдельной строкой: «следить за всем новым» одним нажатием.
-    fr_rows = [[(t(lang, "franchise_row", name=name[:28]), f"subf:{fid}:{pid}")] for fid, name, pid in franchises]
-    # Завершённые без франшизы — карточкой: там «🔔 Сообщить о продолжении».
-    waiting = [i for i in items if (i.is_finished or i.hdrezka_id in finished_known) and not i.looks_like_film
-               and i.section in cfg.feed_sections and i.hdrezka_id in page_ids][:MAX_WAITING]
-    fr_rows += [[(f"🔔 {i.title[:34]} · {t(lang, 'finished_word')}", f"pcard:{page_ids[i.hdrezka_id]}")] for i in waiting]
-    await events.record(note.chat.id, "search", events.found("site", len(ongoing) + len(fr_rows)))
-    if not ongoing:
-        hidden = local_hidden + sum(1 for i in items if i.is_finished or i.looks_like_film
-                                    or i.hdrezka_id in finished_known) - len(waiting)
-        text_ = t(lang, "nothing_airing_query") + (t(lang, "hidden_site", n=hidden) if hidden > 0 else "")
-        if franchises:
-            text_ += t(lang, "has_franchise_hint")
-        if waiting:
-            text_ += t(lang, "waiting_hint")
-        if not franchises and not waiting:
-            text_ += t(lang, "link_hint")
-        await note.edit_text(text_, reply_markup=_kb(fr_rows) if fr_rows else None)
+        g = group_hits(pages, max_standalone=MAX_RESULTS)
+        stats = await svc.franchise_stats(s, g.franchise_ids) if g.franchise_ids else {}
+        named = await svc.franchises_named(s, query, g.franchise_ids)
+    rows = _hit_rows(lang, g, stats, named)
+    hidden = local_hidden + g.hidden + (len(items) - len(pages))
+    await events.record(note.chat.id, "search", events.found("site", len(rows)))
+    if not rows:
+        text_ = t(lang, "nothing_airing_query") + (t(lang, "hidden_local", n=hidden) if hidden > 0 else "") + t(lang, "link_hint")
+        await note.edit_text(text_)
         return
-    # Каждая кнопка понятна без контекста: название · раздел · текущая серия.
-    rows = [[(f"➕ {i.title[:34]} · {_section_label(lang, i.section, i.section or '')} · {i.season}×{i.episode}",
-              f"sub:{i.hdrezka_id}")] for i in ongoing]
-    await note.edit_text(t(lang, "airing_now_n", n=len(ongoing)), reply_markup=_kb(rows + fr_rows))
+    await note.edit_text(t(lang, "found_n", n=len(rows)), reply_markup=_kb(rows))
 
 
 PAGE_FRESH_DAYS = 7   # страница в базе моложе — на сайт не ходим: бот учится на пользователях
@@ -938,10 +925,10 @@ async def _render_page_card(user_id: int, page_id: int, just_created: bool = Fal
     state = svc.card_state(page, sub is not None, bool(fr_sub), fr is not None)
     if state == "waiting":
         head = t(lang, "head_wait_created" if just_created else "head_waiting")
-    elif state == "subscribed":
+    elif state in ("subscribed", "franchise_sub"):
         head = t(lang, "head_subscribed_new" if just_created else "head_in_subs")
     else:
-        head = t(lang, "head_in_subs" if state == "franchise_sub" else "head_found")
+        head = t(lang, "head_found")
     lines = [f"{head} <b>{html.escape(page.title)}</b>" + (f" · {kind}" if kind else "")]
     if page.content_type != "film" and page.last_season:
         if page.is_finished:
@@ -951,13 +938,18 @@ async def _render_page_card(user_id: int, page_id: int, just_created: bool = Fal
     if nxt:
         lines.append(t(lang, "next_episode", d=fmt_date(lang, nxt)))
     rows = []
+    # Только что подписался (нажатие в выдаче поиска) — «↩️ Отменить»: снимает сразу и оставляет карточку на месте.
+    undo = (t(lang, "btn_undo"), f"undo:p:{(sub.id if sub else fr_sub)}:{page.id}") if just_created else None
     if state == "waiting":
         lines.append(t(lang, "wait_desc"))
-        rows.append([(t(lang, "btn_stop_waiting"), f"unsub:{sub.id}")])
+        rows.append([undo or (t(lang, "btn_stop_waiting"), f"unsub:{sub.id}")])
     elif state == "subscribed":
         lines.append(t(lang, "voice_line", v=html.escape(_voice_label(lang, sub, voices))) + warn)
         rows.append([(t(lang, "btn_choose_voice"), f"voices:{sub.id}")])
-        rows.append([(t(lang, "btn_unsubscribe"), f"unsub:{sub.id}")])
+        rows.append([undo or (t(lang, "btn_unsubscribe"), f"unsub:{sub.id}")])
+    elif state == "franchise_sub" and just_created:
+        lines.append(t(lang, "fr_follow_created", name=html.escape(fr.name)))
+        rows.append([(t(lang, "btn_choose_voice"), f"voices:{fr_sub}"), undo])
     elif state == "franchise_sub":
         # Раньше здесь не было ни одной кнопки: человек не понимал, подписан он или нет (07.09.2026).
         lines.append(t(lang, "in_franchise_sub", name=html.escape(fr.name)))
@@ -969,15 +961,18 @@ async def _render_page_card(user_id: int, page_id: int, just_created: bool = Fal
         lines.append(t(lang, "finished_offer_wait"))
         rows.append([(t(lang, "btn_wait"), f"wait:{page.hdrezka_id}")])
     elif state == "finished_franchise":
+        # Сезон вышел, но франшиза есть: «Следить» — за ней, о продолжении сообщит она (10.10.2026; раньше главной
+        # кнопки не было, только состав франшизы).
         lines.append(t(lang, "finished_in_franchise"))
+        rows.append([(t(lang, "btn_follow"), f"subf_all:{fr.id}")])
     else:
         # «Нажал и забыл»: франшиза известна — подписываем на неё целиком, иначе на страницу
         # (она сама станет «жду продолжения», когда сезон закончится).
         lines.append(t(lang, "follow_desc_franchise" if fr else "follow_desc"))
         rows.append([(t(lang, "btn_follow"), f"subf_all:{fr.id}" if fr else f"sub:{page.hdrezka_id}")])
-    if fr and parts > 1 and state != "franchise_sub":
+    if fr and parts > 1 and (state != "franchise_sub" or just_created):
         # Кнопка «Следить» уже покрывает всю франшизу — здесь только выбор отдельных частей.
-        label = (t(lang, "btn_fr_parts_n", n=parts) if state == "follow"
+        label = (t(lang, "btn_fr_parts_n", n=parts) if state in ("follow", "franchise_sub", "finished_franchise")
                  else t(lang, "btn_whole_franchise", name=fr.name[:24], n=parts))
         rows.append([(label, f"subf:{fr.id}:{page.id}")])
     site = [(t(lang, "btn_open_site"), Url(svc.public_url(page.url)))]                  # нет адреса — нет кнопки (_kb)
@@ -1053,39 +1048,97 @@ async def cb_subscribe(cb: CallbackQuery) -> None:
         await s.commit()
         pid, hid, url, fresh = page.id, page.hdrezka_id, page.url, page.page_refreshed_at
     await cb.answer()
-
-    # В выдаче поиска кнопка становится «✓ …» — результат виден без тоста.
-    if cb.message and cb.message.reply_markup and cb.message.reply_markup.inline_keyboard:
-        tapped = any(b.callback_data == cb.data and b.text.startswith(("➕", "🔔"))
-                     for row in cb.message.reply_markup.inline_keyboard for b in row)
-        if tapped:
-            rows = [[InlineKeyboardButton(
-                text=("✓ " + b.text[2:]) if b.callback_data == cb.data else b.text,
-                callback_data="noop" if b.callback_data == cb.data else b.callback_data) for b in row]
-                for row in cb.message.reply_markup.inline_keyboard]
-            try:
-                await cb.message.edit_reply_markup(reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
-            except TelegramBadRequest:
-                pass
-            send_new = True
-        else:
-            send_new = False   # нажали в карточке — обновим её же
-    else:
-        send_new = True
-
-    # Свежая страница — для карточки и расписания. Только если разрешает лимит: подписка уже создана,
-    # а страницу иначе прочитает поллер (очередь каталога или обновление подписанных).
-    if (not fresh or (svc.now() - fresh).days >= 1) and not guard.site_permit(cb.from_user.id):
-        try:
-            await _read_page(hid, url)
-        except (AccessBlocked, PageGone, asyncio.TimeoutError):
-            log.warning("Не прочитал страницу %s после подписки", hid)
-
+    has_kb = cb.message and cb.message.reply_markup and cb.message.reply_markup.inline_keyboard
+    send_new = not has_kb or await _mark_tapped(cb)          # нажали в карточке — обновим её же
+    await _refresh_after_follow(cb.from_user.id, hid, url, fresh)
     if send_new:
         await _send_card(cb.message, cb.from_user.id, pid, just_created=created)
     else:
         text_, kb = await _render_page_card(cb.from_user.id, pid, just_created=created)
         await _edit(cb, text_, kb)
+
+
+async def _mark_tapped(cb: CallbackQuery) -> bool:
+    """В выдаче поиска нажатая кнопка становится «✓ …» — результат виден без тоста. False — нажатие было не в выдаче
+    (в карточке), отмечать нечего."""
+    kb = cb.message.reply_markup.inline_keyboard if cb.message and cb.message.reply_markup else []
+    if not any(b.callback_data == cb.data and b.text.startswith(("➕", "🔔")) for row in kb for b in row):
+        return False
+    rows = [[InlineKeyboardButton(
+        text=("✓ " + b.text[2:]) if b.callback_data == cb.data else b.text,
+        callback_data="noop" if b.callback_data == cb.data else b.callback_data) for b in row] for row in kb]
+    try:
+        await cb.message.edit_reply_markup(reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
+    except TelegramBadRequest:
+        pass
+    return True
+
+
+async def _refresh_after_follow(user_id: int, hid: int, url: str, fresh) -> None:
+    """Свежая страница — для карточки и расписания. Только если разрешает лимит: подписка уже создана,
+    а страницу иначе прочитает поллер (очередь каталога или обновление подписанных)."""
+    if (not fresh or (svc.now() - fresh).days >= 1) and not guard.site_permit(user_id):
+        try:
+            await _read_page(hid, url)
+        except (AccessBlocked, PageGone, asyncio.TimeoutError):
+            log.warning("Не прочитал страницу %s после подписки", hid)
+
+
+@dp.callback_query(_cb("go"))
+@limited
+async def cb_go(cb: CallbackQuery) -> None:
+    """Нажатие в выдаче поиска — сразу «слежу» (10.10.2026; раньше: выдача → карточка → «Следить»). go:p:<page_id> —
+    часть: франшиза целиком, если известна (как «🔔 Следить» в карточке, решение «нажал и забыл»), иначе сама
+    страница — завершённая означает «слежу за продолжением»; go:f:<franchise_id> — запрос совпал с именем франшизы.
+    Кнопка в выдаче становится «✓ …», карточка приходит новым сообщением с «↩️ Отменить»."""
+    lang = await _lang(cb.from_user.id)
+    _, kind, raw = cb.data.split(":")
+    if await _too_many_subs(cb.from_user.id):
+        await cb.answer(t(lang, "max_subs", n=guard.MAX_SUBSCRIPTIONS), show_alert=True)
+        return
+    async with session() as s:
+        lang = await _touch_user(s, cb.from_user)
+        page = None if kind == "f" else await s.get(Page, int(raw))
+        fid = int(raw) if kind == "f" else page.franchise_id if page else None
+        if (kind == "f" and await s.get(Franchise, fid) is None) or (kind == "p" and page is None):
+            await s.commit()
+            await cb.answer(t(lang, "card_stale"), show_alert=True)
+            return
+        if fid:
+            created = await svc.subscribe_franchise(s, cb.from_user.id, fid)
+        elif page.content_type == "film":
+            await s.commit()
+            await cb.answer(t(lang, "cannot_sub"), show_alert=True)
+            return
+        else:
+            created = await svc.subscribe_page(s, cb.from_user.id, page.id)
+        await s.commit()
+        target = (page.id, page.hdrezka_id, page.url, page.page_refreshed_at) if page else None
+    await cb.answer()
+    await _mark_tapped(cb)
+    if target is None:
+        text_, kb = await _render_franchise_card(cb.from_user.id, fid, created)
+        await cb.message.answer(_clip(text_), reply_markup=kb)
+        return
+    pid, hid, url, fresh = target
+    await _refresh_after_follow(cb.from_user.id, hid, url, fresh)
+    await _send_card(cb.message, cb.from_user.id, pid, just_created=created)
+
+
+@dp.callback_query(_cb("undo"))
+@limited
+async def cb_undo(cb: CallbackQuery) -> None:
+    """«↩️ Отменить» сразу после «слежу»: подписка снимается без вопроса «точно?», карточка остаётся на месте —
+    уже без подписки, с кнопкой «🔔 Следить». undo:p:<sub>:<page_id> — карточка части, undo:f:<sub>:<fid> — франшизы."""
+    lang = await _lang(cb.from_user.id)
+    _, kind, sub_id, obj = cb.data.split(":")
+    async with session() as s:
+        ok = await svc.unsubscribe(s, cb.from_user.id, int(sub_id))
+        await s.commit()
+    await cb.answer(t(lang, "toast_undone" if ok else "toast_no_sub"))
+    render = _render_page_card if kind == "p" else _render_franchise_card
+    text_, kb = await render(cb.from_user.id, int(obj), False)
+    await _edit(cb, text_, kb)
 
 
 # ----------------------------------------------------------------------------- франшиза
@@ -1228,7 +1281,8 @@ async def _render_franchise_card(user_id: int, fid: int, created: bool = True):
     if sub:
         lines.append(t(lang, "voice_line", v=html.escape(_voice_label(lang, sub, uniq))) + warn)
         rows.append([(t(lang, "btn_choose_voice"), f"voices:{sub.id}")])
-        rows.append([(t(lang, "btn_unsubscribe"), f"unsub:{sub.id}")])
+        rows.append([(t(lang, "btn_undo"), f"undo:f:{sub.id}:{fid}") if created
+                     else (t(lang, "btn_unsubscribe"), f"unsub:{sub.id}")])
     else:
         rows.append([(t(lang, "btn_sub_franchise"), f"subf_all:{fid}")])
     rows.append([(t(lang, "btn_schedule"), f"sched:f:{fid}")])

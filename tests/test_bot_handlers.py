@@ -198,7 +198,7 @@ def test_site_search_shows_airing_titles(db, monkeypatch, no_background):
     assert searches == ["уникальный запрос 4601"] and msg.answers[0][0] == main.t("ru", "searching")
     text_, kb = msg.notes[0].edits[-1]
     buttons = [b.text for row in kb.inline_keyboard for b in row]
-    assert text_ == main.t("ru", "airing_now_n", n=1) and buttons[0].startswith("➕ Выходит"), "фильм не предлагается"
+    assert text_ == main.t("ru", "found_n", n=1) and buttons[0].startswith("🔔 Выходит"), "фильм не предлагается"
 
 
 def test_subscription_limits_and_films(db, site):

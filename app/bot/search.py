@@ -20,6 +20,7 @@ def is_ongoing(p: Page) -> bool:
 class Grouped:
     franchise_ids: list[int] = field(default_factory=list)       # в порядке релевантности
     origin: dict[int, int] = field(default_factory=dict)         # franchise_id → id самой релевантной части
+    leads: dict[int, Page] = field(default_factory=dict)         # franchise_id → сама эта часть: её название — в кнопке
     standalone: list[Page] = field(default_factory=list)         # выходящие страницы без франшизы
     waiting: list[Page] = field(default_factory=list)            # завершённые сериалы без франшизы («жду продолжения»)
     hidden: int = 0                                              # фильмы и страницы без серий вне франшиз
@@ -39,6 +40,7 @@ def group_hits(pages: list[Page], max_standalone: int = MAX_STANDALONE, max_wait
             if p.franchise_id not in g.origin:
                 g.franchise_ids.append(p.franchise_id)
                 g.origin[p.franchise_id] = p.id
+                g.leads[p.franchise_id] = p
         elif is_ongoing(p):
             if len(g.standalone) < max_standalone:
                 g.standalone.append(p)

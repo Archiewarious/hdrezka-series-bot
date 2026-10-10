@@ -630,7 +630,11 @@ async def mark_voice_seen(s: AsyncSession, episode_id: int, translator_id: int) 
 
 # ----------------------------------------------------------------------------- локальный поиск
 
-WORD_SIMILARITY_THRESHOLD = 0.6   # «слиз» → «…в слизь» = 0.8; при 0.5 «дом дракона» тянул «Кот и дракон»
+WORD_SIMILARITY_THRESHOLD = 0.75  # «слиз» → «…в слизь» = 0.8, «ведьмака» → «Ведьмак» = 0.78; совпадение по одному
+                                  # слову из двух — 0.65–0.73: «дом дракона» тянул «Новую таверну дракона» и Пороро (10.10.2026)
+
+FULL_MATCH = 0.95
+NEAR_MATCH = 0.8
 
 SEARCH_SQL = text("""
     SELECT p.id,
@@ -638,7 +642,10 @@ SEARCH_SQL = text("""
                     word_similarity(norm_title(CAST(:q AS text)), norm_title(p.orig_title))) AS score
       FROM pages p
      WHERE norm_title(CAST(:q AS text)) <% norm_title(p.title) OR norm_title(CAST(:q AS text)) <% norm_title(p.orig_title)
-     ORDER BY score DESC, (NOT p.is_finished) DESC, p.last_event_at DESC NULLS LAST, p.id DESC
+     ORDER BY score DESC,
+              -- при равной оценке — ближайшее название целиком: «ведьмак» → «Ведьмак», а не «Ведьмак: Кошмар волка»
+              similarity(norm_title(CAST(:q AS text)), norm_title(p.title)) DESC,
+              (NOT p.is_finished) DESC, p.last_event_at DESC NULLS LAST, p.id DESC
      LIMIT :lim""")
 
 
@@ -647,7 +654,21 @@ async def search_catalog(s: AsyncSession, query: str, limit: int = 30) -> list[P
     (unaccent). Ответ — миллисекунды и ноль запросов к сайту."""
     await s.execute(text(f"SET LOCAL pg_trgm.word_similarity_threshold = {WORD_SIMILARITY_THRESHOLD}"))
     rows = (await s.execute(SEARCH_SQL, {"q": query, "lim": limit})).all()
+    if rows and rows[0][1] >= FULL_MATCH:
+        # Есть полное совпадение — частичные рядом с ним шум: «ведьмак» → «Сильнейшая ведьма…» = 0.75 (10.10.2026)
+        rows = [r for r in rows if r[1] >= NEAR_MATCH]
     return [await s.get(Page, pid) for pid, _ in rows]
+
+
+async def franchises_named(s: AsyncSession, query: str, ids: list[int]) -> set[int]:
+    """Франшизы, чьё имя само совпало с запросом («ведьмак» → «Ведьмак»): строку выдачи называем франшизой. Иначе —
+    найденной частью: на «дом дракона» кнопка «Игра престолов» выглядела как ошибка поиска (10.10.2026)."""
+    if not ids:
+        return set()
+    await s.execute(text(f"SET LOCAL pg_trgm.word_similarity_threshold = {WORD_SIMILARITY_THRESHOLD}"))
+    rows = await s.execute(text("SELECT id FROM franchises WHERE id = ANY(CAST(:ids AS int[])) "
+                                "AND norm_title(CAST(:q AS text)) <% norm_title(name)"), {"ids": ids, "q": query})
+    return set(rows.scalars())
 
 
 async def franchise_stats(s: AsyncSession, ids: list[int]) -> dict[int, tuple[str, int, int]]:
@@ -657,27 +678,6 @@ async def franchise_stats(s: AsyncSession, ids: list[int]) -> dict[int, tuple[st
           FROM franchises f JOIN pages p ON p.franchise_id = f.id
          WHERE f.id = ANY(CAST(:ids AS int[])) GROUP BY f.id, f.name"""), {"ids": ids})
     return {fid: (name, parts, ongoing) for fid, name, parts, ongoing in rows}
-
-
-AIRING_SQL = text("""
-    SELECT id, title, last_season, last_episode FROM (
-        SELECT DISTINCT ON (coalesce(p.franchise_id, -p.id))
-               p.id, p.title, p.last_season, p.last_episode,
-               (p.last_event_at IS NOT NULL) AS seen,          -- серию видели сами: такой тайтл живой наверняка
-               coalesce(p.last_event_at, p.created_at) AS fresh
-          FROM pages p
-         WHERE NOT p.is_finished AND coalesce(p.content_type, 'series') = 'series'
-           AND p.last_episode IS NOT NULL AND p.url <> '' AND p.section IS NOT NULL
-           AND (p.year IS NULL OR p.year >= :since_year)
-         ORDER BY coalesce(p.franchise_id, -p.id), seen DESC, fresh DESC) t
-     ORDER BY seen DESC, fresh DESC LIMIT :lim""")
-
-
-async def airing_now(s: AsyncSession, limit: int) -> list[tuple[int, str, int, int]]:
-    """Что предложить на первом экране: выходящие сериалы, по одному на франшизу, свежие сверху.
-    Популярности сайт не отдаёт, поэтому «сейчас выходят» — честная формулировка, не «популярное»."""
-    rows = await s.execute(AIRING_SQL, {"lim": limit, "since_year": str(now().year - 1)})
-    return [tuple(r) for r in rows]
 
 
 # ----------------------------------------------------------------------------- subscriptions

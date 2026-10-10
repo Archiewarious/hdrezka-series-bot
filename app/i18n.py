@@ -94,52 +94,19 @@ STRINGS: dict[str, dict[str, str | tuple]] = {
         "en": "\n\n<i>To add more, type a title. Your list is under “📋 My subscriptions”.</i>",
     },
     "start": {
-        "ru": ("Привет! Я слежу за HDREZKA и пишу, когда выходит новая серия.\n\n"
-               "Нажмите «🔔 Следить» — и больше ничего делать не нужно: расскажу о каждой новой серии, "
-               "а когда сезон закончится — о продолжении: новом сезоне, фильме или спин-оффе.\n\n"
-               "Напишите название или пришлите ссылку на страницу. Кнопки внизу — всё управление. 👇"),
-        "uk": ("Привіт! Я стежу за HDREZKA і пишу, коли виходить нова серія.\n\n"
-               "Натисніть «🔔 Стежити» — і більше нічого робити не потрібно: розповім про кожну нову серію, "
-               "а коли сезон завершиться — про продовження: новий сезон, фільм або спін-оф.\n\n"
-               "Напишіть назву або надішліть посилання на сторінку. Кнопки внизу — усе керування. 👇"),
-        "en": ("Hi! I watch HDREZKA and message you when a new episode is out.\n\n"
-               "Tap “🔔 Follow” and you're done: I'll tell you about every new episode, and when the season "
-               "ends — about the sequel: a new season, film or spin-off.\n\n"
-               "Type a title or send a link to a page. The buttons below are all the controls. 👇"),
+        "ru": "Привет! Напишите название сериала — пришлю, когда выйдет новая серия.\n\nНапример: <i>Дом дракона</i>",
+        "uk": "Привіт! Напишіть назву серіалу — надішлю, коли вийде нова серія.\n\nНаприклад: <i>Дім дракона</i>",
+        "en": "Hi! Type the name of a show — I'll message you when a new episode is out.\n\nFor example: <i>House of the Dragon</i>",
     },
     "choose_lang": {
         "ru": "🌐 <b>Выберите язык</b>\nПотом его можно поменять в ⚙️ Настройках.",
         "uk": "🌐 <b>Виберіть мову</b>\nПотім її можна змінити в ⚙️ Налаштуваннях.",
         "en": "🌐 <b>Choose your language</b>\nYou can change it later in ⚙️ Settings.",
     },
-    "start_pick": {"ru": "🔥 Сейчас выходят — можно начать отсюда:",
-                   "uk": "🔥 Зараз виходять — можна почати звідси:",
-                   "en": "🔥 Airing now — you can start here:"},
     "help": {
-        "ru": ("Слежу за выходом новых серий на HDREZKA и присылаю уведомления.\n\n"
-               "<b>Как подписаться</b>\n"
-               "• пришлите название — покажу, что сейчас выходит\n"
-               "• или ссылку на страницу тайтла\n\n"
-               "Подписаться можно на <b>один сезон</b> или на <b>всю франшизу</b> — тогда "
-               "сообщу и о новых сезонах, фильмах и спин-оффах.\n\n"
-               "Сезон уже вышел целиком, а франшизы нет? На его карточке есть «🔔 Сообщить о продолжении».\n\n"
-               "Кнопки внизу — главное меню: поиск, подписки, что нового за неделю, календарь, настройки, помощь."),
-        "uk": ("Стежу за виходом нових серій на HDREZKA і надсилаю сповіщення.\n\n"
-               "<b>Як підписатися</b>\n"
-               "• надішліть назву — покажу, що зараз виходить\n"
-               "• або посилання на сторінку тайтлу\n\n"
-               "Підписатися можна на <b>один сезон</b> або на <b>всю франшизу</b> — тоді "
-               "повідомлю і про нові сезони, фільми та спін-офи.\n\n"
-               "Сезон уже вийшов повністю, а франшизи немає? На його картці є «🔔 Повідомити про продовження».\n\n"
-               "Кнопки внизу — головне меню: пошук, підписки, що нового за тиждень, календар, налаштування, допомога."),
-        "en": ("I watch for new episodes on HDREZKA and send notifications.\n\n"
-               "<b>How to subscribe</b>\n"
-               "• send a title — I'll show what's airing now\n"
-               "• or a link to a title page\n\n"
-               "You can follow <b>one season</b> or the <b>whole franchise</b> — then I'll also "
-               "tell you about new seasons, films and spin-offs.\n\n"
-               "Season already finished and there's no franchise? Its card has “🔔 Notify about a sequel”.\n\n"
-               "The buttons below are the main menu: search, subscriptions, this week's releases, calendar, settings, help."),
+        "ru": "Слежу за выходом новых серий на HDREZKA и присылаю уведомления.\n\n<b>Как начать</b>\n• напишите название сериала или пришлите ссылку на его страницу\n• нажмите на найденное — и всё: пришлю каждую новую серию\n\nЕсли у сериала есть франшиза, слежу за ней целиком — сообщу и о новых сезонах, фильмах, спин-оффах. Только отдельные части — кнопка «🎞 Состав франшизы» в карточке. Сезон вышел целиком — слежу за продолжением.\n\nКнопки внизу — главное меню: поиск, подписки, что нового за неделю, календарь, настройки, помощь.",
+        "uk": "Стежу за виходом нових серій на HDREZKA і надсилаю сповіщення.\n\n<b>Як почати</b>\n• напишіть назву серіалу або надішліть посилання на його сторінку\n• натисніть на знайдене — і все: надішлю кожну нову серію\n\nЯкщо в серіалу є франшиза, стежу за нею повністю — повідомлю і про нові сезони, фільми, спін-офи. Лише окремі частини — кнопка «🎞 Склад франшизи» в картці. Сезон вийшов повністю — стежу за продовженням.\n\nКнопки внизу — головне меню: пошук, підписки, що нового за тиждень, календар, налаштування, допомога.",
+        "en": "I watch for new episodes on HDREZKA and send notifications.\n\n<b>How to start</b>\n• type the name of a show or send a link to its page\n• tap what I find — that's it: I'll send every new episode\n\nIf the show has a franchise, I follow all of it — new seasons, films and spin-offs too. Only some parts — the “🎞 Franchise parts” button on the card. A season is fully out — I watch for a continuation.\n\nThe buttons below are the main menu: search, subscriptions, what's new this week, calendar, settings, help.",
     },
     "busy": {"ru": "Сайт сейчас отвечает медленно или недоступен — попробуйте через пару минут.",
              "uk": "Сайт зараз відповідає повільно або недоступний — спробуйте за кілька хвилин.",
@@ -196,42 +163,23 @@ STRINGS: dict[str, dict[str, str | tuple]] = {
                   "en": ("{n} airing", "{n} airing")},
     "nothing_airing": {"ru": "ничего не выходит", "uk": "нічого не виходить", "en": "nothing airing"},
     "finished_word": {"ru": "завершён", "uk": "завершено", "en": "finished"},
-    "btn_search_site": {"ru": "🔍 Искать на сайте", "uk": "🔍 Шукати на сайті", "en": "🔍 Search the site"},
-    "found_n": {"ru": "Нашёл ({n}). Выберите:", "uk": "Знайшов ({n}). Виберіть:", "en": "Found {n}. Choose:"},
+    "btn_search_site": {"ru": "🔍 Нет нужного — искать на сайте", "uk": "🔍 Немає потрібного — шукати на сайті", "en": "🔍 Not here — search the site"},
+    "found_n": {"ru": "Нашёл ({n}). Нажмите — и я буду следить:", "uk": "Знайшов ({n}). Натисніть — і я стежитиму:", "en": "Found {n}. Tap one and I'll follow it:"},
     "hidden_local": {"ru": "\n<i>Скрыто {n}: фильмы и тайтлы без вышедших серий.</i>",
                      "uk": "\n<i>Приховано {n}: фільми й тайтли без серій, що вийшли.</i>",
                      "en": "\n<i>{n} hidden: films and titles with no released episodes.</i>"},
     "query_stale": {"ru": "Запрос устарел — напишите название ещё раз.",
                     "uk": "Запит застарів — напишіть назву ще раз.",
                     "en": "The query has expired — type the title again."},
-    "franchise_row": {"ru": "🎞 Франшиза «{name}»", "uk": "🎞 Франшиза «{name}»", "en": "🎞 Franchise “{name}”"},
     "nothing_airing_query": {"ru": "Сейчас ничего выходящего по этому запросу нет.",
                              "uk": "Зараз за цим запитом нічого не виходить.",
                              "en": "Nothing matching this query is airing right now."},
-    "hidden_site": {"ru": " Скрыто {n}: фильмы и завершённые части франшиз.",
-                    "uk": " Приховано {n}: фільми та завершені частини франшиз.",
-                    "en": " {n} hidden: films and finished franchise parts."},
-    "has_franchise_hint": {
-        "ru": "\n\nЕсть франшиза: подпишитесь на неё — сообщу о новых сезонах, фильмах, спин-оффах.",
-        "uk": "\n\nЄ франшиза: підпишіться на неї — повідомлю про нові сезони, фільми, спін-офи.",
-        "en": "\n\nThere is a franchise: subscribe to it and I'll tell you about new seasons, films and spin-offs.",
-    },
-    "waiting_hint": {
-        "ru": "\n\nСезон вышел целиком? Откройте карточку — там «🔔 Сообщить о продолжении».",
-        "uk": "\n\nСезон вийшов повністю? Відкрийте картку — там «🔔 Повідомити про продовження».",
-        "en": "\n\nSeason already complete? Open its card — there's “🔔 Notify about a sequel”.",
-    },
-    "link_hint": {
-        "ru": "\n\nЕсли у тайтла есть франшиза — пришлите ссылку на любую его страницу, предложу подписку на всю франшизу.",
-        "uk": "\n\nЯкщо в тайтлу є франшиза — надішліть посилання на будь-яку його сторінку, запропоную підписку на всю франшизу.",
-        "en": "\n\nIf the title has a franchise, send a link to any of its pages and I'll offer a franchise subscription.",
-    },
-    "airing_now_n": {"ru": "Сейчас выходит ({n}). Выберите:", "uk": "Зараз виходить ({n}). Виберіть:", "en": "Airing now ({n}). Choose:"},
+    "link_hint": {"ru": "\n\nЕсли сериал на сайте есть — пришлите ссылку на его страницу.", "uk": "\n\nЯкщо серіал на сайті є — надішліть посилання на його сторінку.", "en": "\n\nIf the show is on the site, send a link to its page."},
     # --- карточка страницы
-    "head_wait_created": {"ru": "🔔 Сообщу о продолжении:", "uk": "🔔 Повідомлю про продовження:", "en": "🔔 I'll notify about a sequel:"},
-    "head_waiting": {"ru": "🔔 Жду продолжения:", "uk": "🔔 Чекаю на продовження:", "en": "🔔 Waiting for a sequel:"},
-    "head_subscribed_new": {"ru": "✅ Подписал:", "uk": "✅ Підписав:", "en": "✅ Subscribed:"},
-    "head_in_subs": {"ru": "В подписках:", "uk": "У підписках:", "en": "In your subscriptions:"},
+    "head_wait_created": {"ru": "✅ Слежу за продолжением:", "uk": "✅ Стежу за продовженням:", "en": "✅ Watching for a continuation:"},
+    "head_waiting": {"ru": "Слежу за продолжением:", "uk": "Стежу за продовженням:", "en": "Watching for a continuation:"},
+    "head_subscribed_new": {"ru": "✅ Слежу:", "uk": "✅ Стежу:", "en": "✅ Following:"},
+    "head_in_subs": {"ru": "Слежу:", "uk": "Стежу:", "en": "Following:"},
     "head_found": {"ru": "Найдено:", "uk": "Знайдено:", "en": "Found:"},
     "last_episode_finished": {"ru": "Последняя серия: {s}×{e} · <b>сериал завершён</b>",
                               "uk": "Остання серія: {s}×{e} · <b>серіал завершено</b>",
@@ -241,26 +189,31 @@ STRINGS: dict[str, dict[str, str | tuple]] = {
     "wait_desc": {"ru": "Сообщу, когда появится продолжение: новый сезон, фильм или спин-офф.",
                   "uk": "Повідомлю, коли з'явиться продовження: новий сезон, фільм або спін-оф.",
                   "en": "I'll let you know when a sequel appears: a new season, film or spin-off."},
-    "btn_stop_waiting": {"ru": "❌ Больше не ждать", "uk": "❌ Більше не чекати", "en": "❌ Stop waiting"},
+    "btn_stop_waiting": {"ru": "🔕 Не следить", "uk": "🔕 Не стежити", "en": "🔕 Stop following"},
     "voice_line": {"ru": "Озвучка: {v}", "uk": "Озвучка: {v}", "en": "Dub: {v}"},
     "btn_choose_voice": {"ru": "🎙 Выбрать озвучку", "uk": "🎙 Вибрати озвучку", "en": "🎙 Choose a dub"},
-    "btn_unsubscribe": {"ru": "❌ Отписаться", "uk": "❌ Відписатися", "en": "❌ Unsubscribe"},
-    "in_franchise_sub": {"ru": "Уже входит в вашу подписку на франшизу «{name}».",
-                         "uk": "Уже входить до вашої підписки на франшизу «{name}».",
-                         "en": "Already covered by your subscription to the “{name}” franchise."},
+    "btn_unsubscribe": {"ru": "🔕 Не следить", "uk": "🔕 Не стежити", "en": "🔕 Stop following"},
+    "fr_follow_created": {
+        "ru": "И за всей франшизой «{name}» — сообщу о новых сезонах, фильмах, спин-оффах.",
+        "uk": "І за всією франшизою «{name}» — повідомлю про нові сезони, фільми, спін-офи.",
+        "en": "And the whole “{name}” franchise — I'll tell you about new seasons, films and spin-offs.",
+    },
+    "btn_undo": {"ru": "↩️ Отменить", "uk": "↩️ Скасувати", "en": "↩️ Undo"},
+    "toast_undone": {"ru": "Отменил", "uk": "Скасував", "en": "Undone"},
+    "in_franchise_sub": {"ru": "Слежу в составе франшизы «{name}».", "uk": "Стежу у складі франшизи «{name}».", "en": "Followed as part of the “{name}” franchise."},
     "film_no_sub": {"ru": "Это фильм — на него подписаться нельзя, новых серий не будет.",
                     "uk": "Це фільм — на нього не підписатися, нових серій не буде.",
                     "en": "This is a film — no episodes to follow."},
     "finished_offer_wait": {"ru": "Сезон вышел целиком. Могу сообщить, когда появится продолжение.",
                             "uk": "Сезон вийшов повністю. Можу повідомити, коли з'явиться продовження.",
                             "en": "The season is complete. I can notify you when a sequel appears."},
-    "btn_wait": {"ru": "🔔 Сообщить о продолжении", "uk": "🔔 Повідомити про продовження", "en": "🔔 Notify about a sequel"},
+    "btn_wait": {"ru": "🔔 Следить за продолжением", "uk": "🔔 Стежити за продовженням", "en": "🔔 Watch for a continuation"},
     "finished_in_franchise": {
-        "ru": "Сезон вышел целиком — подписаться на него нельзя. О продолжении сообщит подписка на франшизу.",
-        "uk": "Сезон вийшов повністю — підписатися на нього не можна. Про продовження повідомить підписка на франшизу.",
-        "en": "The season is complete — it can't be followed. A franchise subscription will tell you about sequels.",
+        "ru": "Сезон вышел целиком. Нажмите «🔔 Следить» — сообщу о продолжении: новом сезоне, фильме или спин-оффе.",
+        "uk": "Сезон вийшов повністю. Натисніть «🔔 Стежити» — повідомлю про продовження: новий сезон, фільм або спін-оф.",
+        "en": "The season is fully out. Tap “🔔 Follow” and I'll tell you about a continuation: a new season, film or spin-off.",
     },
-    "btn_sub_season": {"ru": "➕ Подписаться на этот сезон", "uk": "➕ Підписатися на цей сезон", "en": "➕ Follow this season"},
+    "btn_sub_season": {"ru": "🔔 Следить за сезоном", "uk": "🔔 Стежити за сезоном", "en": "🔔 Follow this season"},
     "btn_follow": {"ru": "🔔 Следить", "uk": "🔔 Стежити", "en": "🔔 Follow"},
     "follow_desc": {
         "ru": "Сообщу о новых сериях, а когда сезон закончится — о продолжении: новом сезоне, фильме или спин-оффе.",
@@ -282,35 +235,33 @@ STRINGS: dict[str, dict[str, str | tuple]] = {
     "voice_any": {"ru": "любая", "uk": "будь-яка", "en": "any"},
     "max_subs": {"ru": "Не больше {n} подписок.", "uk": "Не більше {n} підписок.", "en": "No more than {n} subscriptions."},
     "card_stale": {"ru": "Карточка устарела — повторите поиск.", "uk": "Картка застаріла — повторіть пошук.", "en": "The card has expired — search again."},
-    "cannot_sub": {"ru": "На это подписаться нельзя: фильм или завершённый сезон.",
-                   "uk": "На це не підписатися: фільм або завершений сезон.",
-                   "en": "This can't be followed: a film or a finished season."},
+    "cannot_sub": {"ru": "Следить не за чем: это фильм.", "uk": "Стежити нема за чим: це фільм.", "en": "Nothing to follow: it's a film."},
     # --- франшиза
     "st_finished": {"ru": "{kind} · завершён", "uk": "{kind} · завершено", "en": "{kind} · finished"},
     "st_airing": {"ru": "{kind} · идёт, {s}×{e}", "uk": "{kind} · триває, {s}×{e}", "en": "{kind} · airing, {s}×{e}"},
     "st_unread": {"ru": "ещё не смотрели", "uk": "ще не переглядали", "en": "not checked yet"},
     "fr_not_found": {"ru": "Франшиза не найдена.", "uk": "Франшизу не знайдено.", "en": "Franchise not found."},
     "fr_head": {"ru": "🎞 Франшиза <b>{name}</b> — {parts}", "uk": "🎞 Франшиза <b>{name}</b> — {parts}", "en": "🎞 Franchise <b>{name}</b> — {parts}"},
-    "fr_subscribed": {"ru": "✅ Вы подписаны на всю франшизу.", "uk": "✅ Ви підписані на всю франшизу.", "en": "✅ You follow the whole franchise."},
+    "fr_subscribed": {"ru": "✅ Слежу за всей франшизой.", "uk": "✅ Стежу за всією франшизою.", "en": "✅ Following the whole franchise."},
     "fr_airing": {"ru": "\n<b>Сейчас выходят:</b>", "uk": "\n<b>Зараз виходять:</b>", "en": "\n<b>Airing now:</b>"},
     "fr_rest": {"ru": "\n<b>Остальные части:</b>", "uk": "\n<b>Інші частини:</b>", "en": "\n<b>Other parts:</b>"},
     "fr_more": {"ru": "  … и ещё {n}", "uk": "  … і ще {n}", "en": "  … and {n} more"},
     "fr_explain": {
-        "ru": "\nПодписка на всю франшизу — это все выходящие сезоны плюс сообщения о новых частях: сезонах, фильмах, спин-оффах. Или выберите отдельные части ниже.",
-        "uk": "\nПідписка на всю франшизу — це всі сезони, що виходять, плюс повідомлення про нові частини: сезони, фільми, спін-офи. Або виберіть окремі частини нижче.",
-        "en": "\nA franchise subscription covers every airing season plus news about new parts: seasons, films, spin-offs. Or pick individual parts below.",
+        "ru": "\nСледить за всей франшизой — это все выходящие сезоны и новые части: сезоны, фильмы, спин-оффы. Или выберите отдельные части ниже.",
+        "uk": "\nСтежити за всією франшизою — це всі сезони, що виходять, і нові частини: сезони, фільми, спін-офи. Або виберіть окремі частини нижче.",
+        "en": "\nFollowing the whole franchise means every airing season plus new parts: seasons, films, spin-offs. Or pick separate parts below.",
     },
-    "btn_sub_franchise_all": {"ru": "✅ Подписаться на всю франшизу", "uk": "✅ Підписатися на всю франшизу", "en": "✅ Follow the whole franchise"},
+    "btn_sub_franchise_all": {"ru": "🔔 Следить за всей франшизой", "uk": "🔔 Стежити за всією франшизою", "en": "🔔 Follow the whole franchise"},
     "btn_fr_card": {"ru": "📋 Карточка франшизы", "uk": "📋 Картка франшизи", "en": "📋 Franchise card"},
     "btn_back": {"ru": "« Назад", "uk": "« Назад", "en": "« Back"},
-    "fc_head_new": {"ru": "✅ Подписал на франшизу", "uk": "✅ Підписав на франшизу", "en": "✅ Following the franchise"},
-    "fc_head_in_subs": {"ru": "В подписках — франшиза", "uk": "У підписках — франшиза", "en": "In your subscriptions — franchise"},
+    "fc_head_new": {"ru": "✅ Слежу за франшизой", "uk": "✅ Стежу за франшизою", "en": "✅ Following the franchise"},
+    "fc_head_in_subs": {"ru": "Слежу за франшизой", "uk": "Стежу за франшизою", "en": "Following the franchise"},
     "fc_head": {"ru": "Франшиза", "uk": "Франшиза", "en": "Franchise"},
     "fc_airing": {"ru": "Сейчас выходят:", "uk": "Зараз виходять:", "en": "Airing now:"},
     "fc_desc": {"ru": "Сообщу о новых сериях, сезонах, фильмах и спин-оффах.",
                 "uk": "Повідомлю про нові серії, сезони, фільми та спін-офи.",
                 "en": "I'll tell you about new episodes, seasons, films and spin-offs."},
-    "btn_sub_franchise": {"ru": "➕ Подписаться на франшизу", "uk": "➕ Підписатися на франшизу", "en": "➕ Follow the franchise"},
+    "btn_sub_franchise": {"ru": "🔔 Следить за всей франшизой", "uk": "🔔 Стежити за всією франшизою", "en": "🔔 Follow the whole franchise"},
     "btn_fr_parts": {"ru": "🎞 Состав франшизы", "uk": "🎞 Склад франшизи", "en": "🎞 Franchise parts"},
     # --- расписание, календарь
     "sched_fr_head": {"ru": "📅 Франшиза <b>{name}</b>", "uk": "📅 Франшиза <b>{name}</b>", "en": "📅 Franchise <b>{name}</b>"},
