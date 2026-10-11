@@ -130,7 +130,7 @@ def test_start_is_one_short_message(db):
 
     answers = db(scenario)
     assert len(answers) == 1 and answers[0][0] == main.t("ru", "start")
-    assert "Дом дракона" in answers[0][0] and len(answers[0][0]) < 150
+    assert "Просто напишите название или пришлите ссылку." in answers[0][0] and len(answers[0][0]) < 150
 
 
 def test_new_buttons_use_one_word():

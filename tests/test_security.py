@@ -30,7 +30,7 @@ LEGIT = ["startlang:ru", "startlang:uk", "startlang:en", "site:0123456789ab", "s
          "subf:12", "subf:12:183", "subf_all:12", "sched:p:183", "sched:f:12", "pcard:183", "fcard:12",
          "voices:15", "vt:15:56", "vany:15", "card:15", "card:15:0", "card:15:3", "my:0", "my:1", "unsub:15",
          "unsubq:15", "keep:15", "set:photos:1", "set:photos:0", "set:photos", "set:quiet:1", "set:quiet:0",
-         "set:digest:0", "set:digest:1", "set:tz:-1", "set:tz:1", "set:quietcfg", "set:voice", "set:lang",
+         "set:digest:0", "set:digest:1", "set:tz:-1", "set:tz:1", "set:quietcfg", "set:tzcfg", "set:voice", "set:lang",
          "set:back", "setq:off", "setq:f:1", "setq:f:-1", "setq:t:1", "setq:t:-1", "setl:ru", "setl:en",
          "setv:any", "setv:56", "fb", "fb:bug", "fb:idea", "fb:collab", "fb:other", "fb:cancel", "noop",
          "go:p:183", "go:f:12", "undo:p:15:183", "undo:f:15:12"]

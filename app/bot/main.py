@@ -77,7 +77,7 @@ CB = {
     "unsub": rf"unsub:{ID}",
     "unsubq": rf"unsubq:{ID}",
     "keep": rf"keep:{ID}",
-    "set": r"set:(?:photos|quiet|digest)(?::[01])?|set:tz:-?1|set:(?:quietcfg|voice|lang|back)",
+    "set": r"set:(?:photos|quiet|digest)(?::[01])?|set:tz:-?1|set:(?:quietcfg|tzcfg|voice|lang|back)",
     "setq": r"setq:(?:off|[ft]:-?1)",
     "setl": rf"setl:(?:{_LANG_RX})",
     "setv": rf"setv:(?:any|{ID})",
@@ -1678,6 +1678,9 @@ def _tz_label(lang: str, tz: int) -> str:
 
 
 async def _render_settings(user_id: int):
+    """Одна кнопка на пункт, на ней же значение (11.10.2026): раньше шесть строк текста и 15 кнопок в 7 рядов — каждая
+    настройка показывалась дважды. Картинки и доставка переключаются нажатием (set:photos, set:digest без значения —
+    тумблер), тихие часы, пояс, озвучка и язык — своим экраном. Кнопки — обычный текст: без HTML-экранирования."""
     lang = await _lang(user_id)
     async with session() as s:
         u = await s.get(User, user_id)
@@ -1687,46 +1690,43 @@ async def _render_settings(user_id: int):
     quiet_on = u.quiet_from is not None and u.quiet_to is not None
     quiet = f"{u.quiet_from:02d}:00–{u.quiet_to:02d}:00" if quiet_on else t(lang, "off")
     delivery = t(lang, "delivery_digest", h=u.digest_hour) if u.digest_hour is not None else t(lang, "delivery_now")
-    voice = html.escape(", ".join(names.get(t_, f"#{t_}") for t_ in u.default_voice_filter)) \
-        if u.default_voice_filter else t(lang, "voice_any")
-    text_ = (t(lang, "set_head") + "\n\n"
-             + t(lang, "set_photos", v=t(lang, "on" if u.photos else "off")) + "\n"
-             + t(lang, "set_quiet", v=quiet) + (t(lang, "set_quiet_note") if quiet_on else "") + "\n"
-             + t(lang, "set_tz", v=_tz_label(lang, u.tz_offset)) + "\n"
-             + t(lang, "set_delivery", v=delivery) + "\n"
-             + t(lang, "set_voice", v=voice) + "\n"
-             + t(lang, "set_lang", v=LANGS.get(u.lang, u.lang)))
-    # Кнопка показывает вариант, а не действие, галочка — на выбранном (07.09.2026).
-    # Первая кнопка в строке — подпись, к чему относится пара: без неё «Вкл / Выкл» висело
-    # в воздухе. Конкретные часы и время дайджеста живут в тексте выше, в кнопках их нет.
-    def opt(chosen: bool, key: str) -> str:
-        return ("☑ " if chosen else "☐ ") + t(lang, key)
-
-    rows = [[(t(lang, "lbl_photos"), "noop"),
-             (opt(u.photos, "opt_on"), "set:photos:1"), (opt(not u.photos, "opt_off"), "set:photos:0")],
-            [(t(lang, "lbl_quiet"), "noop"),
-             (opt(quiet_on, "opt_on"), "set:quiet:1"), (opt(not quiet_on, "opt_off"), "set:quiet:0")],
-            [(t(lang, "lbl_delivery"), "noop"),
-             (opt(u.digest_hour is None, "opt_now"), "set:digest:0"),
-             (opt(u.digest_hour is not None, "opt_digest_short"), "set:digest:1")],
-            [(t(lang, "btn_tz_minus"), "set:tz:-1"), (_tz_label(lang, u.tz_offset), "noop"), (t(lang, "btn_tz_plus"), "set:tz:1")]]
-    if quiet_on:
-        rows.append([(t(lang, "btn_quiet_edit"), "set:quietcfg")])
-    rows.append([(t(lang, "btn_default_voice"), "set:voice"), (t(lang, "btn_lang"), "set:lang")])
-    return text_, _kb(rows)
+    voice = ", ".join(names.get(t_, f"#{t_}") for t_ in u.default_voice_filter) if u.default_voice_filter \
+        else t(lang, "voice_any")
+    rows = [[(t(lang, "sb_photos", v=t(lang, "on" if u.photos else "off")), "set:photos")],
+            [(t(lang, "sb_quiet", v=quiet), "set:quietcfg")],
+            [(t(lang, "sb_delivery", v=delivery), "set:digest")],
+            [(t(lang, "sb_tz", v=_tz_label(lang, u.tz_offset)), "set:tzcfg")],
+            [(t(lang, "sb_voice", v=voice[:32]), "set:voice")],
+            [(t(lang, "sb_lang", v=LANGS.get(u.lang, u.lang)), "set:lang")]]
+    return t(lang, "set_head") + "\n" + t(lang, "set_hint"), _kb(rows)
 
 
 async def _render_quiet(user_id: int):
-    """Границы тихих часов: ± по часу для начала и конца; «выключить» — обратно в настройки."""
+    """Тихие часы: включены — границы ± по часу и «выключить»; выключены — одна кнопка «включить» с часами по умолчанию."""
     lang = await _lang(user_id)
     async with session() as s:
         u = await s.get(User, user_id)
-    f, to = (u.quiet_from, u.quiet_to) if u.quiet_from is not None and u.quiet_to is not None else QUIET_DEFAULT
+    if u.quiet_from is None or u.quiet_to is None:
+        f, to = QUIET_DEFAULT
+        return t(lang, "quiet_off_head"), _kb([[(t(lang, "btn_quiet_enable", f=f, t=to), "set:quiet:1")],
+                                               [(t(lang, "btn_done"), "set:back")]])
+    f, to = u.quiet_from, u.quiet_to
     rows = [[("−1", "setq:f:-1"), (t(lang, "quiet_from_label", h=f), "noop"), ("+1", "setq:f:1")],
             [("−1", "setq:t:-1"), (t(lang, "quiet_to_label", h=to), "noop"), ("+1", "setq:t:1")],
             [(t(lang, "btn_quiet_disable"), "setq:off")],
             [(t(lang, "btn_done"), "set:back")]]
     return t(lang, "quiet_head", f=f, t=to), _kb(rows)
+
+
+async def _render_tz(user_id: int):
+    """Часовой пояс — свой экран (11.10.2026): ± по часу, в середине — текущий."""
+    lang = await _lang(user_id)
+    async with session() as s:
+        u = await s.get(User, user_id)
+    label = _tz_label(lang, u.tz_offset)
+    rows = [[(t(lang, "btn_tz_minus"), "set:tz:-1"), (label, "noop"), (t(lang, "btn_tz_plus"), "set:tz:1")],
+            [(t(lang, "btn_done"), "set:back")]]
+    return t(lang, "tz_head", v=html.escape(label)), _kb(rows)
 
 
 async def _render_default_voice(user_id: int):
@@ -1778,7 +1778,8 @@ async def cb_settings(cb: CallbackQuery) -> None:
             await s.flush()
             await svc.reschedule_pending(s, cb.from_user.id)   # уже стоящие в очереди — по новым правилам
         await s.commit()
-    render = {"voice": _render_default_voice, "lang": _render_lang, "quietcfg": _render_quiet}.get(what, _render_settings)
+    render = {"voice": _render_default_voice, "lang": _render_lang, "quietcfg": _render_quiet, "quiet": _render_quiet,
+              "tzcfg": _render_tz, "tz": _render_tz}.get(what, _render_settings)
     text_, kb = await render(cb.from_user.id)
     await cb.answer()
     await _edit(cb, text_, kb)
@@ -1807,7 +1808,7 @@ async def cb_quiet(cb: CallbackQuery) -> None:
         await s.flush()
         await svc.reschedule_pending(s, cb.from_user.id)
         await s.commit()
-    text_, kb = await (_render_settings if parts[1] == "off" else _render_quiet)(cb.from_user.id)
+    text_, kb = await _render_quiet(cb.from_user.id)
     await cb.answer()
     await _edit(cb, text_, kb)
 
