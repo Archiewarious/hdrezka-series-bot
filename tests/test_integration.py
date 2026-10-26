@@ -138,8 +138,8 @@ def test_premiere_reaches_franchise_subscriber(db):
 
 
 def test_waiting_for_continuation_gets_new_part(db):
-    """«Жду продолжения»: подписка на завершённый сезон переводится на франшизу, когда выходит продолжение.
-    Ждавший получает «новую часть» и первую серию — они создаются вместе и уходят одним дайджестом."""
+    """«Жду продолжения»: продолжение отдельной страницей с тем же основным названием приходит «новой частью»
+    (с кнопкой «🔔 Следить»). Подписка остаётся на странице — на франшизу сама не переходит (26.10.2026)."""
     async def scenario():
         async with session() as s:
             s.add(User(id=7))
@@ -157,8 +157,8 @@ def test_waiting_for_continuation_gets_new_part(db):
         return scopes, await _notifications(7)
 
     scopes, notes = db(scenario)
-    assert scopes == ["franchise"], "ждавший переведён на франшизу"
-    assert notes == [("episode", 2, 1), ("new_part", None, None)]
+    assert scopes == ["page"], "подписка не перешла на франшизу"
+    assert notes == [("new_part", None, None)]
 
 
 def test_old_dub_is_silent_new_episode_notifies(db):
@@ -661,9 +661,9 @@ def test_old_season_from_search_is_not_a_new_part(db):
     assert notes == [] and statuses == ["baseline", "baseline"]
 
 
-def test_waiting_subscription_keeps_its_dub_on_the_franchise(db):
-    """D. «Жду продолжения» с фильтром [111]: при переводе на франшизу фильтр сохраняется, а не заменяется
-    озвучкой по умолчанию — иначе пришли бы серии во всех озвучках."""
+def test_waiting_subscription_keeps_its_dub_and_its_page(db):
+    """«Жду продолжения» с фильтром [111]: продолжение — «новой частью», подписка и её озвучка не меняются
+    (до 26.10.2026 подписка переводилась на франшизу с тем же фильтром)."""
     async def scenario():
         async with session() as s:
             s.add(User(id=11))
@@ -685,8 +685,8 @@ def test_waiting_subscription_keeps_its_dub_on_the_franchise(db):
         return subs, await _notifications(11)
 
     subs, notes = db(scenario)
-    assert subs == [("franchise", [111])]
-    assert notes == [("new_part", None, None), ("voice:111", 2, 1)], "только своя озвучка, без episode"
+    assert subs == [("page", [111])]
+    assert notes == [("new_part", None, None)]
 
 
 def test_search_card_does_not_erase_film_type(db):
@@ -986,3 +986,47 @@ def test_parallel_writes_of_one_new_franchise(db):
 
     keys, links, members = db(scenario)
     assert keys == [5001] and len({f for _, f in links}) == 1 and len(links) == 2 and members == 2
+
+
+def test_one_part_subscriber_hears_only_about_parts_with_the_same_name(db):
+    """26.10.2026: «Сорвиголова: Рожденный заново» во франшизе «Человек-паук» на 38 частей. Подписанный только на неё
+    не должен получать каждую новую часть Marvel — только продолжения с тем же основным названием. Подписчик всей
+    франшизы получает всё."""
+    async def scenario():
+        async with session() as s:
+            s.add_all([User(id=91), User(id=92)])
+            fr = await _known_franchise(s, 9600, "Человек-паук")
+            dd = await _page(s, 9601, "Сорвиголова: Рожденный заново", last=(2, 8), franchise_id=fr.id, finished=True)
+            await svc.subscribe_page(s, 91, dd.id)
+            await svc.subscribe_franchise(s, 92, fr.id)
+            vision = await _page(s, 9602, "Вижен", franchise_id=fr.id)
+            sequel = await _page(s, 9603, "Сорвиголова: Рожденный заново [Спецвыпуск]", franchise_id=fr.id)
+            sent = [await svc.enqueue_new_part(s, fr.id, part) for part in (vision, sequel)]
+            await s.commit()
+        return sent, await _notifications(91), await _notifications(92)
+
+    sent, one_part, whole = db(scenario)
+    assert sent == [1, 2], "«Вижен» — только подписчику франшизы, продолжение «Сорвиголовы» — обоим"
+    assert one_part == [("new_part", None, None)] and whole == [("new_part", None, None)] * 2
+
+
+def test_new_season_on_the_same_page_reaches_a_finished_page_subscriber(db):
+    """Подписка на завершённую страницу получает новый сезон на той же странице обычными сериями: так у западных
+    сериалов («Сорвиголова»: 1-й и 2-й сезоны на одной странице, 3×1 уже в расписании)."""
+    async def scenario():
+        async with session() as s:
+            s.add(User(id=93))
+            fr = await _known_franchise(s, 9700, "Человек-паук")
+            dd = await _page(s, 9701, "Сорвиголова: Рожденный заново", last=(2, 8), rows=[(2, 8)], franchise_id=fr.id,
+                             finished=True, voices=[(56, "Дубляж")])
+            await svc.subscribe_page(s, 93, dd.id)
+            await s.commit()
+        site = FakeSite(block({TODAY: [(9701, "Сорвиголова: Рожденный заново", "series", 3, 1, "Дубляж")]}),
+                        {9701: title_page(9701, "Сорвиголова: Рожденный заново", 3, 1, [(56, "Дубляж", None)])})
+        await _run(site)
+        async with session() as s:
+            scopes = (await s.execute(select(Subscription.scope).where(Subscription.user_id == 93))).scalars().all()
+        return scopes, await _notifications(93)
+
+    scopes, notes = db(scenario)
+    assert notes == [("episode", 3, 1)] and scopes == ["page"]

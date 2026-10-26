@@ -914,6 +914,11 @@ async def _render_page_card(user_id: int, page_id: int, just_created: bool = Fal
                  if fr else 0)
         fr_sub = fr and await s.scalar(select(Subscription.id).where(
             Subscription.user_id == user_id, Subscription.franchise_id == fr.id))
+        # Следующий сезон уже в расписании страницы (26.10.2026: «Сорвиголова» — 3×1 без даты): говорим прямо, что
+        # он придёт сюда же сериями — это и есть гарантия для подписки на одну страницу.
+        planned = (await s.execute(select(Schedule.season, Schedule.episode, Schedule.air_date).where(
+            Schedule.page_id == page_id, Schedule.season > (page.last_season or 0))
+            .order_by(Schedule.season, Schedule.episode).limit(1))).first()
 
     # Выбранной озвучки нет у выходящих частей — уведомлений не будет, и это надо сказать вслух,
     # а не оставлять человека гадать, почему тихо (08.09.2026).
@@ -940,8 +945,10 @@ async def _render_page_card(user_id: int, page_id: int, just_created: bool = Fal
     rows = []
     # Только что подписался (нажатие в выдаче поиска) — «↩️ Отменить»: снимает сразу и оставляет карточку на месте.
     undo = (t(lang, "btn_undo"), f"undo:p:{(sub.id if sub else fr_sub)}:{page.id}") if just_created else None
+    planned_line = t(lang, "next_season_planned", s=planned[0], e=planned[1],
+                     d=f" ({fmt_date(lang, planned[2])})" if planned[2] else "") if planned else None
     if state == "waiting":
-        lines.append(t(lang, "wait_desc"))
+        lines.append(planned_line or t(lang, "wait_desc"))
         rows.append([undo or (t(lang, "btn_stop_waiting"), f"unsub:{sub.id}")])
     elif state == "subscribed":
         lines.append(t(lang, "voice_line", v=html.escape(_voice_label(lang, sub, voices))) + warn)
@@ -957,22 +964,17 @@ async def _render_page_card(user_id: int, page_id: int, just_created: bool = Fal
         rows.append([(t(lang, "btn_unfollow_fr"), f"unsubq:{fr_sub}")])
     elif state == "film":
         lines.append(t(lang, "film_no_sub"))
-    elif state == "finished_alone":
-        lines.append(t(lang, "finished_offer_wait"))
+    elif state in ("finished_alone", "finished_franchise"):
+        # Сезон вышел целиком — «следить» за этой страницей: новый сезон придёт сюда же, продолжение отдельной
+        # страницей с тем же названием — «новой частью». Франшиза — отдельной кнопкой ниже (26.10.2026).
+        lines.append(planned_line or t(lang, "finished_offer_wait"))
         rows.append([(t(lang, "btn_wait"), f"wait:{page.hdrezka_id}")])
-    elif state == "finished_franchise":
-        # Сезон вышел, но франшиза есть: «Следить» — за ней, о продолжении сообщит она (10.10.2026; раньше главной
-        # кнопки не было, только состав франшизы).
-        lines.append(t(lang, "finished_in_franchise"))
-        rows.append([(t(lang, "btn_follow"), f"subf_all:{fr.id}")])
     else:
-        # «Нажал и забыл»: франшиза известна — подписываем на неё целиком, иначе на страницу
-        # (она сама станет «жду продолжения», когда сезон закончится).
-        lines.append(t(lang, "follow_desc_franchise" if fr else "follow_desc"))
-        rows.append([(t(lang, "btn_follow"), f"subf_all:{fr.id}" if fr else f"sub:{page.hdrezka_id}")])
+        # «🔔 Следить» — только эта страница (26.10.2026); вся франшиза — отдельной кнопкой ниже.
+        lines.append(t(lang, "follow_desc"))
+        rows.append([(t(lang, "btn_follow"), f"sub:{page.hdrezka_id}")])
     if fr and parts > 1 and (state != "franchise_sub" or just_created):
-        # Кнопка «Следить» уже покрывает всю франшизу — здесь только выбор отдельных частей.
-        label = (t(lang, "btn_fr_parts_n", n=parts) if state in ("follow", "franchise_sub", "finished_franchise")
+        label = (t(lang, "btn_fr_parts_n", n=parts) if state == "franchise_sub"
                  else t(lang, "btn_whole_franchise", name=fr.name[:24], n=parts))
         rows.append([(label, f"subf:{fr.id}:{page.id}")])
     site = [(t(lang, "btn_open_site"), Url(svc.public_url(page.url)))]                  # нет адреса — нет кнопки (_kb)
@@ -1088,8 +1090,10 @@ async def _refresh_after_follow(user_id: int, hid: int, url: str, fresh) -> None
 @limited
 async def cb_go(cb: CallbackQuery) -> None:
     """Нажатие в выдаче поиска — сразу «слежу» (10.10.2026; раньше: выдача → карточка → «Следить»). go:p:<page_id> —
-    часть: франшиза целиком, если известна (как «🔔 Следить» в карточке, решение «нажал и забыл»), иначе сама
-    страница — завершённая означает «слежу за продолжением»; go:f:<franchise_id> — запрос совпал с именем франшизы.
+    только эта страница (26.10.2026; до этого — вся франшиза, и «Сорвиголова» тянула 38 частей «Человека-паука»):
+    новые сезоны на той же странице приходят сериями, продолжение отдельной страницей с тем же основным названием —
+    «новой частью» (svc.enqueue_new_part). Завершённая страница — «слежу за продолжением». go:f:<franchise_id> —
+    запрос совпал с именем франшизы, подписка на всю. Франшиза уже отслеживается — второй строки не заводим.
     Кнопка в выдаче становится «✓ …», карточка приходит новым сообщением с «↩️ Отменить»."""
     lang = await _lang(cb.from_user.id)
     _, kind, raw = cb.data.split(":")
@@ -1104,18 +1108,20 @@ async def cb_go(cb: CallbackQuery) -> None:
             await s.commit()
             await cb.answer(t(lang, "card_stale"), show_alert=True)
             return
-        if fid:
+        film = page is not None and page.content_type == "film"
+        follows_fr = fid is not None and await s.scalar(select(Subscription.id).where(
+            Subscription.user_id == cb.from_user.id, Subscription.franchise_id == fid)) is not None
+        if kind == "f":
             created = await svc.subscribe_franchise(s, cb.from_user.id, fid)
-        elif page.content_type == "film":
-            await s.commit()
-            await cb.answer(t(lang, "cannot_sub"), show_alert=True)
-            return
+        elif follows_fr or film:
+            created = False          # уже в подписке на франшизу; у фильма следить не за чем — карточка с франшизой
         else:
             created = await svc.subscribe_page(s, cb.from_user.id, page.id)
         await s.commit()
         target = (page.id, page.hdrezka_id, page.url, page.page_refreshed_at) if page else None
-    await cb.answer()
-    await _mark_tapped(cb)
+    await cb.answer(t(lang, "cannot_sub") if film else None)
+    if not film:
+        await _mark_tapped(cb)
     if target is None:
         text_, kb = await _render_franchise_card(cb.from_user.id, fid, created)
         await cb.message.answer(_clip(text_), reply_markup=kb)

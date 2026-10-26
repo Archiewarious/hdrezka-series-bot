@@ -58,3 +58,12 @@ def test_digest_splits_by_series_count():
 def test_retry_delay_grows_and_never_gives_up():
     """11.09.2026: после пятой неудачи уведомление навсегда оставалось «в очереди»."""
     assert [retry_delay(a) for a in (1, 2, 3, 4, 5, 6, 50)] == [60, 120, 240, 480, 960, 1800, 1800]
+
+
+def test_new_series_part_has_a_follow_button():
+    """26.10.2026: продолжение-сериал — «▶ Смотреть» и «🔔 Следить» (go:p): подписка на одну часть сама на франшизу
+    больше не переходит. У фильма следить не за чем — одна кнопка."""
+    series = Rendered("new_part", 7, "Сага [ТВ-2]", "txt", "line", "https://rezka.test/x", None, None, followable=True)
+    rows = [[(b.text, b.callback_data) for b in row] for row in _single_keyboard(series).inline_keyboard]
+    assert rows[1] == [("🔔 Следить", "go:p:7")]
+    assert len(_single_keyboard(_r("new_part", "Фильм")).inline_keyboard) == 1

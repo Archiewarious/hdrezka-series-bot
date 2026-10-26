@@ -286,9 +286,9 @@ def card_state(page: Page, page_sub: bool, franchise_sub: bool, franchise: bool)
     subscribed         — подписка на эту страницу
     franchise_sub      — страница входит в подписку на франшизу (кнопки ведут в карточку франшизы)
     film               — фильм: следить не за чем
-    finished_alone     — завершён, франшизы нет → «🔔 Сообщить о продолжении»
-    finished_franchise — завершён, но франшиза есть → следить надо за ней
-    follow             — идёт: одна кнопка «🔔 Следить» (франшиза целиком, если она известна)
+    finished_alone     — завершён, франшизы нет → «🔔 Следить за продолжением» (подписка на страницу)
+    finished_franchise — завершён, франшиза есть → то же; вся франшиза — отдельной кнопкой (26.10.2026)
+    follow             — идёт: «🔔 Следить» — только эта страница; вся франшиза — отдельной кнопкой (26.10.2026)
     """
     film = page.content_type == "film"
     if page_sub:
@@ -566,60 +566,42 @@ async def enqueue_voice(s: AsyncSession, page: Page, episode_id: int, translator
     return r.rowcount or 0
 
 
+# Основное название: до двоеточия, скобки или слэша — «Сага [ТВ-2]» → «сага», «Сорвиголова: Рожденный заново» →
+# «сорвиголова». По нему подписанный на одну часть узнаёт о продолжении, а не о каждой части большой франшизы.
+BASE_TITLE_SQL = r"norm_title(btrim(regexp_replace({}, '\s*[(/:\[].*$', '')))"
+
+
 async def enqueue_new_part(s: AsyncSession, franchise_id: int, part: Page, user_id: int | None = None,
                            only_page_subscribers: bool = False) -> int:
-    """Подписчикам франшизы и подписчикам любой её части: новый сезон, фильм или спин-офф приходит и тому,
-    кто следит за одним сезоном (06.09.2026). only_page_subscribers — только подписанным на другие части:
-    о первой серии нового сезона подписчики франшизы узнают уведомлением о самой серии.
-    С user_id — только ему (ждавший продолжения переведён на франшизу)."""
-    r = await s.execute(text("""
+    """Новый сезон, фильм или спин-офф. Подписчикам франшизы — всегда; подписанным на одну её часть — только если у
+    новой части то же основное название (26.10.2026): подписавшийся на «Сорвиголову» во франшизе «Человек-паук» на
+    38 частей не должен получать каждую новую часть Marvel, а «Сага [ТВ-2]» ждавшему «Сагу [ТВ-1]» — должен.
+    only_page_subscribers — только подписанным на части: о первой серии нового сезона подписчики франшизы узнают
+    уведомлением о самой серии. С user_id — только ему."""
+    r = await s.execute(text(f"""
         INSERT INTO notifications (user_id, kind, ref_id, next_attempt_at)
         SELECT DISTINCT sub.user_id, 'new_part', CAST(:part_id AS bigint),
                notify_at(u.tz_offset, u.quiet_from, u.quiet_to, u.digest_hour)
           FROM subscriptions sub JOIN users u ON u.id = sub.user_id AND u.is_active
           LEFT JOIN pages p ON p.id = sub.page_id
-         WHERE ((sub.franchise_id = :franchise_id AND NOT CAST(:only_pages AS boolean)) OR p.franchise_id = :franchise_id)
+         WHERE ((sub.franchise_id = :franchise_id AND NOT CAST(:only_pages AS boolean))
+                OR (p.franchise_id = :franchise_id
+                    AND {BASE_TITLE_SQL.format("p.title")} = {BASE_TITLE_SQL.format("CAST(:part_title AS text)")}))
            AND sub.page_id IS DISTINCT FROM :part_id          -- о своей же странице не пишем
            AND (CAST(:uid AS bigint) IS NULL OR sub.user_id = :uid)
         ON CONFLICT ON CONSTRAINT uq_notification DO NOTHING
-    """), {"part_id": part.id, "franchise_id": franchise_id, "uid": user_id, "only_pages": only_page_subscribers})
+    """), {"part_id": part.id, "part_title": part.title, "franchise_id": franchise_id, "uid": user_id,
+           "only_pages": only_page_subscribers})
     return r.rowcount or 0
 
 
 # ----------------------------------------------------------------------------- «жду продолжения»
-
-async def waiting_subscriptions(s: AsyncSession, franchise_id: int) -> list[tuple[int, int, list[int] | None]]:
-    """Подписки на завершённые части франшизы = «жду продолжения» (§7, решение 3):
-    (user_id, page_id, voice_filter) — выбранная озвучка переходит в подписку на франшизу."""
-    rows = await s.execute(text("""
-        SELECT sub.user_id, sub.page_id, sub.voice_filter FROM subscriptions sub
-          JOIN pages p ON p.id = sub.page_id
-         WHERE p.franchise_id = :f AND p.is_finished
-         ORDER BY sub.id"""), {"f": franchise_id})
-    return [(u, pid, vf) for u, pid, vf in rows]
-
 
 def _year(p: Page) -> int | None:
     try:
         return int((p.year or "")[:4])
     except ValueError:
         return None
-
-
-def continuation_parts(parts: list[Page], waited: Page) -> list[Page]:
-    """Части франшизы, о которых стоит сообщить ждавшему продолжения: не та, которую ждали,
-    не завершённые, не старше ждавшейся по году (старые части и старые фильмы — не продолжение).
-    Непрочитанные (content_type NULL) проходят: вызывающий дочитает их и отфильтрует ещё раз."""
-    wy = _year(waited)
-    out = []
-    for p in parts:
-        if p.id == waited.id or p.is_finished:
-            continue
-        py = _year(p)
-        if wy is not None and py is not None and py < wy:
-            continue
-        out.append(p)
-    return out
 
 
 async def mark_voice_seen(s: AsyncSession, episode_id: int, translator_id: int) -> bool:

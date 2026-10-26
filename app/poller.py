@@ -22,7 +22,7 @@ from app import lifecycle
 from app import service as svc
 from app.config import cfg
 from app.db import init_db, session
-from app.models import Episode, Franchise, Page
+from app.models import Episode, Page
 from app.rezka.client import AccessBlocked, PageGone, RezkaClient
 from app.rezka.parser import UpdateItem, match_voice, parse_updates
 
@@ -65,42 +65,7 @@ class Poller:
 
     async def sync(self, s, hdrezka_id: int, url: str) -> svc.SyncResult:
         """Читает страницу. Новые части франшизы сервис дописывает в состав, уведомляет announce_new_parts."""
-        res = await svc.sync_page(s, self.client, hdrezka_id, url)
-        if res.franchise:
-            await self._adopt_waiting(s, res.franchise)
-        return res
-
-    async def _adopt_waiting(self, s, fr: Franchise) -> None:
-        """«Жду продолжения» (§7, решение 3): подписка на завершённую часть франшизы переводится
-        на франшизу, а о частях-продолжениях (не завершены, не старше ждавшейся) уходит new_part.
-        Идемпотентно: после перевода ждущих у франшизы не остаётся."""
-        waiting = await svc.waiting_subscriptions(s, fr.id)
-        if not waiting:
-            return
-        parts = (await s.execute(select(Page).where(Page.franchise_id == fr.id))).scalars().all()
-        by_id = {p.id: p for p in parts}
-        by_user: dict[int, list[tuple[Page, list[int] | None]]] = {}
-        for user_id, page_id, voices in waiting:
-            if page_id in by_id:
-                by_user.setdefault(user_id, []).append((by_id[page_id], voices))
-        moved = queued = 0
-        for user_id, waited_list in by_user.items():
-            for waited, _ in waited_list:
-                for part in svc.continuation_parts(parts, waited):
-                    if part.page_refreshed_at is None and part.url:      # тип и статус части — со страницы
-                        try:
-                            await svc.sync_page(s, self.client, part.hdrezka_id, part.url)
-                        except (AccessBlocked, PageGone) as exc:
-                            log.warning("Не прочитал часть %s для ждущего продолжения: %s", part.hdrezka_id, exc)
-            # Выбранная озвучка переходит в подписку на франшизу; несколько ждавших — объединение (24.09.2026).
-            voices = svc.merge_voice_filters(*(v for _, v in waited_list))
-            await svc.subscribe_franchise(s, user_id, fr.id, voices=voices)   # удаляет и подписки на страницы
-            moved += 1
-            for waited, _ in waited_list:
-                for part in svc.continuation_parts(parts, waited):
-                    queued += await svc.enqueue_new_part(s, fr.id, part, user_id=user_id)
-        self._cycle_new_parts += queued
-        log.info("ПРОДОЛЖЕНИЕ: франшиза «%s» — переведено подписок %s, уведомлений %s", fr.name, moved, queued)
+        return await svc.sync_page(s, self.client, hdrezka_id, url)
 
     async def _read(self, s, page: Page, required: bool) -> bool:
         """Чтение страницы ради события. Обязательное — новая серия на непрочитанной странице: без привязки
@@ -315,8 +280,6 @@ class Poller:
         try:
             async with session() as s:
                 res = await svc.apply_title_page(s, hdrezka_id, url, tp)
-                if res.franchise:
-                    await self._adopt_waiting(s, res.franchise)
                 if after:
                     await after(s, res)
                 await s.commit()

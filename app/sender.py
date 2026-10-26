@@ -110,6 +110,7 @@ class Rendered:
     watch_url: str
     poster_url: str | None
     poster_file_id: str | None
+    followable: bool = False   # новая часть-сериал: в посте ещё «🔔 Следить» — подписанный на одну часть сам решает
 
 
 def retry_delay(attempts: int) -> int:
@@ -175,15 +176,20 @@ async def _render(s, user_id: int, kind: str, ref_id: int, lang: str = "ru") -> 
             kind=kind, page_id=page_id, title=title,
             text=f"{head}\n\n{name}" + (f"\n🎞 {tail}" if tail else ""),
             line=f"{head}\n{name}" + (f" · {tail}" if tail else ""),
-            watch_url=public_url(url), poster_url=poster_url, poster_file_id=file_id,
+            watch_url=public_url(url), poster_url=poster_url, poster_file_id=file_id, followable=ctype != "film",
         )
     return None
 
 
 def _single_keyboard(r: Rendered, lang: str = "ru") -> InlineKeyboardMarkup:
     """Пост с одной кнопкой (решение 11.09.2026). Озвучки и отписка — в «📋 Мои подписки»;
-    нажатия на кнопки старых уведомлений бот по-прежнему обрабатывает."""
-    return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=t(lang, "btn_watch_site"), url=r.watch_url)]])
+    нажатия на кнопки старых уведомлений бот по-прежнему обрабатывает. Исключение — новая часть-сериал (26.10.2026):
+    подписка на одну страницу больше не переходит на франшизу сама, и «🔔 Следить» (go:p, app/bot/main.py) — одно
+    нажатие, чтобы следить за продолжением."""
+    rows = [[InlineKeyboardButton(text=t(lang, "btn_watch_site"), url=r.watch_url)]]
+    if r.followable:
+        rows.append([InlineKeyboardButton(text=t(lang, "btn_follow"), callback_data=f"go:p:{r.page_id}")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def _digest(items: list[Rendered], lang: str = "ru") -> tuple[str, InlineKeyboardMarkup]:
