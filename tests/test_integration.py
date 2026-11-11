@@ -1030,3 +1030,22 @@ def test_new_season_on_the_same_page_reaches_a_finished_page_subscriber(db):
 
     scopes, notes = db(scenario)
     assert notes == [("episode", 3, 1)] and scopes == ["page"]
+
+
+def test_season_dropped_out_of_order_notifies_every_episode(db):
+    """11.11.2026: сайт выложил сезон пачкой — 3×4 раньше 3×1–3×3. Подписчик получает все четыре серии."""
+    async def scenario():
+        async with session() as s:
+            s.add(User(id=94))
+            page = await _page(s, 9900, "Кольца", last=(2, 8), rows=[(2, 8)], voices=[(35, "Coldfilm")])
+            await svc.subscribe_page(s, 94, page.id)
+            await s.commit()
+        first = FakeSite(block({TODAY: [(9900, "Кольца", "series", 3, 4, "Coldfilm")]}),
+                         {9900: title_page(9900, "Кольца", 3, 4, [(35, "Coldfilm", None)])})
+        await _run(first)
+        rest = FakeSite(block({TODAY: [(9900, "Кольца", "series", 3, e, "Coldfilm") for e in (1, 2, 3)]}),
+                        {9900: title_page(9900, "Кольца", 3, 4, [(35, "Coldfilm", None)])})
+        await _run(rest)
+        return await _notifications(94)
+
+    assert db(scenario) == [("episode", 3, e) for e in (1, 2, 3, 4)]

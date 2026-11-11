@@ -8,7 +8,7 @@ from __future__ import annotations
 import logging
 import re
 from dataclasses import dataclass
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from urllib.parse import urlsplit
 
 from sqlalchemy import and_, case, delete, func, or_, select, text, tuple_
@@ -469,20 +469,37 @@ async def record_episode(s: AsyncSession, page: Page, season: int, episode: int)
     return (await s.execute(stmt)).scalar_one_or_none()
 
 
+BATCH_WINDOW = timedelta(days=2)
+
+
 def classify_update(has_row: bool, page_max: tuple[int, int] | None, season: int, episode: int,
-                    fresh: bool) -> str:
+                    fresh: bool, max_seen_at: datetime | None = None, at: datetime | None = None) -> str:
     """Что значит событие блока обновлений (F13). Решают только записи самого бота и свежесть события.
     Номер последней серии в полях страницы пишут пять мест (чтение страницы в поллере и в боте,
     карточки поиска), и 10.09.2026 чтение, запущенное самим событием, превращало премьеру в «старую».
       voice   — серия уже записана: вышла ещё в одной озвучке;
       new     — старше всех записанных серий страницы, а если записей нет — событие свежее (сегодня, вчера);
+                или младше, но сезон выложен пачкой: событие свежее, сезон тот же, последняя записанная серия
+                появилась меньше BATCH_WINDOW назад (11.11.2026: «Кольца власти» 3×4 пришла на 20 минут раньше
+                3×1–3×3, и три серии записались молча);
       catchup — старая серия без записи: дозвучка задним числом или выход до того, как бот узнал тайтл.
                 Записывается молча, иначе «вышла 3×3» придёт через неделю после 3×11."""
     if has_row:
         return "voice"
     if page_max is not None:
-        return "new" if (season, episode) > page_max else "catchup"
+        if (season, episode) > page_max:
+            return "new"
+        batch = (fresh and season == page_max[0] and max_seen_at is not None
+                 and (at or now()) - max_seen_at < BATCH_WINDOW)
+        return "new" if batch else "catchup"
     return "new" if fresh else "catchup"
+
+
+async def max_recorded_seen_at(s: AsyncSession, page_id: int) -> datetime | None:
+    """Когда бот впервые увидел последнюю записанную серию страницы — для «сезон выложен пачкой» (classify_update)."""
+    return await s.scalar(text(
+        "SELECT first_seen_at FROM episodes WHERE page_id = :p ORDER BY season DESC, episode DESC LIMIT 1"),
+        {"p": page_id})
 
 
 async def max_recorded_episode(s: AsyncSession, page_id: int) -> tuple[int, int] | None:

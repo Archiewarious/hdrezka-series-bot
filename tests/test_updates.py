@@ -67,3 +67,17 @@ def test_classify_update():
     assert classify_update(False, (3, 11), 3, 3, fresh=True) == "catchup", "дозвучка старой серии"
     assert classify_update(False, None, 1, 1, fresh=True) == "new", "премьера на странице без записей"
     assert classify_update(False, None, 1, 5, fresh=False) == "catchup", "старое событие о незнакомом тайтле"
+
+
+def test_season_dropped_in_one_batch_out_of_order_is_new():
+    """11.11.2026: «Кольца власти» — 3×4 пришла на 20 минут раньше 3×1–3×3, и три серии записались молча."""
+    from datetime import datetime, timedelta, timezone
+    at = datetime(2026, 11, 11, 18, 45, tzinfo=timezone.utc)
+    just_now, long_ago = at - timedelta(minutes=19), at - timedelta(days=7)
+    assert classify_update(False, (3, 4), 3, 1, fresh=True, max_seen_at=just_now, at=at) == "new", "сезон пачкой"
+    assert classify_update(False, (3, 11), 3, 3, fresh=True, max_seen_at=long_ago, at=at) == "catchup", "дозвучка через неделю"
+    assert classify_update(False, (3, 4), 3, 1, fresh=False, max_seen_at=just_now, at=at) == "catchup", "старое событие"
+    assert classify_update(False, (3, 4), 2, 8, fresh=True, max_seen_at=just_now, at=at) == "catchup", "прошлый сезон"
+    seed = datetime(1970, 1, 1, tzinfo=timezone.utc)
+    assert classify_update(False, (3, 4), 3, 1, fresh=True, max_seen_at=seed, at=at) == "catchup", "затравка подписки"
+

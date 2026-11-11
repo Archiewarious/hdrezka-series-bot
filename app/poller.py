@@ -162,7 +162,8 @@ class Poller:
             page = await svc.upsert_page_from_update(s, item, item.url)
         eid = await svc.find_episode(s, page.id, item.season, item.episode)
         page_max = await svc.max_recorded_episode(s, page.id)
-        kind = svc.classify_update(eid is not None, page_max, item.season, item.episode, fresh)
+        max_seen_at = await svc.max_recorded_seen_at(s, page.id) if page_max else None
+        kind = svc.classify_update(eid is not None, page_max, item.season, item.episode, fresh, max_seen_at)
 
         # Классификация уже решена и от чтения не зависит. Непрочитанную страницу с новой серией читаем
         # до уведомлений — ради привязки к франшизе и списка озвучек.
