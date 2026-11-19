@@ -240,9 +240,10 @@ class Feedback(Base):
 
 
 class UserEvent(Base):
-    """Действие человека в боте — чтобы видеть, где новички теряются (10.10.2026, app/events.py). Только тип и
-    короткая метка: тексты сообщений и запросов не храним. Живёт 30 дней. Без внешнего ключа: первое нажатие /start
-    записывается раньше, чем заводится строка users."""
+    """Действие человека в боте — чтобы видеть, где новички теряются (10.10.2026, app/events.py). Тип и короткая
+    метка; у итога поиска и ссылки — ещё и что человек ввёл (query, 19.11.2026). Других текстов не храним: ни
+    сообщений, ни писем автору. Живёт 30 дней. Без внешнего ключа: первое нажатие /start записывается раньше, чем
+    заводится строка users."""
     __tablename__ = "user_events"
     __table_args__ = (
         Index("user_events_by_user", "user_id", "at"),     # путь одного человека — /events <id>
@@ -254,6 +255,7 @@ class UserEvent(Base):
     at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     kind: Mapped[str] = mapped_column(String(16))
     detail: Mapped[str | None] = mapped_column(String(32))
+    query: Mapped[str | None] = mapped_column(String(200))      # запрос поиска или текст со ссылкой (search / link)
 
 
 class FeedbackLink(Base):

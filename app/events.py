@@ -1,18 +1,20 @@
 """Действия людей в боте — чтобы видеть, где новички теряются (10.10.2026).
 
-Пишем только тип действия и короткую метку: команда, кнопка меню, имя нажатой кнопки, итог поиска или ссылки.
-Тексты сообщений и поисковых запросов не храним — как и тексты писем автору (app/feedback.py). Хранение —
+Пишем тип действия и короткую метку: команда, кнопка меню, имя нажатой кнопки, итог поиска или ссылки. С 19.11.2026
+у итога поиска и ссылки — ещё и что человек ввёл (query): новичок четыре раза подряд получил «ничего не нашлось», и
+без запроса не понять, баг ли это поиска или такого на сайте нет. Запрос — только у kind search и link (record сам
+отбрасывает его у остальных); других текстов не храним: ни сообщений, ни писем автору (app/feedback.py). Хранение —
 KEEP_DAYS: старое удаляет отправщик раз в час (purge). Смотреть — /events у админа.
 
-    kind      detail
-    cmd       /start, /start ссылка, /my …          — команда, без аргументов
-    menu      btn_find, btn_my …                    — кнопка нижнего меню
-    text      —                                     — текст: поиск, ссылка или письмо автору (сам текст не пишем)
-    media     photo, sticker, voice …               — не текст
-    button    sub, subf, set, startlang …           — нажатая кнопка: имя из CB в app/bot/main.py, без id
-    search    catalog:N, site:N, short, busy, limit — чем кончился поиск
-    link      known, read, gone, busy, limit        — чем кончилась присланная ссылка
-    feedback  bug, idea, collab, other              — письмо автору отправлено
+    kind      detail                                   query
+    cmd       /start, /start ссылка, /my …             —                 команда, без аргументов
+    menu      btn_find, btn_my …                       —                 кнопка нижнего меню
+    text      —                                        —                 пришёл текст: поиск, ссылка или письмо автору
+    media     photo, sticker, voice …                  —                 не текст
+    button    sub, subf, set, startlang …              —                 нажатая кнопка: имя из CB в app/bot/main.py
+    search    catalog:N, site:N, short, busy, limit    запрос            чем кончился поиск
+    link      known, read, gone, busy, limit           текст со ссылкой  чем кончилась присланная ссылка
+    feedback  bug, idea, collab, other                 —                 письмо автору отправлено
 """
 from __future__ import annotations
 
@@ -22,6 +24,7 @@ from datetime import datetime, timedelta
 
 from sqlalchemy import text
 
+from app.bot import guard
 from app.db import session
 from app.i18n import t
 
@@ -31,15 +34,20 @@ KEEP_DAYS = 30
 SUMMARY_DAYS = 7
 SUMMARY_USERS = 15
 SUMMARY_TAIL = 8          # последних действий в строке сводки
+SUMMARY_QUERY = 40        # символов запроса в сводке; целиком — в /events <id>
 PATH_LIMIT = 80           # действий в пути одного человека
+QUERY_KINDS = ("search", "link")   # только у них пишется, что человек ввёл
+QUERY_LEN = 200           # user_events.query
 
 
-async def record(user_id: int, kind: str, detail: str | None = None) -> None:
-    """Своя короткая транзакция. Сбой записи не мешает ответить человеку: только строка в лог."""
+async def record(user_id: int, kind: str, detail: str | None = None, query: str | None = None) -> None:
+    """Своя короткая транзакция. Сбой записи не мешает ответить человеку: только строка в лог.
+    query — запрос поиска или текст с присланной ссылкой; у других kind не пишется, даже если передан."""
+    said = (guard.clean_query(query, QUERY_LEN) or None) if query and kind in QUERY_KINDS else None
     try:
         async with session() as s:
-            await s.execute(text("INSERT INTO user_events (user_id, kind, detail) VALUES (:u, :k, :d)"),
-                            {"u": user_id, "k": kind[:16], "d": detail[:32] if detail else None})
+            await s.execute(text("INSERT INTO user_events (user_id, kind, detail, query) VALUES (:u, :k, :d, :q)"),
+                            {"u": user_id, "k": kind[:16], "d": detail[:32] if detail else None, "q": said})
             await s.commit()
     except Exception as exc:
         log.warning("Событие %s/%s человека %s не записано: %s", kind, detail, user_id, exc)
@@ -66,7 +74,7 @@ _BUTTONS = {
     "my": "мои подписки: листает", "unsub": "отписался", "unsubq": "«отписаться?»", "keep": "оставил подписку",
     "set": "настройки", "setq": "тихие часы", "setl": "язык", "setv": "озвучка по умолчанию",
     "fb": "написать автору", "fb_topic": "тема письма", "fb_cancel": "письмо: отмена", "noop": "пустая кнопка",
-    "stale": "старая кнопка", "go": "слежу (из поиска)", "undo": "отменил «слежу»",
+    "stale": "старая кнопка", "go": "слежу (из поиска)", "undo": "отменил «слежу»", "done": "✓ (уже слежу)",
 }
 _OUTCOMES = {
     "short": "слишком короткий запрос", "busy": "сайт не ответил", "limit": "упёрся в лимит",
@@ -74,7 +82,8 @@ _OUTCOMES = {
 }
 
 
-def label(kind: str, detail: str | None) -> str:
+def label(kind: str, detail: str | None, query: str | None = None, width: int | None = None) -> str:
+    """Действие словами: «поиск «дом дракона»: нашлось 1 (каталог)». width — сколько символов запроса показать."""
     if kind == "cmd":
         return detail or "команда"
     if kind == "menu":
@@ -92,10 +101,18 @@ def label(kind: str, detail: str | None) -> str:
             result = f"{found} ({'каталог' if where == 'catalog' else 'сайт'})"
         else:
             result = _OUTCOMES.get(where, where)
-        return f"{'поиск' if kind == 'search' else 'ссылка'}: {result}"
+        what = "поиск" if kind == "search" else "ссылка"
+        if query:
+            what += f" «{query if width is None or len(query) <= width else query[:width - 1] + '…'}»"
+        return f"{what}: {result}"
     if kind == "feedback":
         return f"письмо автору отправлено ({detail})"
     return f"{kind} {detail or ''}".strip()
+
+
+def _size(text_: str) -> int:
+    """Длина так, как её считает Telegram (UTF-16). Считаем по HTML вместе с тегами — оценка сверху."""
+    return len(text_.encode("utf-16-le")) // 2
 
 
 def _who(user_id: int, username: str | None, created: datetime | None, tz: int) -> str:
@@ -105,45 +122,58 @@ def _who(user_id: int, username: str | None, created: datetime | None, tz: int) 
 
 
 async def summary(s, tz: int, at: datetime | None = None) -> str:
-    """Кто что делал за SUMMARY_DAYS: на человека — число действий, время последнего и хвост пути."""
+    """Кто что делал за SUMMARY_DAYS: на человека — число действий, время последнего и хвост пути с запросами
+    (до SUMMARY_QUERY символов). Не влезает в сообщение Telegram — дальние по времени не показываются, сказано сколько."""
     rows = (await s.execute(text("""
         WITH recent AS (
             SELECT user_id, count(*) AS n, max(at) AS last_at FROM user_events
              WHERE at > coalesce(CAST(:at AS timestamptz), now()) - make_interval(days => :days)
              GROUP BY user_id ORDER BY max(at) DESC LIMIT :users)
         SELECT r.user_id, r.n, r.last_at, u.username, u.created_at,
-               (SELECT array_agg(e.kind || '|' || coalesce(e.detail, '') ORDER BY e.at)
-                  FROM (SELECT kind, detail, at FROM user_events
+               (SELECT array_agg(ARRAY[e.kind, e.detail, e.query] ORDER BY e.at)
+                  FROM (SELECT kind, detail, query, at FROM user_events
                          WHERE user_id = r.user_id ORDER BY at DESC LIMIT :tail) e) AS tail
           FROM recent r LEFT JOIN users u ON u.id = r.user_id
          ORDER BY r.last_at DESC"""),
         {"at": at, "days": SUMMARY_DAYS, "users": SUMMARY_USERS, "tail": SUMMARY_TAIL})).all()
     if not rows:
         return f"За {SUMMARY_DAYS} дней действий в боте нет."
-    lines = [f"<b>Действия за {SUMMARY_DAYS} дней</b> (хранятся {KEEP_DAYS})"]
+    head = [f"<b>Действия за {SUMMARY_DAYS} дней</b> (хранятся {KEEP_DAYS})"]
+    foot = ["", "Путь одного человека: /events &lt;id&gt;"]
+    blocks = []
     for user_id, n, last_at, username, created, tail in rows:
-        steps = " → ".join(html.escape(label(*item.split("|", 1))) for item in tail)
-        lines += ["", _who(user_id, username, created, tz),
-                  f"{n} действий, последнее {(last_at + timedelta(hours=tz)):%d.%m %H:%M}", f"… {steps}"]
-    lines += ["", "Путь одного человека: /events &lt;id&gt;"]
-    return "\n".join(lines)
+        steps = " → ".join(html.escape(label(kind, detail, query, SUMMARY_QUERY)) for kind, detail, query in tail)
+        blocks.append(["", _who(user_id, username, created, tz),
+                       f"{n} действий, последнее {(last_at + timedelta(hours=tz)):%d.%m %H:%M}", f"… {steps}"])
+    while True:
+        cut = len(rows) - len(blocks)
+        more = ["", f"Ещё {cut} чел. не влезли в сообщение."] if cut else []
+        out = "\n".join(head + [line for block in blocks for line in block] + more + foot)
+        if _size(out) <= guard.TEXT_MAX or len(blocks) <= 1:
+            return out
+        blocks.pop()
 
 
 async def path(s, user_id: int, tz: int) -> str:
-    """Последние PATH_LIMIT действий человека по порядку, с датами."""
+    """Последние PATH_LIMIT действий человека по порядку, с датами и запросами целиком. Не влезает в сообщение
+    Telegram — отбрасываются самые старые: важнее, чем человек закончил."""
     rows = (await s.execute(text("""
-        SELECT at, kind, detail FROM (SELECT at, kind, detail FROM user_events WHERE user_id = :u
-                                       ORDER BY at DESC LIMIT :n) e ORDER BY at"""),
+        SELECT at, kind, detail, query FROM (SELECT at, kind, detail, query FROM user_events WHERE user_id = :u
+                                              ORDER BY at DESC LIMIT :n) e ORDER BY at"""),
         {"u": user_id, "n": PATH_LIMIT})).all()
     user = (await s.execute(text("SELECT username, created_at FROM users WHERE id = :u"), {"u": user_id})).first()
     head = _who(user_id, user[0] if user else None, user[1] if user else None, tz)
     if not rows:
         return f"{head}\nДействий за {KEEP_DAYS} дней нет."
-    lines, day = [f"{head} — последние {len(rows)} действий"], None
-    for at, kind, detail in rows:
-        local = at + timedelta(hours=tz)
-        if local.date() != day:
-            day = local.date()
-            lines.append(f"\n<b>{local:%d.%m}</b>")
-        lines.append(f"{local:%H:%M} {html.escape(label(kind, detail))}")
-    return "\n".join(lines)
+    steps = [(at + timedelta(hours=tz), html.escape(label(kind, detail, query))) for at, kind, detail, query in rows]
+    while True:
+        lines, day = [f"{head} — последние {len(steps)} действий"], None
+        for local, step in steps:
+            if local.date() != day:
+                day = local.date()
+                lines.append(f"\n<b>{local:%d.%m}</b>")
+            lines.append(f"{local:%H:%M} {step}")
+        out = "\n".join(lines)
+        if _size(out) <= guard.TEXT_MAX or len(steps) <= 1:
+            return out
+        steps = steps[1:]

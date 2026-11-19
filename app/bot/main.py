@@ -24,7 +24,7 @@ from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command, CommandObject, CommandStart
 from aiogram.types import (BotCommand, CallbackQuery, ErrorEvent, InlineKeyboardButton,
                            InlineKeyboardMarkup, KeyboardButton, Message, ReplyKeyboardMarkup, Update)
-from sqlalchemy import exists, func, select, text
+from sqlalchemy import exists, func, or_, select, text
 
 from app import health, posters
 from app import service as svc
@@ -88,6 +88,8 @@ CB = {
     # Выдача поиска (10.10.2026): нажал — слежу; «↩️ Отменить» в карточке после этого.
     "go": rf"go:(?:p|f):{ID}",
     "undo": rf"undo:(?:p|f):{ID}:{ID}",
+    # «✓ …» — нажатая «🔔» (19.11.2026): done:<callback_data той кнопки>.
+    "done": rf"done:(?:go:(?:p|f)|sub|wait):{ID}",
 }
 CB_RX = {k: re.compile(rf"\A(?:{v})\Z") for k, v in CB.items()}
 
@@ -161,7 +163,8 @@ _MENU_KEY = {text_: key for key, texts in MENU.items() for text_ in texts}
 
 
 def _event_of(event: Update) -> tuple[int, str, str | None] | None:
-    """Что сделал человек — для app/events.py. Тип и метка, текст сообщения не берём; только личные чаты."""
+    """Что сделал человек — для app/events.py. Тип и метка, текст сообщения не берём (запрос поиска и ссылку пишут
+    обработчики вместе с итогом: kind search / link); только личные чаты."""
     if (cb := event.callback_query) is not None:
         if cb.message is None or cb.message.chat.type != ChatType.PRIVATE:
             return None
@@ -672,14 +675,14 @@ async def on_text(msg: Message) -> None:
     query = guard.clean_query(msg.text)
     lang = await _lang(msg.from_user.id)
     if len(query) < 2:
-        await events.record(msg.from_user.id, "search", "short")
+        await events.record(msg.from_user.id, "search", "short", query)
         await msg.answer(t(lang, "query_short"), reply_markup=menu(lang))
         return
     link = _PATH_RX.search(msg.text[:guard.MAX_LINK_SCAN])
     # Разрешение на сайт — там, где запрос к сайту действительно нужен (guard.site_permit): ссылка на известную
     # страницу и поиск по каталогу отвечают из базы.
     if not guard.cheap_actions.allow(msg.from_user.id):
-        await events.record(msg.from_user.id, "link" if link else "search", "limit")
+        await events.record(msg.from_user.id, "link" if link else "search", "limit", msg.text if link else query)
         await msg.answer(t(lang, "too_fast"))
         return
     async with session() as s:
@@ -723,7 +726,7 @@ async def _handle_search(msg: Message, lang: str, query: str) -> None:
         named = await svc.franchises_named(s, query, g.franchise_ids)
     if g.empty:
         if _cached_search(query) is None and (reason := guard.site_permit(msg.from_user.id)):
-            await events.record(msg.from_user.id, "search", "limit")
+            await events.record(msg.from_user.id, "search", "limit", query)
             await msg.answer(t(lang, reason))
             return
         note = await msg.answer(t(lang, "searching"))
@@ -732,7 +735,7 @@ async def _handle_search(msg: Message, lang: str, query: str) -> None:
     rows = _hit_rows(lang, g, stats, named)
     rows.append([(t(lang, "btn_search_site"), f"site:{_site_token(query)}")])
     text_ = t(lang, "found_n", n=len(rows) - 1)
-    await events.record(msg.from_user.id, "search", events.found("catalog", len(rows) - 1))
+    await events.record(msg.from_user.id, "search", events.found("catalog", len(rows) - 1), query)
     if g.hidden:
         text_ += t(lang, "hidden_local", n=g.hidden)
     await msg.answer(text_, reply_markup=_kb(rows))
@@ -788,7 +791,7 @@ async def cb_site_search(cb: CallbackQuery) -> None:
         await cb.answer(t(lang, "query_stale"), show_alert=True)
         return
     if _cached_search(hit[0]) is None and (reason := guard.site_permit(cb.from_user.id)):
-        await events.record(cb.from_user.id, "search", "limit")
+        await events.record(cb.from_user.id, "search", "limit", hit[0])
         await cb.answer(t(lang, reason))
         return
     await cb.answer()
@@ -800,7 +803,7 @@ async def _site_search(note: Message, lang: str, query: str, local_hidden: int =
     try:
         items = await _search(query)
     except (AccessBlocked, asyncio.TimeoutError):
-        await events.record(note.chat.id, "search", "busy")
+        await events.record(note.chat.id, "search", "busy", query)
         await note.edit_text(t(lang, "busy"))
         return
     _remember(items)
@@ -819,7 +822,7 @@ async def _site_search(note: Message, lang: str, query: str, local_hidden: int =
         named = await svc.franchises_named(s, query, g.franchise_ids)
     rows = _hit_rows(lang, g, stats, named)
     hidden = local_hidden + g.hidden + (len(items) - len(pages))
-    await events.record(note.chat.id, "search", events.found("site", len(rows)))
+    await events.record(note.chat.id, "search", events.found("site", len(rows)), query)
     if not rows:
         text_ = t(lang, "nothing_airing_query") + (t(lang, "hidden_local", n=hidden) if hidden > 0 else "") + t(lang, "link_hint")
         await note.edit_text(text_)
@@ -842,7 +845,7 @@ async def _handle_link(msg: Message, lang: str, hdrezka_id: int, path: str) -> N
 
     if known:
         log.info("Ссылка на %s — из базы, без запроса к сайту", hdrezka_id)
-        await events.record(msg.from_user.id, "link", "known")
+        await events.record(msg.from_user.id, "link", "known", msg.text)
         note = await _send_card(msg, msg.from_user.id, page_id)
         # Флаг «завершён» знаем наверняка, если он уже стоит или серии выходили недавно.
         recently_active = last_event is not None and (svc.now() - last_event).days < 30
@@ -851,7 +854,7 @@ async def _handle_link(msg: Message, lang: str, hdrezka_id: int, path: str) -> N
         return
 
     if reason := guard.site_permit(msg.from_user.id):
-        await events.record(msg.from_user.id, "link", "limit")
+        await events.record(msg.from_user.id, "link", "limit", msg.text)
         await msg.answer(t(lang, reason))
         return
     url = path                     # путь: домен подставит клиент — текущее зеркало (24.09.2026)
@@ -860,14 +863,14 @@ async def _handle_link(msg: Message, lang: str, hdrezka_id: int, path: str) -> N
         res = await _read_page(hdrezka_id, url)
         page_id, title = res.page.id, res.page.title
     except PageGone:
-        await events.record(msg.from_user.id, "link", "gone")
+        await events.record(msg.from_user.id, "link", "gone", msg.text)
         await note.edit_text(t(lang, "link_gone"))
         return
     except (AccessBlocked, asyncio.TimeoutError):
-        await events.record(msg.from_user.id, "link", "busy")
+        await events.record(msg.from_user.id, "link", "busy", msg.text)
         await note.edit_text(t(lang, "busy"))
         return
-    await events.record(msg.from_user.id, "link", "read")
+    await events.record(msg.from_user.id, "link", "read", msg.text)
     try:
         await note.delete()
     except TelegramBadRequest:
@@ -1061,19 +1064,59 @@ async def cb_subscribe(cb: CallbackQuery) -> None:
 
 
 async def _mark_tapped(cb: CallbackQuery) -> bool:
-    """В выдаче поиска нажатая кнопка становится «✓ …» — результат виден без тоста. False — нажатие было не в выдаче
-    (в карточке), отмечать нечего."""
+    """В выдаче поиска нажатая кнопка становится «✓ …» — результат виден без тоста; нажатие на галочку — cb_done.
+    False — нажатие было не в выдаче (в карточке), отмечать нечего."""
+    return await _swap_tapped(cb, ("➕", "🔔"), "✓ ", f"done:{cb.data}")
+
+
+async def _swap_tapped(cb: CallbackQuery, was: tuple[str, ...], mark: str, data: str) -> bool:
+    """Нажатая кнопка (callback_data == cb.data), если её подпись начинается с `was`: первые два символа подписи —
+    `mark`, callback_data — `data`. False — такой кнопки в сообщении нет."""
     kb = cb.message.reply_markup.inline_keyboard if cb.message and cb.message.reply_markup else []
-    if not any(b.callback_data == cb.data and b.text.startswith(("➕", "🔔")) for row in kb for b in row):
+    if not any(b.callback_data == cb.data and b.text.startswith(was) for row in kb for b in row):
         return False
     rows = [[InlineKeyboardButton(
-        text=("✓ " + b.text[2:]) if b.callback_data == cb.data else b.text,
-        callback_data="noop" if b.callback_data == cb.data else b.callback_data) for b in row] for row in kb]
+        text=(mark + b.text[2:]) if b.callback_data == cb.data else b.text,
+        callback_data=data if b.callback_data == cb.data else b.callback_data) for b in row] for row in kb]
     try:
         await cb.message.edit_reply_markup(reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
     except TelegramBadRequest:
         pass
     return True
+
+
+async def _follows(user_id: int, data: str) -> bool:
+    """Следит ли человек за тем, что было на кнопке: go:p:<page_id>, go:f:<franchise_id>, sub|wait:<hdrezka_id>.
+    Часть франшизы, за которой он следит целиком, — тоже «слежу»."""
+    kind, raw = data.rsplit(":", 1)
+    async with session() as s:
+        if kind == "go:f":
+            page, fid = None, int(raw)
+        else:
+            page = await s.get(Page, int(raw)) if kind == "go:p" else await svc.page_by_hid(s, int(raw))
+            if page is None:
+                return False
+            fid = page.franchise_id
+        mine = [Subscription.franchise_id == fid] if fid is not None else []
+        if page is not None:
+            mine.append(Subscription.page_id == page.id)
+        return await s.scalar(select(Subscription.id).where(Subscription.user_id == user_id, or_(*mine))
+                              .limit(1)) is not None
+
+
+@dp.callback_query(_cb("done"))
+@limited
+async def cb_done(cb: CallbackQuery) -> None:
+    """Нажатие на «✓ …» в выдаче (19.11.2026): новички жали галочку по 1–4 раза, а она молчала (была noop). Слежу —
+    тост «уже слежу»; подписку с тех пор сняли («↩️ Отменить» в карточке, «Не следить») — тост «подписки уже нет», и
+    кнопка снова «🔔 …» с прежним действием: нажал — снова слежу."""
+    lang = await _lang(cb.from_user.id)
+    tapped = cb.data.split(":", 1)[1]
+    if await _follows(cb.from_user.id, tapped):
+        await cb.answer(t(lang, "toast_following"))
+        return
+    await cb.answer(t(lang, "toast_no_sub"))
+    await _swap_tapped(cb, ("✓",), "🔔 ", tapped)
 
 
 async def _refresh_after_follow(user_id: int, hid: int, url: str, fresh) -> None:

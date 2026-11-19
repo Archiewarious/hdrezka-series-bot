@@ -23,9 +23,9 @@ _CONTROL_RX = re.compile(r"[\x00-\x08\x0b-\x1f\x7f\u200b-\u200f\u2028-\u202e\u20
 _SPACES_RX = re.compile(r"\s+")
 
 
-def clean_query(text: str) -> str:
+def clean_query(text: str, limit: int = MAX_QUERY_LEN) -> str:
     text = _CONTROL_RX.sub("", text or "")
-    return _SPACES_RX.sub(" ", text).strip()[:MAX_QUERY_LEN]
+    return _SPACES_RX.sub(" ", text).strip()[:limit]
 
 
 class UserLimiter:

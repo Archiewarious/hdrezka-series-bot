@@ -110,6 +110,62 @@ def test_tap_follows_only_the_found_show_and_undo_keeps_the_card(db, quiet):
     assert any(b.text == main.t("ru", "btn_follow") for row in after_kb.inline_keyboard for b in row)
 
 
+def test_tick_answers_and_turns_back_into_a_bell_after_undo(db, quiet):
+    """19.11.2026: «✓ …» после нажатия была noop и молчала — новички жали её по 1–4 раза. Теперь тост «уже слежу».
+    После «↩️ Отменить» в карточке галочка в выдаче остаётся — нажатие на неё говорит «подписки уже нет» и возвращает
+    «🔔 …»: нажал — снова слежу. Остальные кнопки выдачи не трогаются."""
+    async def scenario():
+        async with session() as s:
+            s.add(User(id=68))
+            got, dragon = await _dragon_catalog(s)
+            await s.commit()
+        go = f"go:p:{dragon.id}"
+        results = FakeMessage(68, reply_markup=main._kb([[("🔔 Дом Дракона · 2×8 · «Игра престолов»", go)],
+                                                          [("🔍 Нет нужного — искать на сайте", "site:0123456789ab")]]))
+        await main.cb_go(FakeCallback(68, go, results))
+        tick = results.reply_markup.inline_keyboard[0][0]
+        following = FakeCallback(68, tick.callback_data, results)
+        await main.cb_done(following)
+        card_kb = results.answers[-1][1]
+        undo = next(b.callback_data for row in card_kb.inline_keyboard for b in row if b.text == main.t("ru", "btn_undo"))
+        await main.cb_undo(FakeCallback(68, undo, FakeMessage(68)))
+        gone = FakeCallback(68, tick.callback_data, results)
+        await main.cb_done(gone)
+        bell = results.reply_markup.inline_keyboard[0][0]
+        await main.cb_go(FakeCallback(68, bell.callback_data, results))
+        async with session() as s:
+            subs = [x.page_id for x in (await s.execute(select(Subscription))).scalars()]
+        return dragon.id, tick, following.toasts, gone.toasts, bell, results.reply_markup, subs
+
+    page_id, tick, following, gone, bell, kb, subs = db(scenario)
+    assert (tick.text, tick.callback_data) == ("✓ Дом Дракона · 2×8 · «Игра престолов»", f"done:go:p:{page_id}")
+    assert following == [main.t("ru", "toast_following")] and following[0].startswith("Уже слежу ✓")
+    assert gone == [main.t("ru", "toast_no_sub")]
+    assert (bell.text, bell.callback_data) == ("🔔 Дом Дракона · 2×8 · «Игра престолов»", f"go:p:{page_id}")
+    assert kb.inline_keyboard[0][0].text.startswith("✓ ") and subs == [page_id], "снова слежу — снова галочка"
+    assert kb.inline_keyboard[1][0].callback_data == "site:0123456789ab"
+
+
+def test_tick_counts_a_franchise_followed_as_a_whole(db, quiet):
+    """19.11.2026: часть франшизы, за которой следят целиком, и франшиза из выдачи — «уже слежу»; неизвестная
+    страница — «подписки нет», без ошибок."""
+    async def scenario():
+        async with session() as s:
+            s.add(User(id=69))
+            got, dragon = await _dragon_catalog(s)
+            await main.svc.subscribe_franchise(s, 69, got.id)
+            await s.commit()
+        toasts = []
+        for data in (f"done:go:p:{dragon.id}", f"done:go:f:{got.id}", f"done:sub:{dragon.hdrezka_id}", "done:go:p:999999"):
+            cb = FakeCallback(69, data, FakeMessage(69))
+            await main.cb_done(cb)
+            toasts += cb.toasts
+        return toasts
+
+    following, no_sub = main.t("ru", "toast_following"), main.t("ru", "toast_no_sub")
+    assert db(scenario) == [following, following, following, no_sub]
+
+
 def test_tap_does_not_duplicate_a_followed_franchise(db, quiet):
     async def scenario():
         async with session() as s:

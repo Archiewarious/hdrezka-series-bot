@@ -33,14 +33,17 @@ LEGIT = ["startlang:ru", "startlang:uk", "startlang:en", "site:0123456789ab", "s
          "set:digest:0", "set:digest:1", "set:tz:-1", "set:tz:1", "set:quietcfg", "set:tzcfg", "set:voice", "set:lang",
          "set:back", "setq:off", "setq:f:1", "setq:f:-1", "setq:t:1", "setq:t:-1", "setl:ru", "setl:en",
          "setv:any", "setv:56", "fb", "fb:bug", "fb:idea", "fb:collab", "fb:other", "fb:cancel", "noop",
-         "go:p:183", "go:f:12", "undo:p:15:183", "undo:f:15:12"]
+         "go:p:183", "go:f:12", "undo:p:15:183", "undo:f:15:12",
+         "done:go:p:183", "done:go:f:12", "done:sub:90932", "done:wait:90932"]
 
 HOSTILE = ["pcard:9999999999", "pcard:99999999999999999999", "pcard:-1", "pcard:1 ", "pcard:1\n", "pcard:١",
            "pcard:", "pcard:1:2", "vt:1:abc", "vt:1", "vt:1:2:3", "set:tz:100", "set:tz:-12", "set:photos:2",
            "setq:f:1000", "setq:f", "setq:x:1", "my:99999", "my:-1", "card:1:99999", "sched:x:1", "sched:p",
            "startlang:de", "setl:xx", "setv:1e9", "setv:-5", "fb:hack", "unsub:1;DROP TABLE users", "",
            "a" * 64, "sub:12abc", "wait:", "site:xyz", "site:0123456789abcdef", "noop2", "fb:",
-           "go:x:1", "go:p:", "go:p:1:2", "go:183", "undo:p:1", "undo:x:1:2", "undo:p:1:2:3"]
+           "go:x:1", "go:p:", "go:p:1:2", "go:183", "undo:p:1", "undo:x:1:2", "undo:p:1:2:3",
+           "done:", "done:noop", "done:go:p:", "done:go:x:1", "done:unsub:15", "done:done:go:p:1", "done:sub:1:2",
+           "done:go:p:9999999999"]
 
 
 @pytest.mark.parametrize("data", LEGIT)

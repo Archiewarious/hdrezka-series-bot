@@ -12,6 +12,7 @@ from app.bot import guard
 from app.db import session
 from app.models import User
 from test_bot_handlers import SearchSite, _card_html, _message
+from test_integration import _page
 
 
 def _msg(text_=None, chat="private", content_type="text", uid=7):
@@ -67,7 +68,8 @@ def test_failed_write_does_not_stop_the_answer(monkeypatch):
     asyncio.run(events.record(7, "cmd", "/start"))
 
 
-def test_search_outcome_is_recorded_without_the_query(db, monkeypatch):
+def test_search_outcome_is_recorded_with_the_query(db, monkeypatch):
+    """19.11.2026: новичок четыре раза подряд получил «ничего», а что он вводил — неизвестно. Запрос — в строке итога."""
     fake = SearchSite(_card_html(4601, "Выходит", "1 сезон, 5 серия"))
     monkeypatch.setattr(main, "client", fake)
     monkeypatch.setattr(main, "_background", lambda coro: coro.close())
@@ -80,9 +82,90 @@ def test_search_outcome_is_recorded_without_the_query(db, monkeypatch):
         await main._handle_search(_message(46), "ru", "другой запрос")
         async with session() as s:
             return [tuple(r) for r in (await s.execute(text(
-                "SELECT kind, detail FROM user_events WHERE user_id = 46 ORDER BY id"))).all()]
+                "SELECT kind, detail, query FROM user_events WHERE user_id = 46 ORDER BY id"))).all()]
 
-    assert db(scenario) == [("search", "site:1"), ("search", "site:0")]
+    assert db(scenario) == [("search", "site:1", "секретный запрос 4601"), ("search", "site:0", "другой запрос")]
+
+
+def test_what_was_typed_is_kept_next_to_the_outcome(db, monkeypatch):
+    """19.11.2026: короткий запрос, поиск по каталогу, ссылка — что ввёл человек, лежит в строке итога; текст ссылки —
+    целиком, с адресом сайта (ссылка с чужого сайта тоже видна)."""
+    monkeypatch.setattr(main, "_background", lambda coro: coro.close())
+    monkeypatch.setattr(guard, "cheap_actions", guard.UserLimiter(per_minute=30, per_hour=600))
+
+    async def scenario():
+        async with session() as s:
+            await _page(s, 4700, "Известный сериал", last=(1, 3))
+            await s.commit()
+        for said in ("я", "Известный  сериал", "вот https://rezka.test/series/y/4700-p.html"):
+            msg = _message(47)
+            msg.text = said
+            await main.on_text(msg)
+        async with session() as s:
+            return [tuple(r) for r in (await s.execute(text(
+                "SELECT kind, detail, query FROM user_events WHERE user_id = 47 ORDER BY id"))).all()]
+
+    assert db(scenario) == [("search", "short", "я"), ("search", "catalog:1", "Известный сериал"),
+                            ("link", "known", "вот https://rezka.test/series/y/4700-p.html")]
+
+
+def test_only_search_and_link_keep_the_text(db):
+    """19.11.2026: письмо автору и прочее — без текста, даже если его передали; запрос чистится от управляющих
+    символов и режется до длины колонки."""
+    async def scenario():
+        await events.record(48, "feedback", "bug", "текст письма автору")
+        await events.record(48, "text", None, "привет")
+        await events.record(48, "search", "site:0", "ab‮cd\x00 \n ef" + "x" * 300)
+        await events.record(48, "search", "short", "   ")
+        async with session() as s:
+            return [tuple(r) for r in (await s.execute(text(
+                "SELECT kind, query FROM user_events WHERE user_id = 48 ORDER BY id"))).all()]
+
+    assert db(scenario) == [("feedback", None), ("text", None), ("search", "abcd ef" + "x" * 193), ("search", None)]
+
+
+def test_events_show_what_was_typed(db):
+    """19.11.2026: /events — запрос рядом с итогом; в сводке до 40 символов, в пути целиком; разметка экранирована
+    (ответ идёт в HTML). Нажатие на «✓» — своё имя кнопки."""
+    long_q = "очень длинный запрос про сериал которого нет нигде вообще"
+
+    async def scenario():
+        await events.record(56, "search", "catalog:1", "дом дракона")
+        await events.record(56, "search", "site:0", "<b>ведьмак</b> & co")
+        await events.record(56, "search", "site:0", long_q)
+        await events.record(56, "link", "gone", "https://rezka.test/series/x/1-a.html")
+        await events.record(56, "button", "done")
+        async with session() as s:
+            return await events.summary(s, tz=3), await events.path(s, 56, tz=3)
+
+    summary, path = db(scenario)
+    for out in (summary, path):
+        assert "поиск «дом дракона»: нашлось 1 (каталог)" in out
+        assert "поиск «&lt;b&gt;ведьмак&lt;/b&gt; &amp; co»: ничего (сайт)" in out
+        assert "кнопка «✓ (уже слежу)»" in out
+    assert f"поиск «{long_q[:39]}…»: ничего (сайт)" in summary and long_q not in summary
+    assert f"поиск «{long_q}»: ничего (сайт)" in path
+    assert "ссылка «https://rezka.test/series/x/1-a.html»: страницы нет на сайте" in path
+    assert main._event_of(_click("done:go:p:183")) == (7, "button", "done")
+
+
+def test_events_fit_in_one_telegram_message(db):
+    """19.11.2026: с длинными запросами сводка и путь всё равно уходят одним сообщением: в сводке нет дальних по
+    времени людей (сказано сколько), в пути — самых старых действий; последнее на месте."""
+    async def scenario():
+        for uid in range(100, 100 + events.SUMMARY_USERS):
+            for i in range(events.SUMMARY_TAIL):
+                await events.record(uid, "search", "site:0", f"запрос {uid}-{i} " + "я" * 150)
+        for i in range(events.PATH_LIMIT):
+            await events.record(200, "link", "gone", f"https://rezka.test/{i}/" + "a" * 180)
+        async with session() as s:
+            return await events.summary(s, tz=0), await events.path(s, 200, tz=0)
+
+    summary, path = db(scenario)
+    assert events._size(summary) <= guard.TEXT_MAX and events._size(path) <= guard.TEXT_MAX
+    assert "не влезли в сообщение" in summary and summary.endswith("Путь одного человека: /events &lt;id&gt;")
+    assert "<code>200</code>" in summary, "самый свежий — первым"
+    assert f"https://rezka.test/{events.PATH_LIMIT - 1}/" in path and "https://rezka.test/0/" not in path
 
 
 def test_events_summary_and_path_read_like_a_story(db):

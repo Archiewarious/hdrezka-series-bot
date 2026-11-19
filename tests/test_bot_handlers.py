@@ -19,6 +19,7 @@ class FakeMessage:
     def __init__(self, chat_id: int, reply_markup=None):
         self.chat = SimpleNamespace(id=chat_id)
         self.bot = SimpleNamespace()
+        self.text = None          # что прислал человек: ссылку бот пишет в user_events (app/events.py)
         self.photo = None
         self.reply_markup = reply_markup
         self.answers, self.edits = [], []
