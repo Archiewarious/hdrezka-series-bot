@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from datetime import timedelta
+from datetime import datetime, timedelta
 
 from sqlalchemy import select, text
 
@@ -31,6 +31,8 @@ log = logging.getLogger("poller")
 WATCHDOG_LIMIT = 30 * 60                # цикл не отмечался 30 мин — процесс завершается, Docker перезапускает
 EVENT_READS = 10                        # чтений страниц ради событий за цикл; не хватило — событие ждёт цикла
 VOICE_REREAD = timedelta(hours=24)      # незнакомая озвучка → перечитать список озвучек страницы, не чаще
+SUSPECT_RECHECK = timedelta(hours=6)    # скачка из блока нет на странице → перепроверить её не чаще: ложное событие
+                                        # висит в блоке до недели (≤ 28 чтений), настоящее ждёт не дольше 6 ч
 FRANCHISE_REFRESH_HOURS = 24
 PAGE_REFRESH_HOURS = 12                 # выходящие страницы с подписчиками: расписание сайта живое
 PAGE_REFRESH_DAYS = 7                   # завершённые, на которых ждут продолжения
@@ -60,6 +62,9 @@ class Poller:
         self.watchdog: lifecycle.Watchdog | None = None
         self._cycle_new_parts = 0               # уведомлений new_part за цикл — для строки лога
         self._reads_left = EVENT_READS          # на цикл: блок обновлений, новые части; сбрасывает cycle()
+        # Скачки из блока, которых не оказалось на странице: (hdrezka_id, сезон, серия) → время проверки. В памяти:
+        # после перезапуска — одно лишнее чтение на событие, таблица ради этого не нужна (19.11.2026).
+        self._suspects: dict[tuple[int, int, int], datetime] = {}
 
     # ------------------------------------------------------------------ чтение страниц
 
@@ -67,38 +72,41 @@ class Poller:
         """Читает страницу. Новые части франшизы сервис дописывает в состав, уведомляет announce_new_parts."""
         return await svc.sync_page(s, self.client, hdrezka_id, url)
 
-    async def _read(self, s, page: Page, required: bool) -> bool:
-        """Чтение страницы ради события. Обязательное — новая серия на непрочитанной странице: без привязки
-        к франшизе её подписчики уведомления не получат; при исчерпанном лимите или неудаче событие
-        откладывается до следующего цикла, после READ_GIVE_UP_AFTER неудач подряд — идёт без чтения, пока не
-        подойдёт время следующей попытки. Часовых пауз очередей обновления событие не ждёт: премьера после одного
-        сбоя чтения приходила через час, а не через цикл (25.09.2026). Необязательное — обновить список озвучек:
-        берёт не больше половины лимита, ждёт паузу после неудач и просто пропускается. Неудачи — в базе (pages)."""
+    async def _read(self, s, page: Page, required: bool, confirm: bool = False) -> svc.SyncResult | None:
+        """Чтение страницы ради события; None — не читали или не прочиталась. Обязательное — новая серия на
+        непрочитанной странице: без привязки к франшизе её подписчики уведомления не получат; при исчерпанном
+        лимите или неудаче событие откладывается до следующего цикла, после READ_GIVE_UP_AFTER неудач подряд — идёт
+        без чтения, пока не подойдёт время следующей попытки. Часовых пауз очередей обновления событие не ждёт:
+        премьера после одного сбоя чтения приходила через час, а не через цикл (25.09.2026). Необязательное —
+        обновить список озвучек: берёт не больше половины лимита, ждёт паузу после неудач и просто пропускается.
+        confirm (с required) — сверить скачок со страницей (_off_page): лимит как у обязательного, но неудача
+        события не откладывает — оно идёт, как шло до проверки (19.11.2026). Неудачи — в базе (pages)."""
         paused = page.next_read_at is not None and page.next_read_at > svc.now()
         if required and page.read_failures >= READ_GIVE_UP_AFTER and paused:
-            return False
+            return None
+        if confirm and page.id in self._failed_now:
+            return None
         if page.id in self._failed_now or (paused and not required) \
                 or self._reads_left <= (0 if required else EVENT_READS // 2):
             if required:
                 raise Deferred()
-            return False
+            return None
         self._reads_left -= 1
         try:
-            await self.sync(s, page.hdrezka_id, page.url)
-            return True
+            return await self.sync(s, page.hdrezka_id, page.url)
         except PageGone as exc:
             log.warning("Страница %s пропала с сайта, событие без чтения: %s", page.hdrezka_id, exc)
             await svc.mark_read_failure(s, page.id, gone=True)
             self._failed_now.add(page.id)
-            return False
+            return None
         except AccessBlocked as exc:
             self._failed_now.add(page.id)
-            if required and page.read_failures + 1 < READ_GIVE_UP_AFTER:
+            if required and not confirm and page.read_failures + 1 < READ_GIVE_UP_AFTER:
                 log.warning("Страница %s не прочиталась ради события, повторю в следующем цикле: %s", page.hdrezka_id, exc)
                 raise Deferred(read_failed=True) from exc
             log.warning("Страница %s не прочиталась ради события, иду дальше без неё: %s", page.hdrezka_id, exc)
             await svc.mark_read_failure(s, page.id, gone=False)
-            return False
+            return None
 
     # ------------------------------------------------------------------ 1: блок обновлений
 
@@ -114,6 +122,8 @@ class Poller:
         await svc.meta_set(s, "updates_events", str(len(items)))
         await s.commit()
         fresh_from = svc.now().date() - timedelta(days=1)          # «Сегодня» и «Вчера»
+        checked_from = svc.now() - SUSPECT_RECHECK                 # проверенные раньше — пора перечитать страницу
+        self._suspects = {k: at for k, at in self._suspects.items() if at > checked_from}
         new_eps = queued = deferred = failed = 0
         for item in reversed(items):                                # от старых к новым
             if lifecycle.stopping():
@@ -164,11 +174,23 @@ class Poller:
         page_max = await svc.max_recorded_episode(s, page.id)
         max_seen_at = await svc.max_recorded_seen_at(s, page.id) if page_max else None
         kind = svc.classify_update(eid is not None, page_max, item.season, item.episode, fresh, max_seen_at)
+        # Скачок — новый сезон или пропуск серий после записанных — сначала сверяем со страницей (19.11.2026): блок
+        # выдал «Кольца власти» 5×7 при сезонах 2–3 на странице, ложная серия ушла подписчикам и стала последней
+        # записанной, а настоящие 3×5 и 3×6 после неё записались молча как старые. Пачку сезона не задевает: её
+        # серии младше записанных.
+        jump = kind == "new" and page_max is not None and (item.season, item.episode) > (page_max[0], page_max[1] + 1)
+        if jump and (item.hdrezka_id, item.season, item.episode) in self._suspects:
+            return 0, 0                                  # недавно не нашли на странице — ждём SUSPECT_RECHECK
 
         # Классификация уже решена и от чтения не зависит. Непрочитанную страницу с новой серией читаем
-        # до уведомлений — ради привязки к франшизе и списка озвучек.
+        # до уведомлений — ради привязки к франшизе и списка озвучек; это же чтение сверяет скачок.
+        read = None
         if kind == "new" and page.page_refreshed_at is None:
-            await self._read(s, page, required=True)
+            read = await self._read(s, page, required=True)
+        elif jump:
+            read = await self._read(s, page, required=True, confirm=True)
+        if jump and self._off_page(page, item, read):
+            return 0, 0                                  # чтение страницы закоммитится, серии и уведомлений нет
         tid = match_voice(await svc.voice_names(s, page.id), item.voice)
         stale = page.page_refreshed_at is None or svc.now() - page.page_refreshed_at > VOICE_REREAD
         if kind != "catchup" and item.voice and tid is None and stale and await self._read(s, page, required=False):
@@ -198,6 +220,20 @@ class Poller:
             if n:
                 log.info("ОЗВУЧКА: %s s%se%s в «%s» → %s уведомлений", page.title, item.season, item.episode, item.voice, n)
         return new_eps, queued
+
+    def _off_page(self, page: Page, item: UpdateItem, read: svc.SyncResult | None) -> bool:
+        """Скачок из блока сверен со страницей: True — серии на ней нет, событие пропускаем и перепроверим не раньше
+        SUSPECT_RECHECK (блок держит событие до недели). Страница не прочиталась или без списка серий — верим блоку,
+        как до проверки: совпадение сбоя чтения с ложным событием маловероятно, а настоящую премьеру терять нельзя."""
+        if read is None or not read.episodes:
+            log.warning("ПОДОЗРИТЕЛЬНО: %s s%se%s из ленты, %s — верю ленте", page.title, item.season, item.episode,
+                        "страница не прочиталась" if read is None else "на странице нет списка серий")
+            return False
+        if read.has_episode(item.season, item.episode):
+            return False
+        self._suspects[(item.hdrezka_id, item.season, item.episode)] = svc.now()
+        log.warning("ПОДОЗРИТЕЛЬНО: %s s%se%s из ленты — на странице нет, пропускаю", page.title, item.season, item.episode)
+        return True
 
     # ------------------------------------------------------------------ 1б: новые части франшиз
 

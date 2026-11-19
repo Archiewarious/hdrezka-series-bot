@@ -1,18 +1,20 @@
-"""Поллер: очередь каталога, сверка франшиз, границы транзакций цикла, паузы при потере доступа.
-Сайт подменён (FakeSite из test_integration)."""
+"""Поллер: очередь каталога, сверка франшиз, границы транзакций цикла, паузы при потере доступа, сверка скачков
+из блока обновлений со страницей. Сайт подменён (FakeSite из test_integration)."""
 import asyncio
 import dataclasses
+import logging
 from datetime import timedelta
 
 from sqlalchemy import text
 
 from app import lifecycle
+from app import poller as poller_mod
 from app import service as svc
 from app.db import session
 from app.models import Franchise, Subscription, User
 from app.poller import Poller
 from app.rezka.client import AccessBlocked
-from test_integration import TODAY, FakeSite, _known_franchise, _page, block, title_page
+from test_integration import TODAY, FakeSite, _known_franchise, _notifications, _page, block, title_page
 
 VOICES = [(56, "Дубляж", None)]
 
@@ -339,3 +341,153 @@ def test_page_locks_do_not_outlive_their_event(db, monkeypatch):
     locked, kinds = db(scenario)
     assert locked == [False], "после события с чтением строки частей франшизы свободны"
     assert kinds == ["episode"], "премьера разослана"
+
+
+# ----------------------------------------------------------------------------- скачки из блока (19.11.2026)
+
+RINGS = "Кольца власти"
+LOSTFILM = [(56, "лостфильм (LostFilm)")]
+
+
+def _seasons_page(hid: int, title: str, seasons: dict[int, int], aired: tuple = ()) -> str:
+    """Страница со списком серий нескольких сезонов ({сезон: последняя серия}, озвучка по умолчанию) и расписанием:
+    aired — (сезон, серия) со статусом «✓»."""
+    last = max(seasons)
+    eps = "".join(f'<li class="b-simple_episode__item" data-season_id="{se}" data-episode_id="{e}"></li>'
+                  for se, n in seasons.items() for e in range(1, n + 1))
+    rows = "".join(f"<tr><td>{se} сезон {e} серия</td><td><b>Серия {e}</b></td><td></td><td>1 ноября 2026</td>"
+                   "<td>✓</td></tr>" for se, e in aired)
+    return (f'<div class="b-post__title"><h1>{title}</h1></div>'
+            f"<script>initCDNSeriesEvents({hid}, 56, {last}, {seasons[last]}, false)</script>"
+            '<ul><li class="b-translator__item" data-translator_id="56">лостфильм (LostFilm)</li></ul>'
+            f'<ul>{eps}</ul><table class="b-post__schedule_list">{rows}</table>')
+
+
+async def _process(poller: Poller) -> tuple[int, int]:
+    async with session() as s:
+        result = await poller.process_updates(s)
+        await s.commit()
+    return result
+
+
+async def _episodes(hid: int) -> list[tuple[int, int]]:
+    async with session() as s:
+        return [tuple(r) for r in (await s.execute(text(
+            "SELECT e.season, e.episode FROM episodes e JOIN pages p ON p.id = e.page_id "
+            "WHERE p.hdrezka_id = :h ORDER BY 1, 2"), {"h": hid})).all()]
+
+
+def test_false_season_from_the_feed_is_skipped_and_the_real_next_episode_is_new(db, caplog):
+    """16.11.2026: блок выдал «Кольца власти» 5×7 при сезонах 2–3 на странице. Серия ушла подписчикам и стала последней
+    записанной — настоящая 3×5 после неё записалась молча как старая."""
+    async def scenario():
+        async with session() as s:
+            s.add(User(id=97))
+            page = await _page(s, 9850, RINGS, last=(3, 4), rows=[(2, 8)] + [(3, e) for e in range(1, 5)], voices=LOSTFILM)
+            await svc.subscribe_page(s, 97, page.id)
+            await s.commit()
+        false_event = {TODAY - timedelta(days=2): [(9850, RINGS, "series", 5, 7, "LostFilm")]}
+        site = FakeSite(block(false_event), {9850: _seasons_page(9850, RINGS, {2: 8, 3: 4})})
+        poller = Poller(site)
+        first = await _process(poller)
+        notes_after_first = await _notifications(97)
+        poller.client = site = FakeSite(block({**false_event, TODAY: [(9850, RINGS, "series", 3, 5, "LostFilm")]}),
+                                        {9850: _seasons_page(9850, RINGS, {2: 8, 3: 5})})
+        second = await _process(poller)
+        return first, notes_after_first, second, site.reads, await _episodes(9850), await _notifications(97)
+
+    caplog.set_level(logging.WARNING, logger="poller")
+    first, notes_after_first, second, reads, episodes, notes = db(scenario)
+    assert first == (0, 0) and notes_after_first == [], "ложной серии нет ни в базе, ни в уведомлениях"
+    assert "ПОДОЗРИТЕЛЬНО: Кольца власти s5e7 из ленты — на странице нет, пропускаю" in caplog.text
+    assert second == (1, 1) and notes == [("episode", 3, 5)], "настоящая 3×5 — новая, с уведомлением"
+    assert reads == [], "3×5 — не скачок, страницу не читаем; 5×7 недавно проверена — тоже"
+    assert (5, 7) not in episodes and (3, 5) in episodes
+
+
+def test_false_event_hanging_in_the_feed_for_days_is_read_rarely(db, monkeypatch, caplog):
+    """19.11.2026: ложная 5×7 висит в блоке днями рядом с настоящими 3×1, 3×3, 3×4. Её строку удалили из базы — через
+    минуту поллер записал её снова и повторил уведомления. Теперь: ни записи, ни уведомлений; страница перечитывается
+    не чаще SUSPECT_RECHECK, после перезапуска поллера — одно чтение."""
+    async def scenario():
+        async with session() as s:
+            s.add(User(id=98))
+            page = await _page(s, 9860, RINGS, last=(3, 6), rows=[(3, e) for e in range(1, 7)], voices=LOSTFILM)
+            await svc.subscribe_page(s, 98, page.id)
+            await s.commit()
+        site = FakeSite(block({TODAY - timedelta(days=3): [(9860, RINGS, "series", 5, 7, "LostFilm")],
+                               TODAY - timedelta(days=1): [(9860, RINGS, "series", 3, e, "LostFilm") for e in (1, 3, 4)]}),
+                        {9860: _seasons_page(9860, RINGS, {2: 8, 3: 6})})
+        reads = []
+        poller = Poller(site)
+        for _ in range(3):
+            await poller.cycle()
+            reads.append(len(site.reads))
+        monkeypatch.setattr(poller_mod, "SUSPECT_RECHECK", timedelta(0))      # интервал прошёл
+        await poller.cycle()
+        reads.append(len(site.reads))
+        monkeypatch.setattr(poller_mod, "SUSPECT_RECHECK", timedelta(hours=6))
+        restarted = Poller(site)                                               # перезапуск: память проверок пуста
+        for _ in range(2):
+            await restarted.cycle()
+            reads.append(len(site.reads))
+        async with session() as s:
+            notes = await s.scalar(text("SELECT count(*) FROM notifications"))
+        return reads, await _episodes(9860), notes
+
+    caplog.set_level(logging.WARNING, logger="poller")
+    reads, episodes, notes = db(scenario)
+    assert reads == [1, 1, 1, 2, 3, 3], "одно чтение на интервал и одно после перезапуска, а не каждый цикл"
+    assert episodes == [(3, e) for e in range(1, 7)] and notes == 0
+    assert caplog.text.count("ПОДОЗРИТЕЛЬНО: Кольца власти s5e7") == 3, "предупреждение — на каждое чтение, не на цикл"
+
+
+def test_real_jumps_are_confirmed_by_the_page(db):
+    """Настоящий скачок проходит: новый сезон в списке серий страницы; премьера, которой нет в списке (он — озвучки по
+    умолчанию), но расписание отмечает её вышедшей; пропуск серии, когда на странице есть обе."""
+    async def scenario():
+        async with session() as s:
+            s.add(User(id=99))
+            for hid, last in ((9870, (2, 8)), (9871, (2, 8)), (9872, (1, 5))):
+                page = await _page(s, hid, f"Сериал {hid}", last=last, rows=[last], voices=LOSTFILM)
+                await svc.subscribe_page(s, 99, page.id)
+            await s.commit()
+        site = FakeSite(block({TODAY: [(9870, "Сериал 9870", "series", 3, 1, "LostFilm"),
+                                       (9871, "Сериал 9871", "series", 3, 1, "LostFilm"),
+                                       (9872, "Сериал 9872", "series", 1, 7, "LostFilm")]}),
+                        {9870: _seasons_page(9870, "Сериал 9870", {2: 8, 3: 1}),
+                         9871: _seasons_page(9871, "Сериал 9871", {2: 8}, aired=[(2, 8), (3, 1)]),
+                         9872: _seasons_page(9872, "Сериал 9872", {1: 7})})
+        result = await _process(Poller(site))
+        return result, sorted(site.reads), await _notifications(99)
+
+    result, reads, notes = db(scenario)
+    assert reads == [9870, 9871, 9872], "каждый скачок сверен со страницей"
+    assert result == (3, 3) and notes == [("episode", 1, 7), ("episode", 3, 1), ("episode", 3, 1)]
+
+
+def test_jump_waits_for_the_read_budget_and_goes_on_if_the_page_does_not_answer(db, caplog):
+    """Лимит чтений цикла исчерпан — скачок ждёт следующего цикла, а не проходит без проверки. Страница не ответила —
+    как до проверки: верим блоку (совпадение сбоя с ложным событием маловероятно, премьеру терять нельзя)."""
+    async def scenario():
+        async with session() as s:
+            s.add(User(id=100))
+            page = await _page(s, 9880, RINGS, last=(3, 4), rows=[(3, 4)], voices=LOSTFILM)
+            await svc.subscribe_page(s, 100, page.id)
+            await s.commit()
+        site = FakeSite(block({TODAY: [(9880, RINGS, "series", 4, 1, "LostFilm")]}), {9880: AccessBlocked("таймаут")})
+        poller = Poller(site)
+        poller._reads_left = 0
+        waited = await _process(poller), list(site.reads), await _notifications(100)
+        poller._reads_left = poller_mod.EVENT_READS
+        went = await _process(poller), list(site.reads), await _notifications(100)
+        async with session() as s:
+            failures = await s.scalar(text("SELECT read_failures FROM pages WHERE hdrezka_id = 9880"))
+        return waited, went, failures
+
+    caplog.set_level(logging.WARNING, logger="poller")
+    waited, went, failures = db(scenario)
+    assert waited == ((0, 0), [], []), "без чтения скачок не проходит — ждёт цикла"
+    assert went == ((1, 1), [9880], [("episode", 4, 1)]), "страница не ответила — уведомление, как раньше"
+    assert failures == 1, "неудача чтения отмечена"
+    assert "ПОДОЗРИТЕЛЬНО: Кольца власти s4e1 из ленты, страница не прочиталась — верю ленте" in caplog.text

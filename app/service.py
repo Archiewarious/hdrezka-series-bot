@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import logging
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
 from urllib.parse import urlsplit
 
@@ -164,6 +164,13 @@ class SyncResult:
     page: Page
     franchise: Franchise | None
     episodes: dict[int, list[int]]   # сезон → серии по списку на странице (озвучка по умолчанию)
+    aired: set[tuple[int, int]] = field(default_factory=set)   # (сезон, серия) с «✓»/«сегодня» в расписании
+
+    def has_episode(self, season: int, episode: int) -> bool:
+        """Серия есть на странице: в списке серий или вышедшей в расписании. Список — только озвучки по умолчанию,
+        а «✓» сайт ставит, когда серия у него есть в любой озвучке (F4): премьера, вышедшая сначала в другой
+        озвучке, по расписанию видна (19.11.2026)."""
+        return episode in self.episodes.get(season, ()) or (season, episode) in self.aired
 
 
 async def fetch_title_page(client: RezkaClient, url: str) -> TitlePage:
@@ -231,7 +238,7 @@ async def apply_title_page(s: AsyncSession, hdrezka_id: int, url: str, tp: Title
 
     franchise = await _apply_franchise(s, page, tp)
     await s.flush()
-    return SyncResult(page, franchise, tp.episodes)
+    return SyncResult(page, franchise, tp.episodes, {(r.season, r.episode) for r in tp.schedule if r.aired})
 
 
 FINISHED_AFTER_DAYS = 60
