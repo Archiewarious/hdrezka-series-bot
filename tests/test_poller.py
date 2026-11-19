@@ -466,28 +466,63 @@ def test_real_jumps_are_confirmed_by_the_page(db):
     assert result == (3, 3) and notes == [("episode", 1, 7), ("episode", 3, 1), ("episode", 3, 1)]
 
 
-def test_jump_waits_for_the_read_budget_and_goes_on_if_the_page_does_not_answer(db, caplog):
+def test_jump_waits_for_the_read_budget_and_for_the_page_then_trusts_the_feed(db, caplog):
     """Лимит чтений цикла исчерпан — скачок ждёт следующего цикла, а не проходит без проверки. Страница не ответила —
-    как до проверки: верим блоку (совпадение сбоя с ложным событием маловероятно, премьеру терять нельзя)."""
+    тоже ждёт, как обязательное чтение (19.11.2026: сайт иногда отдаёт 502, и одна неудача чтения пропускала ложное
+    событие людям); после READ_GIVE_UP_AFTER неудач подряд — верим блоку: премьеру терять нельзя."""
     async def scenario():
         async with session() as s:
             s.add(User(id=100))
             page = await _page(s, 9880, RINGS, last=(3, 4), rows=[(3, 4)], voices=LOSTFILM)
             await svc.subscribe_page(s, 100, page.id)
             await s.commit()
-        site = FakeSite(block({TODAY: [(9880, RINGS, "series", 4, 1, "LostFilm")]}), {9880: AccessBlocked("таймаут")})
+        site = FakeSite(block({TODAY: [(9880, RINGS, "series", 4, 1, "LostFilm")]}), {9880: AccessBlocked("502")})
         poller = Poller(site)
         poller._reads_left = 0
         waited = await _process(poller), list(site.reads), await _notifications(100)
-        poller._reads_left = poller_mod.EVENT_READS
-        went = await _process(poller), list(site.reads), await _notifications(100)
+        steps = []
+        for _ in range(poller_mod.READ_GIVE_UP_AFTER):
+            caplog.clear()
+            await poller.cycle()
+            steps.append((len(site.reads), await _notifications(100), "верю ленте" in caplog.text))
         async with session() as s:
             failures = await s.scalar(text("SELECT read_failures FROM pages WHERE hdrezka_id = 9880"))
-        return waited, went, failures
+        return waited, steps, failures
 
     caplog.set_level(logging.WARNING, logger="poller")
-    waited, went, failures = db(scenario)
+    waited, steps, failures = db(scenario)
     assert waited == ((0, 0), [], []), "без чтения скачок не проходит — ждёт цикла"
-    assert went == ((1, 1), [9880], [("episode", 4, 1)]), "страница не ответила — уведомление, как раньше"
-    assert failures == 1, "неудача чтения отмечена"
+    assert steps[:-1] == [(1, [], False), (2, [], False)], "страница не ответила — событие ждёт следующего цикла"
+    assert steps[-1] == (3, [("episode", 4, 1)], True), "после трёх неудач подряд — верим ленте"
+    assert failures == poller_mod.READ_GIVE_UP_AFTER, "каждая неудача чтения отмечена"
     assert "ПОДОЗРИТЕЛЬНО: Кольца власти s4e1 из ленты, страница не прочиталась — верю ленте" in caplog.text
+
+
+def test_jump_already_missing_on_the_page_is_skipped_when_the_reread_fails(db, monkeypatch, caplog):
+    """Ложная 5×7 уже сверена: на странице её нет. Через SUSPECT_RECHECK страницу перечитываем, а сайт отвечает 502 —
+    раньше это была «неудача чтения → верю ленте», и ложная серия уходила людям снова. Доказательство уже есть:
+    неудача перечитывания событие не пропускает, сколько бы их ни было (19.11.2026)."""
+    async def scenario():
+        async with session() as s:
+            s.add(User(id=101))
+            page = await _page(s, 9890, RINGS, last=(3, 4), rows=[(3, e) for e in range(1, 5)], voices=LOSTFILM)
+            await svc.subscribe_page(s, 101, page.id)
+            await s.commit()
+        home = block({TODAY - timedelta(days=2): [(9890, RINGS, "series", 5, 7, "LostFilm")]})
+        poller = Poller(FakeSite(home, {9890: _seasons_page(9890, RINGS, {2: 8, 3: 4})}))
+        await poller.cycle()                                                 # сверили: 5×7 на странице нет
+        monkeypatch.setattr(poller_mod, "SUSPECT_RECHECK", timedelta(0))      # пора перепроверить
+        poller.client = site = FakeSite(home, {9890: AccessBlocked("502")})
+        for _ in range(poller_mod.READ_GIVE_UP_AFTER + 2):
+            await poller.cycle()
+        async with session() as s:
+            notes = await s.scalar(text("SELECT count(*) FROM notifications"))
+        return len(site.reads), await _episodes(9890), notes
+
+    caplog.set_level(logging.WARNING, logger="poller")
+    reads, episodes, notes = db(scenario)
+    assert notes == 0 and (5, 7) not in episodes, "ни записи, ни уведомлений"
+    assert reads == poller_mod.READ_GIVE_UP_AFTER, "страница перечитывается, пока не наступила пауза после неудач"
+    assert "верю ленте" not in caplog.text
+    assert "ПОДОЗРИТЕЛЬНО: Кольца власти s5e7 из ленты, страница не прочиталась — на ней уже не было, пропускаю" \
+        in caplog.text
