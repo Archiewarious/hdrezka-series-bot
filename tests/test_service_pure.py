@@ -77,3 +77,20 @@ def test_pick_voices_keeps_only_available():
     assert pick_voices([19], {56, 224}) is None, "совпадений нет — значит «любая», а не пустой фильтр"
     assert pick_voices(None, {56}) is None and pick_voices([], {56}) is None
     assert pick_voices([56, 19], {19, 56}) == [19, 56]
+
+
+def test_released_top_takes_the_list_and_aired_schedule_but_not_today():
+    """Затравка по прочитанной странице (19.11.2026): последняя вышедшая серия — по списку серий и строкам расписания
+    со «✓». «Сегодня» — ещё не вышедшая: затравка по ней сделала бы премьеру дня «озвучкой»."""
+    from app.rezka.parser import TitlePage
+    from app.service import released_top
+
+    def tp(episodes, rows=()):
+        return TitlePage(1, "t", None, "series", 56, None, None, episodes=episodes,
+                         schedule=[ScheduleRow(se, e, None, None, st, st in ("✓", "сегодня")) for se, e, st in rows])
+
+    assert released_top(tp({1: list(range(1, 9))}, [(1, 9, "✓"), (1, 10, "✓"), (1, 11, "сегодня"),
+                                                  (1, 12, "через 7 дней")])) == (1, 10)
+    assert released_top(tp({1: list(range(1, 13)), 2: [1, 2, 3]})) == (2, 3)
+    assert released_top(tp({}, [(1, 1, "✓")])) == (1, 1), "списка нет — по расписанию"
+    assert released_top(tp({})) is None and released_top(tp({}, [(1, 1, "сегодня")])) is None

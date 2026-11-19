@@ -3,8 +3,10 @@
 Живой случай 14–15.11.2026: двое подписались из поиска на завершённые сериалы, которых не было в каталоге бота
 («Месть Анны / Месть Аналии / Убийца ее матери» 1×56, «Биография злодея» 1×10). Карточка поиска завершённого сериала —
 «Завершен (все серии)», без номера серии: страница заводится без last_season, затравка (seed_known_episodes) при
-подписке не пишется, а чтение страницы после подписки (_refresh_after_follow) её уже не пишет. У обеих страниц в проде
-нет ни одной записи в episodes — единственные такие среди подписок на страницы.
+подписке не пишется. У обеих страниц в проде не было ни одной записи в episodes — единственные такие среди подписок на
+страницы. С 19.11.2026 затравку пишет первое чтение подписанной страницы без записей (service.seed_from_read): чтение
+ботом после подписки или поллером; чтения ради события блока её не пишут — иначе соседняя серия того же прохода стала
+бы «озвучкой».
 
 Сценарии продолжения:
   а) новый сезон на той же странице — события блока обновлений и подстраховка _catch_missed;
@@ -18,12 +20,17 @@ from datetime import timedelta
 import pytest
 from sqlalchemy import text
 
+import app.bot.main as main
+from app import poller as poller_mod
 from app import service as svc
+from app.bot import guard
 from app.db import session
 from app.models import User
 from app.poller import Poller
 from app.rezka.parser import FeedItem
-from test_integration import TODAY, FakeSite, _new_parts_to, _notifications, _parts_html, _run, block
+from test_bot_handlers import FakeCallback, site  # noqa: F401 — site: фикстура подменного сайта бота
+from test_integration import (TODAY, FakeSite, _known_franchise, _new_parts_to, _notifications, _page, _parts_html,
+                              _run, block)
 
 ANNA = 69964
 ANNA_TITLE = "Месть Анны / Месть Аналии / Убийца ее матери"
@@ -31,10 +38,7 @@ ANNA_URL = "https://rezka.test/series/drama/69964-mest-anny-2020.html"
 VOICE = (59, "Многоголосый закадровый")
 USER = 4242
 
-NO_SEED = ("подписка из поиска на завершённую страницу без затравки: карточка «Завершен (все серии)» без номера серии, "
-           "seed_known_episodes ничего не пишет, чтение после подписки — тоже")
-VIA_SEARCH = [pytest.param(False, id="page_known"),
-              pytest.param(True, id="via_search", marks=pytest.mark.xfail(strict=True, reason=NO_SEED))]
+VIA_SEARCH = [pytest.param(False, id="page_known"), pytest.param(True, id="via_search")]
 
 
 def show_page(hid: int, title: str, seasons: dict[int, int], franchise: list = ()) -> str:
@@ -48,21 +52,23 @@ def show_page(hid: int, title: str, seasons: dict[int, int], franchise: list = (
             f"<ul>{tr}</ul><ul>{eps}</ul>{_parts_html(title, franchise)}")
 
 
-async def _follow_waiting(via_search: bool) -> None:
+CARD = FeedItem(ANNA, ANNA_TITLE, ANNA_URL, "series", "Завершен (все серии)", None, None, True,
+                meta_line="2020, Колумбия, Драмы")
+
+
+async def _follow_waiting(via_search: bool, bot_read: bool = True) -> None:
     """Подписка «жду продолжения» на «Месть Анны» 1×56. via_search — как в проде: страница пришла карточкой поиска,
-    нажатие подписало (cb_go → subscribe_page), бот дочитал страницу после подписки. Иначе страница уже была в каталоге
-    и прочитана до подписки."""
+    нажатие подписало (cb_go → subscribe_page), бот дочитал страницу после подписки (bot_read; False — лимит бота
+    исчерпан, страницу прочитает поллер). Иначе страница уже была в каталоге и прочитана до подписки."""
     site = FakeSite("", {ANNA: show_page(ANNA, ANNA_TITLE, {1: 56})})
-    card = FeedItem(ANNA, ANNA_TITLE, ANNA_URL, "series", "Завершен (все серии)", None, None, True,
-                    meta_line="2020, Колумбия, Драмы")
     async with session() as s:
         s.add(User(id=USER))
-        page = await svc.upsert_page_from_feed(s, card)
+        page = await svc.upsert_page_from_feed(s, CARD)
         if not via_search:
             await svc.sync_page(s, site, ANNA, ANNA_URL)
         await svc.subscribe_page(s, USER, page.id)
         await s.commit()
-    if via_search:
+    if via_search and bot_read:
         async with session() as s:                          # _refresh_after_follow
             await svc.sync_page(s, site, ANNA, ANNA_URL)
             await s.commit()
@@ -148,6 +154,149 @@ def test_new_dub_of_an_old_episode_is_silent(db, via_search):
         return await _notifications(USER)
 
     assert db(scenario) == []
+
+
+# ----------------------------------------------------------------------------- затравка по чтению страницы (19.11.2026)
+
+async def _seeds(hid: int) -> list[tuple[int, int, int]]:
+    """Записи страницы: (сезон, серия, год first_seen_at) — у затравки 1970."""
+    async with session() as s:
+        return [tuple(r) for r in (await s.execute(text(
+            "SELECT e.season, e.episode, CAST(extract(year FROM e.first_seen_at) AS int) FROM episodes e "
+            "JOIN pages p ON p.id = e.page_id WHERE p.hdrezka_id = :h ORDER BY 1, 2"), {"h": hid})).all()]
+
+
+async def _notes_count() -> int:
+    async with session() as s:
+        return await s.scalar(text("SELECT count(*) FROM notifications"))
+
+
+async def _tap_in_search() -> None:
+    """Как в проде: карточка поиска завела страницу, нажатие в выдаче — настоящий cb_go."""
+    async with session() as s:
+        page = await svc.upsert_page_from_feed(s, CARD)
+        await s.commit()
+    await main.cb_go(FakeCallback(USER, f"go:p:{page.id}"))
+
+
+def test_tap_in_search_seeds_the_page_read_after_subscription(db, site):
+    """cb_go → подписка → бот дочитывает страницу (_refresh_after_follow) — это чтение и пишет затравку 1×56."""
+    site._pages[ANNA] = show_page(ANNA, ANNA_TITLE, {1: 56})
+
+    async def scenario():
+        await _tap_in_search()
+        return await _seeds(ANNA), await _notes_count(), site.reads
+
+    assert db(scenario) == ([(1, 56, 1970)], 0, [ANNA])
+
+
+def test_poller_seeds_the_page_the_bot_did_not_read(db, site, monkeypatch):
+    """Лимит бота исчерпан — страницу после подписки читает поллер (обновление подписанных): затравка пишется там,
+    молча. Опоздавшее событие о новом сезоне после этого — новая серия."""
+    monkeypatch.setattr(guard, "bot_site", guard.UserLimiter(per_minute=0, per_hour=0))
+
+    async def scenario():
+        await _tap_in_search()
+        bot_reads = list(site.reads)
+        await Poller(FakeSite(block({}), {ANNA: show_page(ANNA, ANNA_TITLE, {1: 56})})).cycle()
+        seeded = await _seeds(ANNA), await _notes_count()
+        late = FakeSite(block({TODAY - timedelta(days=2): [(ANNA, "Месть Анны", "series", 2, 1, VOICE[1])]}),
+                        {ANNA: show_page(ANNA, ANNA_TITLE, {1: 56, 2: 1})})
+        await _run(late)
+        return bot_reads, seeded, await _notifications(USER)
+
+    bot_reads, seeded, notes = db(scenario)
+    assert bot_reads == [], "бот страницу не читал"
+    assert seeded == ([(1, 56, 1970)], 0), "затравка — молча"
+    assert notes == [("episode", 2, 1)]
+
+
+def test_event_read_does_not_seed_a_neighbour_of_the_same_pass(db):
+    """Подписка без затравки, в блоке свежие 2×1 и 2×2. Чтение ради 2×1 засеяло бы 2×2 (последняя на странице) — и 2×2
+    стала бы «озвучкой»: подписчикам «любой озвучки» — ничего. Чтение ради события затравку не пишет."""
+    async def scenario():
+        await _follow_waiting(True, bot_read=False)
+        site = FakeSite(block({TODAY: [(ANNA, "Месть Анны", "series", 2, 2, VOICE[1]),        # разбирается второй
+                                       (ANNA, "Месть Анны", "series", 2, 1, VOICE[1])]}),
+                        {ANNA: show_page(ANNA, ANNA_TITLE, {1: 56, 2: 2})})
+        await Poller(site).cycle()
+        return site.reads, await _notifications(USER)
+
+    reads, notes = db(scenario)
+    assert reads == [ANNA], "непрочитанная страница прочитана ради события"
+    assert notes == [("episode", 2, 1), ("episode", 2, 2)]
+
+
+def test_deferred_event_page_is_not_seeded_by_the_same_cycle(db, monkeypatch):
+    """Событие 2×1 отложено (лимит чтений цикла), а страницу в том же цикле прочитало обновление подписанных: затравка
+    по ней была бы 2×1 — и в следующем цикле событие стало бы «озвучкой». Страница отложенного события в этом цикле
+    не сеется; в следующем событие — новая серия."""
+    async def scenario():
+        await _follow_waiting(True, bot_read=False)
+        site = FakeSite(block({TODAY: [(ANNA, "Месть Анны", "series", 2, 1, VOICE[1])]}),
+                        {ANNA: show_page(ANNA, ANNA_TITLE, {1: 56, 2: 1})})
+        poller, budget = Poller(site), poller_mod.EVENT_READS
+        monkeypatch.setattr(poller_mod, "EVENT_READS", 0)
+        await poller.cycle()
+        first = list(site.reads), await _seeds(ANNA), await _notifications(USER)
+        monkeypatch.setattr(poller_mod, "EVENT_READS", budget)
+        await poller.cycle()
+        return first, await _notifications(USER)
+
+    (reads, seeds, notes), second = db(scenario)
+    assert reads == [ANNA] and seeds == [] and notes == [], "страницу прочитали, но не засеяли"
+    assert second == [("episode", 2, 1)]
+
+
+def test_seed_only_for_a_page_subscription_without_records(db):
+    """Затравка — только у страницы с подпиской на неё саму и без записей. Страница без подписок и часть, за которой
+    следят только через франшизу, — без затравки. Сама затравка уведомлений не ставит."""
+    async def scenario():
+        alone, part, mine = 99101, 99102, 99103
+        pages = {h: show_page(h, f"Сериал {h}", {1: 10}) for h in (alone, part, mine)}
+        site = FakeSite("", pages)
+        async with session() as s:
+            s.add(User(id=USER))
+            fr = await _known_franchise(s, part)
+            await _page(s, part, f"Сериал {part}", franchise_id=fr.id)
+            await svc.subscribe_franchise(s, USER, fr.id)
+            card = FeedItem(mine, f"Сериал {mine}", f"https://rezka.test/series/x/{mine}-a.html", "series",
+                            "Завершен (все серии)", None, None, True)
+            own = await svc.upsert_page_from_feed(s, card)
+            await svc.subscribe_page(s, USER, own.id)
+            await s.commit()
+        for h in (alone, part, mine):
+            async with session() as s:
+                await svc.sync_page(s, site, h, f"https://rezka.test/series/x/{h}-a.html")
+                await s.commit()
+        return await _seeds(alone), await _seeds(part), await _seeds(mine), await _notes_count()
+
+    assert db(scenario) == ([], [], [(1, 10, 1970)], 0)
+
+
+def test_new_part_with_only_a_seed_reaches_franchise_subscribers(db):
+    """Новая часть франшизы, у которой есть только затравка (на неё подписались, а событий о её сериях бот не записывал):
+    затравка — не серия, которую часть уже показала, — «новая часть» и подписчикам франшизы, а не только подписанным
+    на другие части."""
+    async def scenario():
+        async with session() as s:
+            s.add_all([User(id=USER), User(id=USER + 1)])
+            fr = await _known_franchise(s, 99200)
+            await _page(s, 99200, "Сага", last=(1, 12), rows=[(1, 12)], franchise_id=fr.id, finished=True)
+            part = await _page(s, 99201, "Сага: Возмездие", last=(1, 1), franchise_id=fr.id)
+            await s.execute(text("INSERT INTO franchise_members (franchise_id, hdrezka_id, announce) "
+                                 "VALUES (:f, 99201, 'pending')"), {"f": fr.id})
+            await svc.subscribe_page(s, USER + 1, part.id)              # затравка 1×1
+            await svc.subscribe_franchise(s, USER, fr.id)
+            await s.commit()
+        seeds = await _seeds(99201)
+        await Poller(FakeSite("", {})).announce_new_parts()
+        return seeds, await _new_parts_to(USER), await _new_parts_to(USER + 1)
+
+    seeds, franchise_sub, part_sub = db(scenario)
+    assert seeds == [(1, 1, 1970)]
+    assert franchise_sub == [99201], "подписчик франшизы узнал о новой части"
+    assert part_sub == [], "о своей же странице не пишем"
 
 
 # ----------------------------------------------------------------------------- б, в) продолжение отдельной страницей

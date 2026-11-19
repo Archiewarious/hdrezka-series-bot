@@ -1121,7 +1121,9 @@ async def cb_done(cb: CallbackQuery) -> None:
 
 async def _refresh_after_follow(user_id: int, hid: int, url: str, fresh) -> None:
     """Свежая страница — для карточки и расписания. Только если разрешает лимит: подписка уже создана,
-    а страницу иначе прочитает поллер (очередь каталога или обновление подписанных)."""
+    а страницу иначе прочитает поллер (очередь каталога или обновление подписанных). Это чтение пишет и затравку
+    (svc.seed_from_read): у карточки поиска завершённого сериала нет номера серии, и подписка её не записала
+    (19.11.2026)."""
     if (not fresh or (svc.now() - fresh).days >= 1) and not guard.site_permit(user_id):
         try:
             await _read_page(hid, url)

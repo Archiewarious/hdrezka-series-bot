@@ -60,6 +60,10 @@ class Poller:
     def __init__(self, client: RezkaClient | None = None) -> None:
         self.client = client or RezkaClient()
         self._failed_now: set[int] = set()      # страницы, не прочитавшиеся в этом цикле: второй раз не просим
+        # Тайтлы (hdrezka_id), чьи события блока в этом цикле отложены или упали: их страницу вторая часть цикла читает
+        # без затравки — затравка по ней сделала бы само отложенное событие (или соседнюю серию) «озвучкой» в следующем
+        # цикле (19.11.2026). Сбрасывает cycle().
+        self._unsettled: set[int] = set()
         self._refresh_failed = 0                # единиц второй части цикла с ошибкой — в meta и /stats
         self.watchdog: lifecycle.Watchdog | None = None
         self._cycle_new_parts = 0               # уведомлений new_part за цикл — для строки лога
@@ -75,8 +79,10 @@ class Poller:
     # ------------------------------------------------------------------ чтение страниц
 
     async def sync(self, s, hdrezka_id: int, url: str) -> svc.SyncResult:
-        """Читает страницу. Новые части франшизы сервис дописывает в состав, уведомляет announce_new_parts."""
-        return await svc.sync_page(s, self.client, hdrezka_id, url)
+        """Читает страницу ради события. Новые части франшизы сервис дописывает в состав, уведомляет
+        announce_new_parts. Без затравки (19.11.2026): чтение ради 2×1 засеяло бы 2×2 с той же страницы, и событие 2×2
+        того же прохода стало бы «озвучкой» — подписчики «любой озвучки» не получили бы ничего."""
+        return await svc.sync_page(s, self.client, hdrezka_id, url, seed=False)
 
     async def _read(self, s, page: Page, required: bool) -> svc.SyncResult | None:
         """Чтение страницы ради события; None — не читали или не прочиталась. Обязательное — новая серия на
@@ -143,6 +149,7 @@ class Poller:
             except Deferred as d:
                 await s.rollback()
                 deferred += 1
+                self._unsettled.add(item.hdrezka_id)
                 if d.read_failed:                       # попытку откатили — неудачу чтения пишем отдельно
                     await self._mark_event_read_failure(s, item)
                     await s.commit()
@@ -153,6 +160,7 @@ class Poller:
             except Exception:
                 await s.rollback()
                 failed += 1
+                self._unsettled.add(item.hdrezka_id)
                 log.exception("Событие блока обновлений пропущено: %s s%se%s", item.hdrezka_id, item.season, item.episode)
                 continue
             new_eps, queued = new_eps + e, queued + q
@@ -296,7 +304,9 @@ class Poller:
             page = await svc.page_by_hid(s, hid)
             n, status = 0, "skipped"
             if svc.is_recent_part(page):
-                has_episodes = await s.scalar(select(Episode.id).where(Episode.page_id == page.id).limit(1)) is not None
+                # Серии — только настоящие записи: затравка (1970) — не серия, которую часть уже показала (19.11.2026).
+                has_episodes = await s.scalar(select(Episode.id).where(
+                    Episode.page_id == page.id, Episode.first_seen_at >= svc.SEED_BEFORE).limit(1)) is not None
                 n = await svc.enqueue_new_part(s, fid, page, only_page_subscribers=has_episodes)
                 status = "sent"
                 log.info("НОВАЯ ЧАСТЬ франшизы %s: %s → %s уведомлений", fid, page.title, n)
@@ -311,7 +321,8 @@ class Poller:
         """Одна страница вне цикла событий: запрос к сайту — без открытой транзакции, затем короткая запись
         и коммит. Ошибка одной единицы не откатывает остальные (24.09.2026: раньше вся вторая часть цикла
         шла одной транзакцией). PageGone и другие ошибки страницы — отметка с растущей паузой и None;
-        AccessBlocked — отметка и дальше вызывающему: доступ потерян, часть цикла заканчивается."""
+        AccessBlocked — отметка и дальше вызывающему: доступ потерян, часть цикла заканчивается. Чтение пишет затравку
+        (svc.seed_from_read), кроме страниц из _unsettled (19.11.2026)."""
         self._beat()
         try:
             tp = await svc.fetch_title_page(self.client, url)
@@ -329,7 +340,7 @@ class Poller:
             return None
         try:
             async with session() as s:
-                res = await svc.apply_title_page(s, hdrezka_id, url, tp)
+                res = await svc.apply_title_page(s, hdrezka_id, url, tp, seed=hdrezka_id not in self._unsettled)
                 if after:
                     await after(s, res)
                 await s.commit()
@@ -427,7 +438,9 @@ class Poller:
         """Подстраховка на случай, если серия не попала в блок обновлений: список серий на самой странице
         новее всего, что бот записал, — значит серия на сайте есть, а события не было. Работает только для
         страниц с подписчиками (их и перечитываем) и только когда записи уже есть: без них не с чем
-        сравнивать, и первое чтение каталога подняло бы весь сезон."""
+        сравнивать, и первое чтение каталога подняло бы весь сезон. У подписанной страницы без записей базу
+        создаёт само первое чтение — затравкой в той же транзакции, до этой проверки (svc.seed_from_read); со
+        следующего чтения подстраховка ловит (19.11.2026)."""
         page = res.page
         if not res.episodes:
             return 0
@@ -474,6 +487,7 @@ class Poller:
         self._cycle_new_parts = 0
         self._reads_left = EVENT_READS
         self._failed_now = set()
+        self._unsettled = set()
         self._refresh_failed = 0
         async with session() as s:
             new_eps, queued = await self.process_updates(s)

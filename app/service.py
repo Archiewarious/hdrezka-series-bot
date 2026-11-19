@@ -178,15 +178,17 @@ async def fetch_title_page(client: RezkaClient, url: str) -> TitlePage:
     return parse_title_page(await client.title_page(url), url)
 
 
-async def sync_page(s: AsyncSession, client: RezkaClient, hdrezka_id: int, url: str) -> SyncResult:
+async def sync_page(s: AsyncSession, client: RezkaClient, hdrezka_id: int, url: str, seed: bool = True) -> SyncResult:
     """Читает страницу тайтла и раскладывает её по таблицам: fetch_title_page + apply_title_page."""
-    return await apply_title_page(s, hdrezka_id, url, await fetch_title_page(client, url))
+    return await apply_title_page(s, hdrezka_id, url, await fetch_title_page(client, url), seed=seed)
 
 
-async def apply_title_page(s: AsyncSession, hdrezka_id: int, url: str, tp: TitlePage) -> SyncResult:
+async def apply_title_page(s: AsyncSession, hdrezka_id: int, url: str, tp: TitlePage, seed: bool = True) -> SyncResult:
     """Обновляет pages / voices / schedule / franchises по прочитанной странице. Новые части франшизы
     только дописывает в состав (franchise_members, pending): уведомляет о них поллер (announce_new_parts),
-    кто бы ни прочитал страницу — бот или поллер."""
+    кто бы ни прочитал страницу — бот или поллер. seed — записать затравку (seed_from_read), если у страницы есть
+    подписка на неё и нет записей; False — чтение ради события блока: затравка по нему сделала бы соседнюю серию
+    того же прохода «озвучкой» (19.11.2026)."""
     if tp.hdrezka_id and tp.hdrezka_id != hdrezka_id:
         log.warning("Страница %s отдала id %s (редирект на другое зеркало/слаг?)", hdrezka_id, tp.hdrezka_id)
 
@@ -238,6 +240,8 @@ async def apply_title_page(s: AsyncSession, hdrezka_id: int, url: str, tp: Title
 
     franchise = await _apply_franchise(s, page, tp)
     await s.flush()
+    if seed:
+        await seed_from_read(s, page.id, released_top(tp))
     return SyncResult(page, franchise, tp.episodes, {(r.season, r.episode) for r in tp.schedule if r.aired})
 
 
@@ -466,9 +470,10 @@ SEED_BEFORE = datetime(2000, 1, 1, tzinfo=timezone.utc)
 
 
 async def record_episode(s: AsyncSession, page: Page, season: int, episode: int) -> int | None:
-    """Записывает серию и возвращает id, если записи не было. Запись-затравку (seed_known_episodes),
-    появившуюся в этом же событии, забирает себе: чтение страницы могло перевести ждавшего продолжения
-    на франшизу и засеять ту самую серию, о которой сообщает блок."""
+    """Записывает серию и возвращает id, если записи не было. Запись-затравку (seed_known_episodes, seed_from_read),
+    появившуюся, пока шло событие, забирает себе: её мог записать параллельно бот — подпиской или чтением страницы
+    после неё — ровно на ту серию, о которой сообщает блок (19.11.2026; чтение ради самого события затравку
+    не пишет)."""
     stmt = (pg_insert(Episode).values(page_id=page.id, season=season, episode=episode)
             .on_conflict_do_update(constraint="uq_episode", set_={"first_seen_at": func.now()},
                                    where=Episode.first_seen_at < SEED_BEFORE)
@@ -519,7 +524,9 @@ async def max_recorded_episode(s: AsyncSession, page_id: int) -> tuple[int, int]
 async def seed_known_episodes(s: AsyncSession, page_ids: list[int]) -> int:
     """Страница стала важной (подписка) — её текущая последняя серия записывается как уже известная.
     Иначе на странице без записей первая же дозвучка старой серии сошла бы за новую. Дата 1970 — чтобы
-    затравка не попала в «🆕 Новое» и в проверку здоровья."""
+    затравка не попала в «🆕 Новое» и в проверку здоровья. Номер серии неизвестен (карточка поиска завершённого
+    сериала — «Завершен (все серии)», без номера) — затравку пишет первое чтение страницы (seed_from_read,
+    19.11.2026)."""
     if not page_ids:
         return 0
     r = await s.execute(text("""
@@ -529,6 +536,37 @@ async def seed_known_episodes(s: AsyncSession, page_ids: list[int]) -> int:
            AND NOT EXISTS (SELECT 1 FROM episodes e WHERE e.page_id = p.id)
         ON CONFLICT DO NOTHING"""), {"ids": list(page_ids), "seen": SEED_SEEN_AT})
     return r.rowcount or 0
+
+
+def released_top(tp: TitlePage) -> tuple[int, int] | None:
+    """Последняя вышедшая серия прочитанной страницы: максимум по списку серий (озвучка по умолчанию) и строкам
+    расписания со «✓» (F4: серия у сайта есть в любой озвучке). «Сегодня» не годится: расписание ставит его и ещё
+    не вышедшей серии, а затравка по ней сделала бы премьеру дня «озвучкой». Ничего нет — None (19.11.2026)."""
+    out = [(se, max(eps)) for se, eps in tp.episodes.items() if eps]
+    out += [(r.season, r.episode) for r in tp.schedule if r.status == "✓"]
+    return max(out, default=None)
+
+
+async def seed_from_read(s: AsyncSession, page_id: int, top: tuple[int, int] | None) -> int:
+    """Затравка по прочитанной странице (19.11.2026): у страницы есть подписка на неё саму, а записей нет — последняя
+    вышедшая серия (released_top) записывается как известная, одной строкой, без озвучек, с датой 1970. Живой случай
+    14–15.11.2026: подписка из поиска на завершённый сериал, которого не было в базе, — затравки не было, и запоздавшее
+    событие нового сезона записывалось молча, подстраховка _catch_missed молчала, а дозвучка старой серии пришла бы
+    новой. Только подписка на страницу: часть, за которой следят через франшизу, засевает подписка на франшизу
+    (seed_known_episodes), страница без подписок затравки не требует."""
+    if top is None:
+        return 0
+    r = await s.execute(text("""
+        INSERT INTO episodes (page_id, season, episode, first_seen_at)
+        SELECT CAST(:p AS int), CAST(:s AS int), CAST(:e AS int), CAST(:seen AS timestamptz)
+         WHERE EXISTS (SELECT 1 FROM subscriptions sub WHERE sub.page_id = :p)
+           AND NOT EXISTS (SELECT 1 FROM episodes e WHERE e.page_id = :p)
+        ON CONFLICT DO NOTHING"""), {"p": page_id, "s": top[0], "e": top[1], "seen": SEED_SEEN_AT})
+    n = r.rowcount or 0
+    if n:
+        page = await s.get(Page, page_id)
+        log.info("ЗАТРАВКА: %s s%se%s — последняя вышедшая серия записана как известная", page.title, *top)
+    return n
 
 
 def is_recent_part(part: Page, at: datetime | None = None) -> bool:
